@@ -1,7 +1,8 @@
 // Smoke test: mount the *built* SPA bundle in jsdom against a live server.
 //
-// Usage:  node test/smoke.mjs [baseUrl]
-// The server must be running and serving server/static (the vite build output).
+// Usage:  ADMIN_TOKEN=<token> node test/smoke.mjs [baseUrl]
+// The server must be running, started with the same ADMIN_TOKEN, and serving
+// server/static (the vite build output).
 //
 // Why jsdom: the browser tooling refuses private/loopback addresses, and this
 // exercises the real compiled bundle (runes, router, fetch wiring) rather than
@@ -76,6 +77,30 @@ const api = async (path, init) => {
   return text ? JSON.parse(text) : undefined
 }
 
+const TOKEN = process.env.ADMIN_TOKEN
+if (!TOKEN) {
+  console.error('set ADMIN_TOKEN to the token the server was started with')
+  process.exit(2)
+}
+
+/** PATCH a prefix status. Returns the HTTP status code. */
+async function setStatus(prefix, status, { token = TOKEN } = {}) {
+  const headers = { 'content-type': 'application/json' }
+  if (token) headers.authorization = `Bearer ${token}`
+  const res = await realFetch(`${BASE}/api/prefixes/${prefix}/status`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ status }),
+  })
+  return res.status
+}
+
+/** GET /api/prefixes with an optional token. Returns the HTTP status code. */
+async function listPrefixes(token) {
+  const headers = token ? { authorization: `Bearer ${token}` } : {}
+  return (await realFetch(`${BASE}/api/prefixes`, { headers })).status
+}
+
 console.log(`bundle: ${bundleName}\nbase:   ${BASE}\n`)
 
 // ---- scenario A: landing auto-creates a project and redirects --------------
@@ -124,14 +149,16 @@ console.log('\nB. project page renders a card')
   check('shows 1 card', text.includes('1 card'))
   check('name input is editable', !w.document.querySelector('input#name-1')?.disabled)
 
-  // ---- scenario C: a frozen (printing) project is read-only ----------------
-  console.log('\nC. a printing project is read-only')
+  // ---- scenario C: the auth boundary, then a frozen project ---------------
+  console.log('\nC. auth boundary and the print freeze')
+  check('list prefixes without a token -> 401', (await listPrefixes('')) === 401)
+  check('list prefixes with a wrong token -> 401', (await listPrefixes('nope')) === 401)
+  check('list prefixes with the admin token -> 200', (await listPrefixes(TOKEN)) === 200)
+  check('set status without a token -> 401',
+    (await setStatus(prefix, 'submitted', { token: '' })) === 401)
+
   for (const s of ['submitted', 'paid', 'queued', 'printing']) {
-    await api(`/api/prefixes/${prefix}/status`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ status: s }),
-    })
+    check(`operator sets status -> ${s}`, (await setStatus(prefix, s)) === 200)
   }
   const w2 = await mount(`/p/${prefix}`, { bust: 'c' })
   const text2 = w2.document.body.textContent ?? ''

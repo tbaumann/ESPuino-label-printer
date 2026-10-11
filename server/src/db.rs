@@ -96,13 +96,18 @@ pub async fn list_prefixes(
     rows.iter().map(prefix_from_row).collect()
 }
 
-/// Move a prefix to a new status, validating the transition. Re-applying the
-/// current status is a no-op (idempotent, so shop/queue callbacks can retry).
+/// Move a prefix to a new status. Re-applying the current status is a no-op
+/// (idempotent, so shop/queue callbacks can retry).
+///
+/// `force` skips transition validation — used for admin writes, which may move
+/// a prefix to any status at any time (e.g. requeue a stuck `printing` order,
+/// which has no legal edge back).
 pub async fn set_status(
     pool: &SqlitePool,
     uuid: Uuid,
     next: PrefixStatus,
     order_ref: Option<&str>,
+    force: bool,
 ) -> Result<Prefix, ApiError> {
     let current = get_prefix(pool, uuid).await?;
     if current.status == next {
@@ -119,7 +124,7 @@ pub async fn set_status(
         }
         return Ok(current);
     }
-    if !current.status.can_transition_to(next) {
+    if !force && !current.status.can_transition_to(next) {
         return Err(ApiError::Conflict(format!(
             "cannot transition prefix {uuid} from {} to {}",
             current.status, next
@@ -140,10 +145,15 @@ pub async fn set_status(
     get_prefix(pool, uuid).await
 }
 
-/// Reject card mutations on a frozen prefix (printing or later).
-pub async fn ensure_writable(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiError> {
+/// Reject card mutations on a frozen prefix (printing or later), unless the
+/// caller is the operator.
+pub async fn ensure_writable(
+    pool: &SqlitePool,
+    uuid: Uuid,
+    admin: bool,
+) -> Result<Prefix, ApiError> {
     let prefix = get_prefix(pool, uuid).await?;
-    if !prefix.status.is_writable() {
+    if !admin && !prefix.status.is_writable() {
         return Err(ApiError::Conflict(format!(
             "prefix {uuid} is '{}' and can no longer be modified",
             prefix.status

@@ -17,6 +17,12 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    #[error("admin API unavailable: {0}")]
+    Unavailable(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -33,6 +39,8 @@ impl ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             ApiError::Db(_) | ApiError::Io(_) | ApiError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR

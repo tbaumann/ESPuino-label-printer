@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::auth;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus, StatusInput};
@@ -142,14 +143,22 @@ pub struct StatusQuery {
     pub status: Option<String>,
 }
 
-/// List prefixes, optionally filtered by status.
+/// List prefixes, optionally filtered by status. **Admin only** — the full
+/// list exposes every customer's uuid, which is their only credential.
 #[utoipa::path(get, path = "/api/prefixes", tag = "prefixes",
     params(("status" = Option<String>, Query, description = "filter by status (draft|submitted|paid|queued|printing|printed|cancelled)")),
-    responses((status = 200, body = [Prefix])))]
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, body = [Prefix]),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
 pub async fn list_prefixes(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Vec<Prefix>>, ApiError> {
+    auth::resolve(&st, &headers).require_admin()?;
     let status = match q.status.as_deref() {
         None => None,
         Some(s) => Some(
@@ -195,11 +204,13 @@ pub async fn list_cards(
 )]
 pub async fn put_card(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
     mp: Multipart,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::ensure_writable(&st.pool, prefix).await?;
+    let caller = auth::resolve(&st, &headers);
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let (name, serial, back, rel, ct) =
         store_card_form(mp, &st.data_dir, prefix, id).await?;
     let card = db::upsert_card(
@@ -225,11 +236,13 @@ pub async fn put_card(
 )]
 pub async fn post_card(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(prefix): Path<String>,
     mp: Multipart,
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::ensure_writable(&st.pool, prefix).await?;
+    let caller = auth::resolve(&st, &headers);
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let id = db::next_card_id(&st.pool, prefix).await?;
     let (name, serial, back, rel, ct) =
         store_card_form(mp, &st.data_dir, prefix, id).await?;
@@ -286,10 +299,12 @@ pub async fn get_card_image(
     responses((status = 204, description = "deleted"), (status = 404, body = crate::error::ErrorBody)))]
 pub async fn delete_card(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::ensure_writable(&st.pool, prefix).await?;
+    let caller = auth::resolve(&st, &headers);
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     db::delete_card(&st.pool, prefix, id).await?;
     let rel = format!(
@@ -303,22 +318,29 @@ pub async fn delete_card(
 }
 
 /// Delete a prefix and all of its cards (and their images).
+///
+/// A customer may delete only a *writable* prefix (draft, submitted, paid or
+/// queued). The operator may delete one in any state, including while printing.
 #[utoipa::path(delete, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 204, description = "deleted"),
         (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is currently printing", body = crate::error::ErrorBody)
+        (status = 409, description = "prefix is not deletable without the admin token", body = crate::error::ErrorBody)
     ))]
 pub async fn delete_prefix(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers);
     let p = db::get_prefix(&st.pool, prefix).await?;
-    if p.status == PrefixStatus::Printing {
+    if !caller.is_admin() && !p.status.is_writable() {
         return Err(ApiError::Conflict(format!(
-            "prefix {prefix} is 'printing' and cannot be deleted"
+            "prefix {prefix} is '{}' and cannot be deleted; only draft, submitted, \
+             paid or queued prefixes can be",
+            p.status
         )));
     }
     db::delete_prefix(&st.pool, prefix).await?;
@@ -336,10 +358,12 @@ pub async fn delete_prefix(
     ))]
 pub async fn delete_cards(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::ensure_writable(&st.pool, prefix).await?;
+    let caller = auth::resolve(&st, &headers);
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     db::delete_all_cards(&st.pool, prefix).await?;
     let _ = std::fs::remove_dir_all(st.data_dir.join("blobs").join(prefix.to_string()));
     Ok(StatusCode::NO_CONTENT)
@@ -357,11 +381,13 @@ pub async fn delete_cards(
     ))]
 pub async fn patch_card(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
     Json(patch): Json<CardPatch>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::ensure_writable(&st.pool, prefix).await?;
+    let caller = auth::resolve(&st, &headers);
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     Ok(Json(db::update_card_meta(&st.pool, prefix, id, &patch).await?))
 }
 
@@ -375,31 +401,56 @@ pub async fn patch_card(
     ))]
 pub async fn submit_prefix(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(prefix): Path<String>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers);
     Ok(Json(
-        db::set_status(&st.pool, prefix, PrefixStatus::Submitted, None).await?,
+        db::set_status(
+            &st.pool,
+            prefix,
+            PrefixStatus::Submitted,
+            None,
+            caller.is_admin(),
+        )
+        .await?,
     ))
 }
 
-/// Transition a prefix's status (shop / print-queue side).
+/// Set a prefix's status. **Admin only.**
+///
+/// The operator may move a prefix to any status at any time, bypassing the
+/// transition table — e.g. requeueing a `printing` order that never finished,
+/// which a customer has no legal edge for.
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}/status", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body = StatusInput,
+    security(("bearerAuth" = [])),
     responses(
         (status = 200, body = Prefix),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
         (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "invalid transition", body = crate::error::ErrorBody)
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
     ))]
 pub async fn patch_status(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(prefix): Path<String>,
     Json(input): Json<StatusInput>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers);
+    caller.require_admin()?;
     Ok(Json(
-        db::set_status(&st.pool, prefix, input.status, input.order_ref.as_deref()).await?,
+        db::set_status(
+            &st.pool,
+            prefix,
+            input.status,
+            input.order_ref.as_deref(),
+            caller.is_admin(),
+        )
+        .await?,
     ))
 }
 

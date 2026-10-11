@@ -7,6 +7,8 @@ use std::path::Path;
 pub struct Client {
     base: String,
     http: reqwest::Client,
+    /// Operator bearer token. `None` for pure customer-level use.
+    token: Option<String>,
 }
 
 /// Guess a content type from a file extension. Matches the server's accepted
@@ -37,7 +39,7 @@ pub fn is_image(path: &Path) -> bool {
 }
 
 impl Client {
-    pub fn new(base: impl Into<String>) -> Result<Self> {
+    pub fn new(base: impl Into<String>, token: Option<String>) -> Result<Self> {
         let base = base.into();
         let http = reqwest::Client::builder()
             .build()
@@ -45,6 +47,7 @@ impl Client {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
+            token,
         })
     }
 
@@ -64,8 +67,22 @@ impl Client {
         serde_json::from_str(&text).with_context(|| format!("parsing response: {text}"))
     }
 
+    /// Attach the operator bearer token when one is configured. Every request
+    /// goes through `send`, so this is the only place that has to know: on a
+    /// customer-level call the server just ignores the header.
+    fn authorize(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => req.bearer_auth(token),
+            None => req,
+        }
+    }
+
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let resp = req.send().await.context("sending request")?;
+        let resp = self
+            .authorize(req)
+            .send()
+            .await
+            .context("sending request")?;
         Self::handle(resp).await
     }
 

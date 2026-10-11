@@ -64,6 +64,7 @@ makes every `nix build` / `nix run` slow. Once the tree is tracked (and
 
 ```sh
 esplp --server http://127.0.0.1:8080 <command>     # or export ESPLP_SERVER=...
+esplp --token <admin-token> prefix list           # or export ESPLP_TOKEN=...
 ```
 
 Commands (every API field is a flag):
@@ -90,6 +91,10 @@ Notes:
   for scripting: `P=$(esplp prefix create --quiet)`.
 - Not yet covered by the CLI: the `submit` / `status` transitions and the
   `?status=` filter — use the REST API or Swagger UI for those for now.
+- `prefix list` is admin-only, so it needs the operator token: `--token <tok>`
+  or `ESPLP_TOKEN`. Every other command is customer-level and needs no token.
+  Passing the token anyway is harmless — the server ignores it on those routes,
+  so one exported `ESPLP_TOKEN` is fine for everything.
 
 ## Web UI (`web/`)
 
@@ -105,7 +110,16 @@ npm --prefix web install
 npm --prefix web run build      # writes server/static; then just run the server
 npm --prefix web run dev        # dev server, /api proxied to 127.0.0.1:8080
 npm --prefix web run check      # svelte-check + tsc
-npm --prefix web test           # jsdom smoke test (needs a server on :8099)
+npm --prefix web test           # jsdom smoke test; see below for the server it needs
+```
+
+The smoke test mounts the built bundle in jsdom and drives it against a live
+server, so it needs a build in `server/static` plus a server on `:8099` started
+with an `ADMIN_TOKEN` — the same token must be in the test's environment:
+
+```sh
+DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 ./target/debug/espuino-label-printer &
+ADMIN_TOKEN=secret npm --prefix web test
 ```
 
 Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
@@ -127,6 +141,7 @@ stores no rendered back image.
 | `DATABASE_URL` | `sqlite://$DATA_DIR/cards.db`  | sqlx SQLite URL                      |
 | `RUST_LOG`     | `info,tower_http=info`         | tracing filter                       |
 | `STATIC_DIR`   | `server/static`                | built SPA to serve at `/`            |
+| `ADMIN_TOKEN`  | *(unset)*                      | operator bearer token; unset switches the admin API off |
 
 Layout on disk:
 
@@ -161,18 +176,54 @@ draft ──submit──▶ submitted ──paid──▶ paid ──▶ queued 
 - `GET /api/prefixes?status=paid` is the print queue's work list.
 - Transitions are validated; an invalid one returns `409`. Re-applying the
   current status is a no-op, so shop/queue callbacks can safely retry.
-- There is no separate auth: the prefix uuid is the capability.
+- There are no accounts: a customer's credential is the prefix uuid they know,
+  and the operator additionally presents a bearer token. See "Who may do what".
+
+## Who may do what
+
+There are no accounts. Two kinds of caller:
+
+- **Customer** — anyone holding a prefix uuid. That uuid *is* the credential,
+  and it cannot be discovered: listing is admin-only, so there is no
+  enumeration route. A customer can read and modify their own prefix and its
+  cards, submit it, and delete it while it is still writable.
+- **Operator** — sends `Authorization: Bearer $ADMIN_TOKEN`. Can list every
+  prefix, set any status at any time, delete a prefix in any state, and write
+  cards even while one is printing.
+
+| Operation                                  | Customer      | Operator |
+|--------------------------------------------|---------------|----------|
+| list prefixes                              | ✗             | ✓        |
+| create a prefix                            | ✓             | ✓        |
+| read a prefix / its cards / an image       | ✓             | ✓        |
+| add, edit or delete cards                  | ✓ if writable | ✓ always |
+| submit (`draft → submitted`)               | ✓             | ✓        |
+| set status (`PATCH .../status`)            | ✗             | ✓ (any transition) |
+| delete a prefix                            | ✓ if writable | ✓ always |
+
+"Writable" means `draft`, `submitted`, `paid` or `queued`. From `printing`
+onwards a prefix is frozen for customers; the operator can still work on it,
+which is what makes a stuck print job recoverable — a customer has no legal
+edge out of `printing`, and the operator can set any status regardless.
+
+When `ADMIN_TOKEN` is unset the admin API is switched off: admin-only calls
+answer `503` with an explanatory body while everything customer-facing keeps
+working. An unset token is never an open door.
+
+The token is compared in constant time. There is no rate limiting yet.
 
 ## API
+
+`(admin)` marks operations that need the bearer token.
 
 | Method | Path                                   | Purpose                       |
 |--------|----------------------------------------|-------------------------------|
 | POST   | `/api/prefixes`                        | create prefix (optional uuid) |
-| GET    | `/api/prefixes`                        | list prefixes (`?status=` filter) |
+| GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
-| DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs |
+| DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
 | POST   | `/api/prefixes/{prefix}/submit`        | submit for payment (draft→submitted) |
-| PATCH  | `/api/prefixes/{prefix}/status`        | shop/queue status transition  |
+| PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
 | GET    | `/api/prefixes/{prefix}/cards`         | index of cards in the prefix  |
 | POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id  |
 | DELETE | `/api/prefixes/{prefix}/cards`         | delete every card in the prefix |

@@ -1,3 +1,4 @@
+mod auth;
 mod db;
 mod error;
 mod models;
@@ -19,6 +20,32 @@ use utoipa_swagger_ui::SwaggerUi;
 pub struct AppState {
     pub pool: SqlitePool,
     pub data_dir: Arc<PathBuf>,
+    /// Bearer token granting operator rights. `None` disables the admin API.
+    pub admin_token: Option<Arc<str>>,
+}
+
+/// Declares the bearer scheme so Swagger UI offers an Authorize button and
+/// generated clients know how to authenticate the admin operations.
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("opaque")
+                        .description(Some(
+                            "Operator token: `Authorization: Bearer <ADMIN_TOKEN>`.",
+                        ))
+                        .build(),
+                ),
+            );
+        }
+    }
 }
 
 #[derive(OpenApi)]
@@ -26,8 +53,11 @@ pub struct AppState {
     info(
         title = "ESPuino Label Printer API",
         version = "0.1.0",
-        description = "Manage prefixes and printable RFID card labels (front image + optional B&W back text)."
+        description = "Manage prefixes and printable RFID card labels (front image + optional B&W back text). \
+            Two kinds of caller: a customer, whose credential is the prefix uuid they know, and the operator, \
+            who presents the admin bearer token for listing, status changes and overriding the print freeze."
     ),
+    modifiers(&SecurityAddon),
     paths(
         routes::create_prefix,
         routes::list_prefixes,
@@ -75,9 +105,25 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
     let pool = db::init_pool(&database_url).await?;
+
+    // Operator credential. Unset or blank means the admin API is switched off
+    // entirely, rather than left open.
+    let admin_token: Option<Arc<str>> = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .map(Arc::<str>::from);
+    if admin_token.is_none() {
+        tracing::warn!(
+            "ADMIN_TOKEN is not set: the admin API is disabled \
+             (listing prefixes and status changes will answer 503)"
+        );
+    }
+
     let state = AppState {
         pool,
         data_dir: Arc::new(data_dir),
+        admin_token,
     };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be

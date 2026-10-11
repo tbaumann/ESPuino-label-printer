@@ -21,6 +21,11 @@ struct Cli {
     #[arg(long, env = "ESPLP_SERVER", default_value = "http://127.0.0.1:8080", global = true)]
     server: String,
 
+    /// Operator bearer token. Needed for admin-only commands (`prefix list`);
+    /// harmless on customer-level ones.
+    #[arg(long, env = "ESPLP_TOKEN", global = true)]
+    token: Option<String>,
+
     /// Print raw JSON responses (default) or a short human summary.
     #[arg(long, global = true)]
     quiet: bool,
@@ -124,7 +129,7 @@ struct BatchArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new(cli.server.clone())?;
+    let client = Client::new(cli.server.clone(), cli.token.clone())?;
     let quiet = cli.quiet;
 
     match cli.command {
