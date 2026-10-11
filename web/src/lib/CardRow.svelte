@@ -6,11 +6,15 @@
     card,
     writable,
     onDeleted,
+    readonly = false,
   }: {
     prefix: string
     card: Card
     writable: boolean
-    onDeleted: (id: number) => void
+    onDeleted?: (id: number) => void
+    /** Preview only: values as text, no editing and no delete. The admin UI
+     * never modifies cards, it only wants the print preview. */
+    readonly?: boolean
   } = $props()
 
   // This row owns an editable copy of the fields. The parent only re-fetches
@@ -56,7 +60,7 @@
   }
 </script>
 
-<article class="card">
+<article class="card" class:preview-only={readonly}>
   <div>
     <div class="preview">
       <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${name}`} />
@@ -69,49 +73,70 @@
     <div class="caption muted">back · B&amp;W half panel</div>
   </div>
 
-  <div class="fields">
-    <div class="card-head">
-      <span class="card-id">#{card.id}</span>
-      {#if saveState === 'saving'}
-        <span class="save-state"><span class="spinner"></span> saving…</span>
-      {:else if saveState === 'saved'}
-        <span class="save-state">saved</span>
-      {:else if saveState === 'error'}
-        <span class="save-state" style="color:var(--danger)">{errMsg}</span>
-      {/if}
+  {#if readonly}
+    <div class="fields">
+      <div class="card-head"><span class="card-id">#{card.id}</span></div>
+
+      <div>
+        <div class="field-label">Name</div>
+        <div class="value">{name}</div>
+      </div>
+
+      <div>
+        <div class="field-label">Serial number</div>
+        <div class="value mono">{serial || '—'}</div>
+      </div>
+
+      <div>
+        <div class="field-label">Back text</div>
+        <pre class="value backtext">{back || '—'}</pre>
+      </div>
+    </div>
+  {:else}
+    <div class="fields">
+      <div class="card-head">
+        <span class="card-id">#{card.id}</span>
+        {#if saveState === 'saving'}
+          <span class="save-state"><span class="spinner"></span> saving…</span>
+        {:else if saveState === 'saved'}
+          <span class="save-state">saved</span>
+        {:else if saveState === 'error'}
+          <span class="save-state" style="color:var(--danger)">{errMsg}</span>
+        {/if}
+      </div>
+
+      <div>
+        <label for={`name-${card.id}`}>Name</label>
+        <input id={`name-${card.id}`} type="text" bind:value={name} oninput={schedule} disabled={!writable} />
+      </div>
+
+      <div>
+        <label for={`serial-${card.id}`}>Serial number</label>
+        <input
+          id={`serial-${card.id}`}
+          type="text"
+          bind:value={serial}
+          oninput={schedule}
+          disabled={!writable}
+          placeholder="optional"
+        />
+      </div>
+
+      <div>
+        <label for={`back-${card.id}`}>Back text </label>
+        <textarea
+          id={`back-${card.id}`}
+          rows="5"
+          bind:value={back}
+          oninput={schedule}
+          disabled={!writable}
+          placeholder="song list"
+        ></textarea>
+      </div>
     </div>
 
-    <div>
-      <label for={`name-${card.id}`}>Name</label>
-      <input id={`name-${card.id}`} type="text" bind:value={name} oninput={schedule} disabled={!writable} />
+    <div class="fields">
+      <button class="danger" onclick={() => onDeleted?.(card.id)} disabled={!writable}>Delete</button>
     </div>
-
-    <div>
-      <label for={`serial-${card.id}`}>Serial number</label>
-      <input
-        id={`serial-${card.id}`}
-        type="text"
-        bind:value={serial}
-        oninput={schedule}
-        disabled={!writable}
-        placeholder="optional"
-      />
-    </div>
-
-    <div>
-      <label for={`back-${card.id}`}>Back text </label>
-      <textarea
-        id={`back-${card.id}`}
-        rows="5"
-        bind:value={back}
-        oninput={schedule}
-        disabled={!writable}
-        placeholder="song list"
-      ></textarea>
-    </div>
-  </div>
-
-  <div class="fields">
-    <button class="danger" onclick={() => onDeleted(card.id)} disabled={!writable}>Delete</button>
-  </div>
+  {/if}
 </article>

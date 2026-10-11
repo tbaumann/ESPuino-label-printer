@@ -132,6 +132,20 @@ Front and back previews are rendered **client-side** — the front is the stored
 image, the back is `back_text` laid out in a CR80-aspect panel. The server
 stores no rendered back image.
 
+### Admin UI (`/admin`)
+
+The same SPA on an operator route. `/admin` asks for the token, trades it for
+the session cookie, then lists every prefix with its status, card count and
+order reference. Each row takes a new status, and there is a delete button;
+`/admin/p/<uuid>` shows that prefix's cards as a read-only **print preview** —
+front image and back panel, with no editor, no uploader and nothing that writes
+to a card.
+
+The admin views are just two more routes under `web/src/routes/`; there is no
+separate bundle. Since the session cookie is `HttpOnly`, the UI cannot read it,
+so every mutation goes through the shared `req()` helper in `web/src/lib/api.ts`,
+which attaches the `x-esplp-csrf` header automatically.
+
 ## Configuration (server environment)
 
 | Variable       | Default                        | Meaning                              |

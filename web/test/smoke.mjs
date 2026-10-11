@@ -20,6 +20,11 @@ const require = createRequire(import.meta.url)
 
 const BASE = process.argv[2] ?? 'http://127.0.0.1:8099'
 const realFetch = globalThis.fetch // Node's fetch, before we shim it per-scenario
+// The admin session cookie the bundle's own login sets. undici keeps no cookie
+// jar, so without this the session would never be replayed on later requests.
+let cookieJar = ''
+// Mutations the bundle made, so the CSRF header can be asserted on.
+const seen = []
 // Node's own FormData/Blob/File — the per-scenario globals are jsdom's, which
 // undici (Node fetch) cannot serialize into a multipart body.
 const NodeFormData = globalThis.FormData
@@ -59,16 +64,45 @@ async function mount(path, { bust }) {
     // navigator (and friends) are getter-only on Node's globalThis.
     Object.defineProperty(globalThis, k, { value: window[k], writable: true, configurable: true })
   }
+  // jsdom's confirm is unimplemented; the admin UI asks before deleting.
+  Object.defineProperty(globalThis, 'confirm', {
+    value: () => true,
+    writable: true,
+    configurable: true,
+  })
+
   // The bundle calls fetch('/api/…'); Node's fetch needs an absolute URL.
-  // jsdom does not implement fetch, so keep a handle on Node's.
-  globalThis.fetch = (input, init) =>
-    realFetch(typeof input === 'string' ? new URL(input, BASE).href : input, init)
+  // jsdom does not implement fetch, so keep a handle on Node's. Beyond URL
+  // resolution this shim replays the session cookie and records mutations, so
+  // the admin login and the CSRF header are exercised for real.
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? new URL(input, BASE).href : input
+    const opts = { ...(init ?? {}) }
+    const method = (opts.method ?? 'GET').toUpperCase()
+
+    const headers = new Headers(opts.headers ?? {})
+    if (cookieJar && !headers.has('cookie')) headers.set('cookie', cookieJar)
+    opts.headers = headers
+    if (method !== 'GET') seen.push({ method, csrf: headers.get('x-esplp-csrf') })
+
+    const res = await realFetch(url, opts)
+
+    const setCookie = res.headers.get('set-cookie')
+    if (setCookie) {
+      const m = setCookie.match(/esplp_admin=([^;]*)/)
+      if (m) cookieJar = m[1] ? `esplp_admin=${m[1]}` : ''
+    }
+    return res
+  }
 
   delete require.cache[require.resolve(bundlePath)]
   require(bundlePath)
-  await new Promise((r) => setTimeout(r, 1200))
+  await settle()
   return window
 }
+
+/** Let promise callbacks and Svelte's microtask flush settle. */
+const settle = (ms = 1200) => new Promise((r) => setTimeout(r, ms))
 
 const api = async (path, init) => {
   const res = await fetch(BASE + path, init)
@@ -171,6 +205,98 @@ console.log('\nB. project page renders a card')
   console.log('\nD. unknown project')
   const w3 = await mount('/p/00000000-0000-0000-0000-000000000000', { bust: 'd' })
   check('shows an error', /404/.test(w3.document.body.textContent ?? ''))
+}
+
+// ---- scenario E: the admin route asks for the token first -----------------
+console.log('\nE. admin login page')
+{
+  const w = await mount('/admin', { bust: 'e' })
+  const text = w.document.body.textContent ?? ''
+  check('admin route renders the login form', !!w.document.querySelector('input#admin-token'))
+  check('token field is a password input',
+    w.document.querySelector('input#admin-token')?.type === 'password')
+  check('offers a log in button', /Log in/.test(text))
+  check('no prefix list before logging in', !w.document.querySelector('.prow'))
+}
+
+// ---- scenario F: the admin UI — list, status, print preview, delete -------
+console.log('\nF. admin: list, status change, print preview, delete')
+{
+  const prefix = (
+    await api('/api/prefixes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  ).uuid
+
+  const fd = new NodeFormData()
+  fd.append('name', 'Admin Preview Card')
+  fd.append('serial_number', 'ADM-1')
+  fd.append('back_text', '01 Admin Song')
+  fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'admin.png')
+  await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+
+  // Log in through the real form, so the cookie and CSRF wiring are exercised.
+  const w = await mount('/admin', { bust: 'f1' })
+  const tok = w.document.querySelector('#admin-token')
+  tok.value = TOKEN
+  tok.dispatchEvent(new w.Event('input', { bubbles: true }))
+  await settle(150)
+  w.document.querySelector('form').dispatchEvent(
+    new w.Event('submit', { bubbles: true, cancelable: true }),
+  )
+  await settle(1500)
+
+  const text = w.document.body.textContent ?? ''
+  check('logged in, prefix list renders', !!w.document.querySelector('.prow'))
+  check('the seeded prefix is listed', text.includes(prefix))
+  check('row has a status select', !!w.document.querySelector(`select#status-${prefix}`))
+  check('login POST carried the CSRF header',
+    seen.some((r) => r.method === 'POST' && r.csrf))
+
+  // Change a status straight from the row.
+  const sel = w.document.querySelector(`select#status-${prefix}`)
+  sel.value = 'paid'
+  sel.dispatchEvent(new w.Event('change', { bubbles: true }))
+  await settle(1500)
+  const after = await api(`/api/prefixes/${prefix}`)
+  check('status change took effect', after.status === 'paid', after.status)
+  check('status PATCH carried the CSRF header',
+    seen.some((r) => r.method === 'PATCH' && r.csrf))
+
+  // Print preview: read-only, no card editor at all.
+  const w2 = await mount(`/admin/p/${prefix}`, { bust: 'f2' })
+  await settle(1500)
+  const t2 = w2.document.body.textContent ?? ''
+  check('print preview renders the card', !!w2.document.querySelector('.card.preview-only'))
+  check('preview shows the front image',
+    !!w2.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/image"]`))
+  check('preview shows the back half-panel text', t2.includes('01 Admin Song'))
+  check('preview shows the name as text', t2.includes('Admin Preview Card'))
+  check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
+  check('preview has no upload dropzone', !w2.document.querySelector('.dropzone'))
+  check('preview offers no way to add cards', !/drop some images|upload/i.test(t2))
+  check('has a prefix delete button', !!w2.document.querySelector('button.danger'))
+
+  // The detail form also carries the order reference.
+  const st = w2.document.querySelector('#admin-status')
+  st.value = 'queued'
+  st.dispatchEvent(new w2.Event('change', { bubbles: true }))
+  const ref = w2.document.querySelector('#admin-order-ref')
+  ref.value = 'ADM-9'
+  ref.dispatchEvent(new w2.Event('input', { bubbles: true }))
+  await settle(150)
+  ;[...w2.document.querySelectorAll('button')].find((b) => /Apply/.test(b.textContent)).click()
+  await settle(1500)
+  const after2 = await api(`/api/prefixes/${prefix}`)
+  check('status set from the detail page', after2.status === 'queued', after2.status)
+  check('order reference saved alongside it', after2.order_ref === 'ADM-9', String(after2.order_ref))
+
+  // Delete the prefix, from the detail page.
+  w2.document.querySelector('button.danger').click()
+  await settle(1500)
+  check('delete returns to the prefix list', w2.location.pathname === '/admin', w2.location.pathname)
+  const gone = await realFetch(`${BASE}/api/prefixes/${prefix}`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  check('prefix is gone from the server', gone.status === 404, String(gone.status))
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

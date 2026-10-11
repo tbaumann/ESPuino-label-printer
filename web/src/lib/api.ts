@@ -37,8 +37,17 @@ export interface CardPatch {
   back_text?: string
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init)
+/** Required on cookie-authenticated mutations; the server calls this CSRF. */
+const CSRF_HEADER = 'x-esplp-csrf'
+const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method ?? 'GET').toUpperCase()
+  const headers = new Headers(init.headers)
+  // Sent on every mutation. Harmless on customer calls — they carry no cookie,
+  // so the server does not check — and required once the admin session is set.
+  if (MUTATING.has(method)) headers.set(CSRF_HEADER, '1')
+  const res = await fetch(path, { ...init, headers })
   const text = await res.text()
   if (!res.ok) {
     let msg = text || res.statusText
@@ -98,6 +107,57 @@ export const api = {
 
   cardImageUrl: (p: string, id: number): string =>
     `/api/prefixes/${p}/cards/${id}/image`,
+}
+
+export const STATUSES: PrefixStatus[] = [
+  'draft',
+  'submitted',
+  'paid',
+  'queued',
+  'printing',
+  'printed',
+  'cancelled',
+]
+
+/** Operator-only calls. These need the admin session cookie (or a bearer token). */
+export const adminApi = {
+  /** Exchange the operator token for a session cookie. */
+  login: (token: string): Promise<void> =>
+    req<void>('/api/admin/session', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
+
+  logout: (): Promise<void> => req<void>('/api/admin/session', { method: 'DELETE' }),
+
+  /**
+   * Session state on page load. Raw fetch rather than req(), because "not
+   * logged in" (401) and "admin API switched off" (503) are both expected
+   * answers here, not errors.
+   */
+  session: async (): Promise<'authed' | 'anon' | 'disabled'> => {
+    const res = await fetch('/api/admin/session')
+    if (res.ok) return 'authed'
+    return res.status === 503 ? 'disabled' : 'anon'
+  },
+
+  listPrefixes: (status?: PrefixStatus | ''): Promise<Prefix[]> =>
+    req<Prefix[]>(`/api/prefixes${status ? `?status=${status}` : ''}`),
+
+  /** The operator may set any status, including backwards out of `printing`. */
+  setStatus: (p: string, status: PrefixStatus, orderRef?: string): Promise<Prefix> =>
+    req<Prefix>(`/api/prefixes/${p}/status`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(
+        orderRef === undefined ? { status } : { status, order_ref: orderRef },
+      ),
+    }),
+
+  /** Deletes the prefix, every card and every blob under it. */
+  deletePrefix: (p: string): Promise<void> =>
+    req<void>(`/api/prefixes/${p}`, { method: 'DELETE' }),
 }
 
 /** Remembered projects, so the auto-created landing page isn't a dead end. */
