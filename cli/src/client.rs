@@ -1,0 +1,159 @@
+use anyhow::{bail, Context, Result};
+use reqwest::multipart::{Form, Part};
+use serde_json::Value;
+use std::path::Path;
+
+/// Thin HTTP client over the ESPuino Label Printer REST API.
+pub struct Client {
+    base: String,
+    http: reqwest::Client,
+}
+
+/// Guess a content type from a file extension. Matches the server's accepted
+/// set; unknown extensions are sent as octet-stream and rejected server-side.
+pub fn mime_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+pub fn is_image(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("webp") | Some("gif")
+    )
+}
+
+impl Client {
+    pub fn new(base: impl Into<String>) -> Result<Self> {
+        let base = base.into();
+        let http = reqwest::Client::builder()
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            http,
+        })
+    }
+
+    async fn handle(resp: reqwest::Response) -> Result<Value> {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or(text);
+            bail!("HTTP {status}: {msg}");
+        }
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).with_context(|| format!("parsing response: {text}"))
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        let resp = req.send().await.context("sending request")?;
+        Self::handle(resp).await
+    }
+
+    pub async fn create_prefix(&self, uuid: Option<&str>) -> Result<Value> {
+        let body = match uuid {
+            Some(u) => serde_json::json!({ "uuid": u }),
+            None => serde_json::json!({}),
+        };
+        self.send(self.http.post(format!("{}/api/prefixes", self.base)).json(&body))
+            .await
+    }
+
+    pub async fn list_prefixes(&self) -> Result<Value> {
+        self.send(self.http.get(format!("{}/api/prefixes", self.base)))
+            .await
+    }
+
+    pub async fn get_prefix(&self, prefix: &str) -> Result<Value> {
+        self.send(self.http.get(format!("{}/api/prefixes/{prefix}", self.base)))
+            .await
+    }
+
+    pub async fn list_cards(&self, prefix: &str) -> Result<Value> {
+        self.send(
+            self.http
+                .get(format!("{}/api/prefixes/{prefix}/cards", self.base)),
+        )
+        .await
+    }
+
+    pub async fn get_card(&self, prefix: &str, id: i64) -> Result<Value> {
+        self.send(
+            self.http
+                .get(format!("{}/api/prefixes/{prefix}/cards/{id}", self.base)),
+        )
+        .await
+    }
+
+    pub async fn delete_card(&self, prefix: &str, id: i64) -> Result<Value> {
+        self.send(
+            self.http
+                .delete(format!("{}/api/prefixes/{prefix}/cards/{id}", self.base)),
+        )
+        .await
+    }
+
+    /// Upload one card image. `id = Some(_)` uses PUT (create/replace at that
+    /// index); `None` lets the server assign the next id via POST.
+    pub async fn upload_card(
+        &self,
+        prefix: &str,
+        file: &Path,
+        name: &str,
+        serial_number: Option<&str>,
+        back_text: Option<&str>,
+        id: Option<i64>,
+    ) -> Result<Value> {
+        let bytes = tokio::fs::read(file)
+            .await
+            .with_context(|| format!("reading {}", file.display()))?;
+        let filename = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image")
+            .to_string();
+
+        let part = Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(mime_for(file))?;
+
+        let mut form = Form::new()
+            .text("name", name.to_string())
+            .part("image", part);
+        if let Some(s) = serial_number {
+            form = form.text("serial_number", s.to_string());
+        }
+        if let Some(b) = back_text {
+            form = form.text("back_text", b.to_string());
+        }
+
+        let req = match id {
+            Some(id) => self
+                .http
+                .put(format!("{}/api/prefixes/{prefix}/cards/{id}", self.base)),
+            None => self
+                .http
+                .post(format!("{}/api/prefixes/{prefix}/cards", self.base)),
+        };
+        self.send(req.multipart(form)).await
+    }
+}

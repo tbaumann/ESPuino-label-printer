@@ -1,0 +1,13 @@
+/target
+/data
+# SPA: build output is generated, dependencies are not source.
+# (Also keeps them out of `lib.cleanSource` for the Nix build.)
+web/node_modules/
+web/dist/
+server/static/
+*.db
+*.db-shm
+*.db-wal
+.env
+# nix build symlinks (result, result-1, ...)
+result*
