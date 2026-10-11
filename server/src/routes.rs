@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::auth;
 use crate::db;
 use crate::error::ApiError;
-use crate::models::{Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus, StatusInput};
+use crate::models::{
+    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus,
+    StatusInput,
+};
 use crate::AppState;
 
 fn parse_uuid(s: &str) -> Result<Uuid, ApiError> {
@@ -147,7 +150,7 @@ pub struct StatusQuery {
 /// list exposes every customer's uuid, which is their only credential.
 #[utoipa::path(get, path = "/api/prefixes", tag = "prefixes",
     params(("status" = Option<String>, Query, description = "filter by status (draft|submitted|paid|queued|printing|printed|cancelled)")),
-    security(("bearerAuth" = [])),
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = [Prefix]),
         (status = 401, description = "admin token required", body = crate::error::ErrorBody),
@@ -426,7 +429,7 @@ pub async fn submit_prefix(
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}/status", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body = StatusInput,
-    security(("bearerAuth" = [])),
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = Prefix),
         (status = 401, description = "admin token required", body = crate::error::ErrorBody),
@@ -452,6 +455,84 @@ pub async fn patch_status(
         )
         .await?,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Admin session — how the admin UI logs in
+// ---------------------------------------------------------------------------
+
+/// Should the session cookie carry `Secure`?
+///
+/// Off by default so local http development works; force it with
+/// `SESSION_COOKIE_SECURE=true`, or let a reverse proxy advertise https via
+/// `X-Forwarded-Proto`.
+fn cookie_secure(st: &AppState, headers: &HeaderMap) -> bool {
+    st.cookie_secure.unwrap_or_else(|| {
+        headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+    })
+}
+
+/// Log the operator in: exchange the admin token for a session cookie.
+///
+/// The token travels once, in the body. From then on the browser carries an
+/// `HttpOnly` cookie instead, so injected script cannot read the credential
+/// back out of the page.
+#[utoipa::path(post, path = "/api/admin/session", tag = "admin",
+    request_body = AdminLogin,
+    responses(
+        (status = 204, description = "logged in; a session cookie is set"),
+        (status = 401, description = "wrong token", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
+pub async fn admin_login(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AdminLogin>,
+) -> Result<Response, ApiError> {
+    auth::verify_token(&st, &input.token)?;
+    let id = st.sessions.create();
+    let secure = cookie_secure(&st, &headers);
+    let cookie = format!(
+        "{name}={id}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={ttl}{secure}",
+        name = auth::SESSION_COOKIE,
+        ttl = auth::SESSION_TTL.as_secs(),
+        secure = if secure { "; Secure" } else { "" },
+    );
+    Ok(([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response())
+}
+
+/// Log out. Idempotent: always 204, whether or not a session existed.
+#[utoipa::path(delete, path = "/api/admin/session", tag = "admin",
+    responses((status = 204, description = "logged out")))]
+pub async fn admin_logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(id) = auth::cookie_value(&headers, auth::SESSION_COOKIE) {
+        st.sessions.revoke(&id);
+    }
+    let expired = format!(
+        "{name}=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0",
+        name = auth::SESSION_COOKIE,
+    );
+    ([(header::SET_COOKIE, expired)], StatusCode::NO_CONTENT).into_response()
+}
+
+/// Report whether the caller is a logged-in operator. The admin UI calls this
+/// on load to choose between the login form and the dashboard.
+#[utoipa::path(get, path = "/api/admin/session", tag = "admin",
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, body = AdminSession),
+        (status = 401, description = "not logged in", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
+pub async fn admin_session(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminSession>, ApiError> {
+    auth::resolve(&st, &headers).require_admin()?;
+    Ok(Json(AdminSession { authenticated: true }))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -486,5 +567,15 @@ pub fn router(state: AppState) -> Router {
             "/api/prefixes/:prefix/cards/:id/image",
             axum::routing::get(get_card_image),
         )
+        .route(
+            "/api/admin/session",
+            axum::routing::post(admin_login)
+                .get(admin_session)
+                .delete(admin_logout),
+        )
+        // Second CSRF lock, on top of SameSite=Strict: a cookie-authenticated
+        // mutation must also carry the custom header. Applied to the API router
+        // only, so the SPA and Swagger UI are untouched.
+        .layer(axum::middleware::from_fn(auth::csrf_guard))
         .with_state(state)
 }

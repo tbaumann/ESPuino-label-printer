@@ -22,6 +22,11 @@ pub struct AppState {
     pub data_dir: Arc<PathBuf>,
     /// Bearer token granting operator rights. `None` disables the admin API.
     pub admin_token: Option<Arc<str>>,
+    /// Live admin UI logins (the session cookie).
+    pub sessions: auth::Sessions,
+    /// Force `Secure` on the session cookie. `None` = infer per request from
+    /// `X-Forwarded-Proto`, which is what you want behind a TLS proxy.
+    pub cookie_secure: Option<bool>,
 }
 
 /// Declares the bearer scheme so Swagger UI offers an Authorize button and
@@ -30,7 +35,9 @@ struct SecurityAddon;
 
 impl utoipa::Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        use utoipa::openapi::security::{
+            ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+        };
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "bearerAuth",
@@ -39,10 +46,20 @@ impl utoipa::Modify for SecurityAddon {
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("opaque")
                         .description(Some(
-                            "Operator token: `Authorization: Bearer <ADMIN_TOKEN>`.",
+                            "Operator token: `Authorization: Bearer <ADMIN_TOKEN>`. \
+                             Used by the CLI, which is not a browser and has no cookie.",
                         ))
                         .build(),
                 ),
+            );
+            components.add_security_scheme(
+                "sessionCookie",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                    auth::SESSION_COOKIE,
+                    "Admin UI session, set by POST /api/admin/session. HttpOnly, so script \
+                     cannot read it. Mutating requests must additionally carry the \
+                     x-esplp-csrf header.",
+                ))),
             );
         }
     }
@@ -73,6 +90,9 @@ impl utoipa::Modify for SecurityAddon {
         routes::get_card_image,
         routes::patch_card,
         routes::delete_card,
+        routes::admin_login,
+        routes::admin_session,
+        routes::admin_logout,
     ),
     components(schemas(
         models::Prefix,
@@ -83,6 +103,8 @@ impl utoipa::Modify for SecurityAddon {
         models::CardIndex,
         models::CardInput,
         models::CardPatch,
+        models::AdminLogin,
+        models::AdminSession,
         error::ErrorBody,
     ))
 )]
@@ -120,10 +142,22 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Force the session cookie's Secure flag, or leave it to be inferred from
+    // X-Forwarded-Proto per request. Unrecognised values are ignored.
+    let cookie_secure = std::env::var("SESSION_COOKIE_SECURE")
+        .ok()
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        });
+
     let state = AppState {
         pool,
         data_dir: Arc::new(data_dir),
         admin_token,
+        sessions: auth::Sessions::new(),
+        cookie_secure,
     };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be

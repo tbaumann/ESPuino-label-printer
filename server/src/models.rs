@@ -141,3 +141,17 @@ pub struct StatusInput {
     /// Optional external order reference (typically set when marking paid).
     pub order_ref: Option<String>,
 }
+
+/// Operator token, exchanged for a session cookie. Sent once, over the wire,
+/// at login — after that the browser only carries the cookie.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AdminLogin {
+    pub token: String,
+}
+
+/// Result of `GET /api/admin/session`, used by the admin UI to decide whether
+/// it is already logged in.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminSession {
+    pub authenticated: bool,
+}

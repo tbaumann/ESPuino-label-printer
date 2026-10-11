@@ -142,6 +142,7 @@ stores no rendered back image.
 | `RUST_LOG`     | `info,tower_http=info`         | tracing filter                       |
 | `STATIC_DIR`   | `server/static`                | built SPA to serve at `/`            |
 | `ADMIN_TOKEN`  | *(unset)*                      | operator bearer token; unset switches the admin API off |
+| `SESSION_COOKIE_SECURE` | *(unset)*             | force the `Secure` flag on the admin session cookie; unset = infer from `X-Forwarded-Proto` |
 
 Layout on disk:
 
@@ -187,9 +188,10 @@ There are no accounts. Two kinds of caller:
   and it cannot be discovered: listing is admin-only, so there is no
   enumeration route. A customer can read and modify their own prefix and its
   cards, submit it, and delete it while it is still writable.
-- **Operator** — sends `Authorization: Bearer $ADMIN_TOKEN`. Can list every
-  prefix, set any status at any time, delete a prefix in any state, and write
-  cards even while one is printing.
+- **Operator** — either sends `Authorization: Bearer $ADMIN_TOKEN` (the CLI), or
+  logs in through the admin UI, which trades the token for a session cookie.
+  Can list every prefix, set any status at any time, delete a prefix in any
+  state, and write cards even while one is printing.
 
 | Operation                                  | Customer      | Operator |
 |--------------------------------------------|---------------|----------|
@@ -212,9 +214,36 @@ working. An unset token is never an open door.
 
 The token is compared in constant time. There is no rate limiting yet.
 
+### Admin session
+
+`POST /api/admin/session` with `{"token": "…"}` sets:
+
+```
+esplp_admin=<random>; Path=/api; HttpOnly; SameSite=Strict; Max-Age=43200
+```
+
+`HttpOnly` keeps script from reading it, so a stored-XSS bug cannot steal the
+credential — which is why the admin UI gets a cookie rather than holding the
+token in JS. The price is that cookies are *ambient*: a browser attaches them to
+cross-site requests too. Two locks answer that:
+
+  - `SameSite=Strict` — the cookie is not sent from another site at all;
+  - every non-GET request that carries the cookie must also send an
+    `x-esplp-csrf` header, or it gets `403`. A cross-site page cannot add one.
+
+Bearer-token callers are exempt from the header rule: a browser never sets that
+header by itself, so there is nothing to forge.
+
+`GET /api/admin/session` answers `200`/`401` so the UI can tell whether it is
+already logged in. `DELETE /api/admin/session` logs out, and is idempotent.
+Sessions live in memory and expire after 12h, so restarting the server logs the
+operator out. `Secure` is added to the cookie when `X-Forwarded-Proto: https` is
+present; force it with `SESSION_COOKIE_SECURE=true` (or `=false` to suppress).
+
 ## API
 
-`(admin)` marks operations that need the bearer token.
+`(admin)` marks operations that need the admin credential — the bearer token or
+an admin session.
 
 | Method | Path                                   | Purpose                       |
 |--------|----------------------------------------|-------------------------------|
@@ -232,6 +261,9 @@ The token is compared in constant time. There is no rate limiting yet.
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
+| POST   | `/api/admin/session`                   | log in: token → session cookie |
+| GET    | `/api/admin/session`                   | am I logged in? **(admin)**   |
+| DELETE | `/api/admin/session`                   | log out                       |
 
 Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
 `name`, `serial_number`, `back_text` and a file part `image`.

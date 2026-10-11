@@ -20,6 +20,9 @@ pub enum ApiError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("admin API unavailable: {0}")]
     Unavailable(String),
 
@@ -40,6 +43,7 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             ApiError::Db(_) | ApiError::Io(_) | ApiError::Internal(_) => {
