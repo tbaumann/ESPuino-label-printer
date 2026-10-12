@@ -420,6 +420,41 @@ check(
     str(prefix_state(via_meta)),
 )
 
+# --- 6b. an abandoned checkout expires and reverts to draft -----------------
+print("\n6b. checkout.session.expired")
+abandoned = new_prefix(cards=1, start_checkout=True)
+check(
+    "the prefix opened for payment is payment_pending",
+    prefix_state(abandoned) == "payment_pending",
+    str(prefix_state(abandoned)),
+)
+deliver(payment_event(prefix=abandoned, kind="checkout.session.expired", session="cs_abandoned"))
+check(
+    "an expired (abandoned or declined) checkout reverts the prefix to draft",
+    prefix_state(abandoned) == "draft",
+    str(prefix_state(abandoned)),
+)
+deliver(payment_event(prefix=abandoned, kind="checkout.session.expired", session="cs_abandoned"))
+check(
+    "a replayed expired event leaves the draft alone",
+    prefix_state(abandoned) == "draft",
+    str(prefix_state(abandoned)),
+)
+# The unsealed prefix is writable again: the customer can edit cards once more.
+data, content_type = multipart(
+    {"name": "Edited", "serial_number": "S1", "back_text": "01 Song"},
+    "card.png",
+    open(CARD_PNG, "rb").read(),
+)
+code, _ = request(
+    "PUT", f"/api/prefixes/{abandoned}/cards/1", data=data, headers={"content-type": content_type}
+)
+check(
+    "and the customer's write window is open again",
+    code == 200,
+    str(code),
+)
+
 # Cancelling needs the operator token, so this one check is opt-in.
 admin_token = os.environ.get("ADMIN_TOKEN")
 if not admin_token:
