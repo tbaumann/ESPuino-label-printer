@@ -258,6 +258,5 @@ To settle when it is built:
 - Rate-limit failed admin logins and the bearer path.
 - Server-side render of the black-only card back (client-side preview only so
   far) — needed by the print queue, and per print mode.
-- `PUT /api/prefixes/{prefix}` for an idempotent customer-chosen uuid.
 - Admin sessions live in memory, so a restart logs the operator out. Fine for
   now; move to a table if that becomes annoying.

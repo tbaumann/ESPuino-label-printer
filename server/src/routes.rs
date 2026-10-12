@@ -154,6 +154,32 @@ pub async fn create_prefix(
     Ok((StatusCode::CREATED, Json(p)))
 }
 
+/// Create a prefix at the uuid in the path, or return the existing one if it
+/// is already there. Idempotent: the same PUT twice is harmless, and answers
+/// 201 on first creation and 200 on subsequent (no-op) calls.
+#[utoipa::path(
+    put, path = "/api/prefixes/{prefix}", tag = "prefixes",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    responses(
+        (status = 201, description = "created", body = Prefix),
+        (status = 200, description = "already exists", body = Prefix),
+        (status = 400, description = "invalid uuid", body = crate::error::ErrorBody)
+    )
+)]
+pub async fn put_prefix(
+    State(st): State<AppState>,
+    Path(prefix): Path<String>,
+) -> Result<(StatusCode, Json<Prefix>), ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let (p, created) = db::upsert_prefix(&st.pool, prefix).await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(p)))
+}
+
 /// Query for listing prefixes.
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
@@ -855,7 +881,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/prefixes/:prefix",
-            axum::routing::get(get_prefix).delete(delete_prefix),
+            axum::routing::get(get_prefix)
+                .put(put_prefix)
+                .delete(delete_prefix),
         )
         // Kept as an explicit tombstone rather than deleted, so a stale client
         // gets a 410 with a reason instead of a 405 from the static fallback.

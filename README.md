@@ -393,6 +393,7 @@ an admin session.
 | Method | Path                                   | Purpose                       |
 |--------|----------------------------------------|-------------------------------|
 | POST   | `/api/prefixes`                        | create prefix (optional uuid) |
+| PUT    | `/api/prefixes/{prefix}`               | create prefix at path uuid, idempotent |
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |

@@ -101,6 +101,18 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
     prefix_from_row(&row)
 }
 
+/// Create a prefix at a customer-chosen uuid, or return the existing one if it
+/// is already there (idempotent `PUT /api/prefixes/{prefix}`). Returns
+/// `(prefix, created)` so the caller can answer 201 vs 200.
+pub async fn upsert_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<(Prefix, bool), ApiError> {
+    match create_prefix(pool, Some(uuid)).await {
+        Ok(p) => Ok((p, true)),
+        // Already exists: an idempotent PUT returns it rather than 409ing.
+        Err(ApiError::Conflict(_)) => Ok((get_prefix(pool, uuid).await?, false)),
+        Err(e) => Err(e),
+    }
+}
+
 /// List prefixes, optionally filtered by status (e.g. `paid` for the print queue).
 /// Admin-only: carries the operator's `unprinted_count` per prefix.
 pub async fn list_prefixes(
@@ -409,4 +421,75 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
         unprinted_count,
         resume,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    /// A fresh in-memory database with all migrations applied.
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
+
+    #[tokio::test]
+    async fn upsert_creates_and_is_idempotent() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+
+        // First PUT creates.
+        let (p, created) = upsert_prefix(&pool, uuid).await.expect("first upsert");
+        assert!(created);
+        assert_eq!(p.uuid, uuid);
+        assert_eq!(p.status, PrefixStatus::Draft);
+
+        // Second PUT is a no-op, not an error, and returns the same prefix.
+        let (p2, created2) = upsert_prefix(&pool, uuid).await.expect("second upsert");
+        assert!(!created2);
+        assert_eq!(p2.uuid, uuid);
+        assert_eq!(p2.status, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn upsert_does_not_disturb_an_existing_prefix() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+        upsert_prefix(&pool, uuid).await.expect("create");
+
+        // Shuffle the status (only legal from draft in a real transition, so go
+        // via the transition table) — the point is that a repeat upsert must not
+        // reset it back to draft.
+        set_status(&pool, uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("transition to payment_pending");
+
+        let (p, created) = upsert_prefix(&pool, uuid).await.expect("repeat upsert");
+        assert!(!created);
+        // Force must stay false here: set_status was called non-force above.
+        assert_eq!(p.status, PrefixStatus::PaymentPending);
+    }
+
+    #[tokio::test]
+    async fn create_prefix_still_conflicts_on_duplicate() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+        upsert_prefix(&pool, uuid).await.expect("first create");
+        let err = create_prefix(&pool, Some(uuid)).await.expect_err(
+            "a bare POST create must still 409 on a duplicate uuid",
+        );
+        assert!(matches!(err, ApiError::Conflict(_)));
+    }
 }
