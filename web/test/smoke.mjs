@@ -184,6 +184,45 @@ console.log('\nB. project page renders a card')
   check('shows 1 card', text.includes('1 card'))
   check('name input is editable', !w.document.querySelector('input#name-1')?.disabled)
 
+  // ---- scenario B2: markdown back_text renders sanitised in the preview ----
+  console.log('\nB2. markdown back_text renders sanitised in the back preview')
+  {
+    const mdPrefix = (
+      await api('/api/prefixes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+    ).uuid
+
+    const md = [
+      '# Title',
+      '',
+      '**bold** and *italic*',
+      '',
+      '- one',
+      '- two',
+      '',
+      '[link](https://example.com)',
+      '',
+      '![img](https://example.com/x.png)',
+      '',
+      '<script>alert(1)</script>',
+    ].join('\n')
+    const fd = new NodeFormData()
+    fd.append('name', 'MD Card')
+    fd.append('back_text', md)
+    fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'md.png')
+    await api(`/api/prefixes/${mdPrefix}/cards`, { method: 'POST', body: fd })
+
+    const w = await mount(`/p/${mdPrefix}`, { bust: 'b2' })
+    const half = w.document.querySelector('.preview.back .halfpanel')
+    const html = half?.innerHTML ?? ''
+    check('renders a heading', /<h1>Title<\/h1>/.test(html), html)
+    check('renders bold', /<strong>bold<\/strong>/.test(html))
+    check('renders italic', /<em>italic<\/em>/.test(html))
+    check('renders a list', /<ul>/.test(html) && /<li>one<\/li>/.test(html))
+    check('link is plain text, no <a>', !/<a\b/.test(html) && /link/.test(html))
+    check('image is refused', !/<img\b/.test(html))
+    check('raw HTML is stripped', !/<script\b/.test(html) && !/alert\(1\)/.test(html))
+  }
+
   // ---- scenario C: the auth boundary, then a frozen project ---------------
   console.log('\nC. auth boundary and the print freeze')
   check('list prefixes without a token -> 401', (await listPrefixes('')) === 401)

@@ -18,21 +18,23 @@ and `get_card_image`.
 
 ## Markdown in the back text
 
-Decided: `back_text` is markdown, rendered into the black-only card back. The editor
-and the renderer are a solved problem — pick one and do not hand-roll either.
+Decided and built: `back_text` is markdown, rendered into the black-only card
+back. The editor and the renderer are a solved problem — the SPA uses `marked`
+plus `DOMPurify` (`web/src/lib/backText.ts`), no hand-rolled parser.
 
-  - Sanitise on render, no raw HTML passthrough, and avoid `{@html}` unless the
-    string has been through the sanitiser. `back_text` is the dangerous field:
-    free-form, aimed at song lists, and the one a customer is most likely to paste
-    into.
-  - **Two renderers have to agree**, or the guarantee is worse than no preview: the
-    SPA preview the customer approves, and the server-side renderer the print queue
-    will need (see "Also outstanding"). Same subset, or the card comes out different
-    from what was ordered.
-  - The medium is 1-bit black: no colour, no greys. Decide what an image in the
-    markdown does — dither, or refuse it outright — and keep the supported subset
-    small. Headings, bold, italic and lists earn their keep; links are just text on
-    a card, since there is nothing to click.
+  - Sanitised on render: the output is run through DOMPurify against an
+    allowlist of exactly the subset tags, so `{@html}` in the component is safe.
+    No raw HTML passthrough — a `<script>` in the markdown is stripped.
+  - **Two renderers have to agree**, or the guarantee is worse than no preview:
+    the SPA preview the customer approves, and the server-side renderer the
+    print queue needs (see "Also outstanding"). Same subset, or the card comes
+    out different from what was ordered. The subset contract lives in the doc
+    comment of `web/src/lib/backText.ts`; the server renderer must match it.
+  - The medium is 1-bit black: no colour, no greys. Images in the markdown are
+    **refused outright** (the whole construct is dropped, alt text included).
+    The supported subset is small: headings, bold, italic and lists. Links are
+    just text on a card — rendered as their text, never an `<a>`, so a
+    `javascript:` href is inert.
 
 `name` and `serial_number` stay plain text.
 

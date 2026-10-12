@@ -323,6 +323,32 @@ section.panel {
   overflow: auto;
 }
 
+/* Markdown rendered into the black-only back. The subset is small (headings,
+   bold, italic, lists) and the medium is 1-bit black, so keep it flat: no
+   margins between blocks, tight lists, and the same mono face as the rest of
+   the back. */
+.preview.back .halfpanel h1,
+.preview.back .halfpanel h2,
+.preview.back .halfpanel h3,
+.preview.back .halfpanel h4,
+.preview.back .halfpanel h5,
+.preview.back .halfpanel h6 {
+  font-size: inherit;
+  font-weight: 700;
+  margin: 0;
+}
+.preview.back .halfpanel p {
+  margin: 0;
+}
+.preview.back .halfpanel ul,
+.preview.back .halfpanel ol {
+  margin: 0;
+  padding-left: 14px;
+}
+.preview.back .halfpanel li {
+  margin: 0;
+}
+
 .preview .caption {
   font-size: 11px;
   color: var(--muted);

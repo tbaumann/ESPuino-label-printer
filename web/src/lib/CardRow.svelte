@@ -1,5 +1,6 @@
 <script lang="ts">
   import { api, type Card } from './api'
+  import { renderBackText } from './backText'
 
   let {
     prefix,
@@ -27,6 +28,10 @@
   let serial = $state(card.serial_number ?? '')
   // svelte-ignore state_referenced_locally
   let back = $state(card.back_text ?? '')
+
+  // The card-back preview renders `back` as markdown. The output has been
+  // through the sanitiser (renderBackText), so `{@html}` on it is safe.
+  const backHtml = $derived(back ? renderBackText(back) : '')
 
   // NB: do not name this `state` — a bare `state` variable collides with the
   // `$state` rune, which stops the component being compiled in runes mode.
@@ -68,7 +73,7 @@
     <div class="caption muted">front</div>
 
     <div class="preview back" style="margin-top:10px">
-      <div class="halfpanel">{back || '—'}</div>
+      <div class="halfpanel">{@html backHtml || '—'}</div>
     </div>
     <div class="caption muted">back · B&amp;W half panel</div>
   </div>
