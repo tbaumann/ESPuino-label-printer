@@ -80,6 +80,7 @@ impl utoipa::Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     paths(
         routes::create_prefix,
+        routes::put_prefix,
         routes::list_prefixes,
         routes::get_prefix,
         routes::delete_prefix,
