@@ -135,7 +135,7 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
 /// is already there (idempotent `PUT /api/prefixes/{prefix}`). Returns
 /// `(prefix, created)` so the caller can answer 201 vs 200.
 pub async fn upsert_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<(Prefix, bool), ApiError> {
-    match create_prefix(pool, Some(uuid)).await {
+    match create_prefix(pool, Some(uuid), None).await {
         Ok(p) => Ok((p, true)),
         // Already exists: an idempotent PUT returns it rather than 409ing.
         Err(ApiError::Conflict(_)) => Ok((get_prefix(pool, uuid).await?, false)),
@@ -535,7 +535,7 @@ mod tests {
         let pool = test_pool().await;
         let uuid = Uuid::new_v4();
         upsert_prefix(&pool, uuid).await.expect("first create");
-        let err = create_prefix(&pool, Some(uuid)).await.expect_err(
+        let err = create_prefix(&pool, Some(uuid), None).await.expect_err(
             "a bare POST create must still 409 on a duplicate uuid",
         );
         assert!(matches!(err, ApiError::Conflict(_)));
