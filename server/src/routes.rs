@@ -13,8 +13,9 @@ use crate::auth;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{
-    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixModePatch,
-    PrefixStatus, PrintMode, PrintQueue, ShopConfig, StatusInput,
+    AdminLogin, AdminSession, Card, CardIndex, CardPatch, NeedsAttentionItem, NeedsAttentionKind,
+    Prefix, PrefixInput, PrefixModePatch, PrefixStatus, PrintMode, PrintQueue, ShopConfig,
+    StatusInput,
 };
 use crate::stripe;
 use crate::AppState;
@@ -742,6 +743,81 @@ pub async fn admin_session(
 }
 
 // ---------------------------------------------------------------------------
+// Needs attention — payment dead ends where money and orders disagree
+// ---------------------------------------------------------------------------
+
+/// How long a `payment_pending` prefix may sit before the checkout counts as
+/// abandoned and the prefix lands on the "needs attention" list.
+///
+/// Stripe Checkout sessions expire by default after 24 hours and fire
+/// `checkout.session.expired`, which reverts a pending prefix to draft. So a
+/// prefix still `payment_pending` after this window means the expiry never
+/// reached us (or was missed) and the order is genuinely stuck — not a
+/// customer who is still at the checkout in the last few minutes.
+const ABANDONED_CHECKOUT_AFTER_SECS: i64 = 24 * 3600;
+
+/// The admin "needs attention" list: prefixes where money and the order
+/// disagree, each with an `action` saying what to do. **Admin only.**
+///
+/// Two sources, both queried:
+///
+///  * the `payment_anomalies` table, written at the moment a settled payment
+///    could not attach to a prefix (cancelled, draft, deleted, already past
+///    printing);
+///  * a live query for `payment_pending` prefixes stuck past the checkout
+///    window (abandoned, never paid), which need no event to be detectable.
+///
+/// This is deliberately a query — never a scrape of the log — so an operator
+/// who looks at the list sees every unresolved dead end, and entries survive
+/// restarts and the Stirpe retry lifecycle.
+#[utoipa::path(get, path = "/api/admin/needs-attention", tag = "admin",
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, body = [NeedsAttentionItem]),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
+pub async fn needs_attention(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NeedsAttentionItem>>, ApiError> {
+    auth::resolve(&st, &headers).await?.require_admin()?;
+
+    let mut items: Vec<NeedsAttentionItem> = Vec::new();
+    for a in db::list_payment_anomalies(&st.pool).await? {
+        items.push(NeedsAttentionItem {
+            prefix: a.prefix,
+            kind: a.kind,
+            action: a.action,
+            message: a.message,
+            at: a.created_at,
+            session_id: a.session_id,
+            amount_cents: a.amount_cents,
+            currency: a.currency,
+        });
+    }
+    for p in db::abandoned_payment_pending(&st.pool, ABANDONED_CHECKOUT_AFTER_SECS).await? {
+        items.push(NeedsAttentionItem {
+            prefix: p.uuid,
+            kind: NeedsAttentionKind::AbandonedCheckout,
+            action: "rebuild_by_hand".into(),
+            message: "this prefix has sat awaiting payment past the checkout window; \
+                      nothing was ever paid, so no work queue will pick it up — revert it to \
+                      draft, or mark it paid by hand if the money arrived outside Stripe"
+                .into(),
+            at: p.status_changed_at.unwrap_or(p.created_at),
+            session_id: None,
+            amount_cents: None,
+            currency: None,
+        });
+    }
+    // Both sources carry the same ISO-ish timestamp, so a lexicographic sort
+    // interleaves anomalies and abandoned prefixes correctly, newest first.
+    items.sort_by(|a, b| b.at.cmp(&a.at));
+    Ok(Json(items))
+}
+
+// ---------------------------------------------------------------------------
 // Shop — Stripe Checkout, and the webhook that records the payment
 // ---------------------------------------------------------------------------
 
@@ -939,7 +1015,7 @@ pub async fn stripe_webhook(
 
     match event.kind.as_str() {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
-            record_payment(&st, &event).await?;
+            record_payment(&st.pool, &event).await?;
         }
         "checkout.session.expired" => {
             revert_expired_checkout(&st.pool, &event.data.object).await?;
@@ -956,7 +1032,7 @@ pub async fn stripe_webhook(
 /// Idempotent on purpose: Stripe retries, and a customer refreshing the success
 /// URL does not produce a second event, but a duplicated delivery is normal
 /// enough that it must be harmless.
-async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiError> {
+async fn record_payment(pool: &SqlitePool, event: &stripe::Event) -> Result<(), ApiError> {
     let session = &event.data.object;
 
     // Klarna and SEPA report `completed` before the money actually moves; the
@@ -979,12 +1055,27 @@ async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiE
         return Ok(());
     };
 
-    let current = match db::get_prefix(&st.pool, prefix).await {
+    let current = match db::get_prefix(pool, prefix).await {
         Ok(p) => p,
         Err(ApiError::NotFound(_)) => {
             // Paid, then deleted. The money is real and there is nowhere to put
-            // it, so this needs a human — shout, and let it be 200 so Stripe
-            // stops retrying an event that can never succeed.
+            // it, so this needs a human — record it for the needs-attention
+            // list (this survives the deleted prefix row), shout, and let it
+            // be 200 so Stripe stops retrying an event that can never succeed.
+            let message = "a settled payment for a prefix that has since been deleted; \
+                           the money is real but there is nowhere to put it"
+                .to_string();
+            db::insert_payment_anomaly(
+                pool,
+                prefix,
+                NeedsAttentionKind::PaymentForDeleted,
+                &message,
+                "refund_or_rebuild_by_hand",
+                Some(&session.id),
+                session.amount_total,
+                session.currency.as_deref(),
+            )
+            .await?;
             tracing::error!(%prefix, session = %session.id, amount = ?session.amount_total,
                 "payment received for a prefix that no longer exists: refund it, or rebuild \
                  the order by hand");
@@ -996,7 +1087,7 @@ async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiE
     match current.status {
         PrefixStatus::PaymentPending => {
             let updated = db::set_status(
-                &st.pool,
+                pool,
                 prefix,
                 PrefixStatus::Paid,
                 Some(&session.id),
@@ -1006,22 +1097,77 @@ async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiE
             tracing::info!(%prefix, session = %session.id, amount = ?session.amount_total,
                 currency = ?session.currency, "payment recorded, prefix is now {}", updated.status);
         }
-        // Already handled — the normal case for a retried delivery.
-        PrefixStatus::Paid
-        | PrefixStatus::Queued
-        | PrefixStatus::Printing
-        | PrefixStatus::Printed => {
+        // Already handled — the normal case for a retried delivery of a prefix
+        // still in flight (paid or queued). Nothing to do.
+        PrefixStatus::Paid | PrefixStatus::Queued => {
             tracing::info!(%prefix, session = %session.id, status = %current.status,
                 "payment already recorded; ignoring the duplicate");
+        }
+        // Money for an order that is already past printing. It must have been
+        // paid to reach printing/printed, so a new settlement is most likely a
+        // duplicate charge — flag it for a human to confirm rather than
+        // silently keeping the extra money.
+        PrefixStatus::Printing | PrefixStatus::Printed => {
+            let message = format!(
+                "a settled payment for a prefix that is already past printing \
+                 ({status}); the order was already paid to get here, so this is \
+                 likely a duplicate charge",
+                status = current.status
+            );
+            db::insert_payment_anomaly(
+                pool,
+                prefix,
+                NeedsAttentionKind::PaymentAfterPrinting,
+                &message,
+                "verify_then_refund_if_duplicate",
+                Some(&session.id),
+                session.amount_total,
+                session.currency.as_deref(),
+            )
+            .await?;
+            tracing::warn!(%prefix, session = %session.id, status = %current.status,
+                "payment settled for a prefix already past printing; recorded for review");
         }
         // A draft (nothing in flight) or a cancelled order. Deliberately not
         // forced: whether to refund or to honour the order is the operator's
         // call, and guessing wrong either prints an order nobody wants or
-        // silently keeps money.
-        PrefixStatus::Draft | PrefixStatus::Cancelled => {
+        // silently keeps money. Recorded so that call is visible, not buried
+        // in a log line.
+        PrefixStatus::Draft => {
+            let message = "a settled payment for a prefix that still reads as a draft; \
+                           nothing was awaiting it"
+                .to_string();
+            db::insert_payment_anomaly(
+                pool,
+                prefix,
+                NeedsAttentionKind::PaymentForDraft,
+                &message,
+                "refund_or_honour",
+                Some(&session.id),
+                session.amount_total,
+                session.currency.as_deref(),
+            )
+            .await?;
             tracing::warn!(%prefix, session = %session.id, status = %current.status,
-                "payment settled for a prefix that is neither payment_pending nor paid; it has been \
-                 left alone — decide in the admin UI whether to refund or to honour it");
+                "payment settled for a draft prefix; recorded for review");
+        }
+        PrefixStatus::Cancelled => {
+            let message = "a settled payment for a prefix that was cancelled; if the \
+                           cancellation was communicated, the money probably needs to go back"
+                .to_string();
+            db::insert_payment_anomaly(
+                pool,
+                prefix,
+                NeedsAttentionKind::PaymentForCancelled,
+                &message,
+                "refund_or_honour",
+                Some(&session.id),
+                session.amount_total,
+                session.currency.as_deref(),
+            )
+            .await?;
+            tracing::warn!(%prefix, session = %session.id, status = %current.status,
+                "payment settled for a cancelled prefix; recorded for review");
         }
     }
     Ok(())
@@ -1164,6 +1310,10 @@ pub fn router(state: AppState) -> Router {
                 .get(admin_session)
                 .delete(admin_logout),
         )
+        .route(
+            "/api/admin/needs-attention",
+            axum::routing::get(needs_attention),
+        )
         .route("/api/shop/config", axum::routing::get(shop_config))
         .route(
             "/api/prefixes/:prefix/checkout",
@@ -1214,6 +1364,26 @@ mod tests {
             amount_total: None,
             currency: None,
             metadata: None,
+        }
+    }
+
+    /// A settled `checkout.session.completed` event for prefix `prefix`, the
+    /// shape the payment webhook acts on.
+    fn payment_event(prefix: Option<&str>) -> stripe::Event {
+        stripe::Event {
+            id: "evt_paid".into(),
+            kind: "checkout.session.completed".into(),
+            livemode: None,
+            data: stripe::EventData {
+                object: stripe::SessionObject {
+                    id: "cs_paid".into(),
+                    client_reference_id: prefix.map(str::to_string),
+                    payment_status: Some("paid".into()),
+                    amount_total: Some(1750),
+                    currency: Some("eur".into()),
+                    metadata: None,
+                },
+            },
         }
     }
 
@@ -1283,6 +1453,144 @@ mod tests {
         revert_expired_checkout(&pool, &expired_session(Some(&Uuid::new_v4().to_string())))
             .await
             .unwrap();
+    }
+
+    async fn anomaly_kinds(pool: &SqlitePool) -> Vec<NeedsAttentionKind> {
+        db::list_payment_anomalies(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.kind)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn settled_payment_marks_a_pending_prefix_paid_without_an_anomaly() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+        assert!(anomaly_kinds(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replayed_payment_for_a_paid_prefix_is_a_noop() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .unwrap();
+
+        // A retried delivery of the same settled event finds the prefix already
+        // paid (or queued) — harmless, and not a dead end.
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+        assert!(anomaly_kinds(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settled_payment_for_a_cancelled_prefix_is_recorded_and_left_alone() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Cancelled, None, false)
+            .await
+            .unwrap();
+
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        // The order stays cancelled; the money is flagged, not spent.
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Cancelled);
+        assert_eq!(
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentForCancelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_payment_for_a_draft_prefix_is_recorded_and_left_alone() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap(); // draft
+
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
+        assert_eq!(
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentForDraft]
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_payment_for_a_deleted_prefix_is_recorded() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::delete_prefix(&pool, p.uuid).await.unwrap();
+
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        // The prefix row is gone, but the anomaly survives with its uuid — this
+        // is exactly the case the table exists for.
+        assert_eq!(
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentForDeleted]
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_payment_for_a_prefix_past_printing_is_recorded() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        // Force to printing (as the operator would requeue a half-finished job).
+        db::set_status(&pool, p.uuid, PrefixStatus::Printing, None, true)
+            .await
+            .unwrap();
+
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Printing);
+        assert_eq!(
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentAfterPrinting]
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_payment_for_a_queued_prefix_is_not_an_anomaly() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Queued, None, false)
+            .await
+            .unwrap();
+
+        // Still in flight — a retried delivery is the normal case here.
+        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert!(anomaly_kinds(&pool).await.is_empty());
     }
 
     fn state_with(limiter: rate_limit::RateLimiter, pool: SqlitePool) -> AppState {

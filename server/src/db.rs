@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::backtext;
 use crate::error::ApiError;
 use crate::models::{
-    Card, CardPatch, ModePrice, Prefix, PrefixStatus, PrintMode, PrintQueue, PrintQueueCard,
+    Card, CardPatch, ModePrice, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus,
+    PrintMode, PrintQueue, PrintQueueCard,
 };
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -547,6 +548,93 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Payment anomalies — the dead ends behind the admin "needs attention" list
+// ---------------------------------------------------------------------------
+
+/// Record a dead-end payment event: a settled payment that could not attach to
+/// a prefix (cancelled, draft, deleted, or already past printing). Written by
+/// the webhook at the moment the dead end happens, so the "needs attention"
+/// list is a query over this table rather than a scrape of the log.
+pub async fn insert_payment_anomaly(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    kind: NeedsAttentionKind,
+    message: &str,
+    action: &str,
+    session_id: Option<&str>,
+    amount_cents: Option<i64>,
+    currency: Option<&str>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO payment_anomalies
+            (prefix, kind, message, action, session_id, amount_cents, currency)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )
+    .bind(prefix.to_string())
+    .bind(kind.as_str())
+    .bind(message)
+    .bind(action)
+    .bind(session_id)
+    .bind(amount_cents)
+    .bind(currency)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn anomaly_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<PaymentAnomaly, ApiError> {
+    let kind_raw: String = row.get("kind");
+    let kind = NeedsAttentionKind::parse(&kind_raw)
+        .ok_or_else(|| ApiError::Internal(format!("unknown anomaly kind '{kind_raw}'")))?;
+    Ok(PaymentAnomaly {
+        id: row.get("id"),
+        prefix: Uuid::parse_str(row.get::<String, _>("prefix").as_str())
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        kind,
+        message: row.get("message"),
+        action: row.get("action"),
+        session_id: row.get("session_id"),
+        amount_cents: row.get("amount_cents"),
+        currency: row.get("currency"),
+        created_at: row.get("created_at"),
+    })
+}
+
+/// Every recorded dead-end payment event, newest first.
+pub async fn list_payment_anomalies(pool: &SqlitePool) -> Result<Vec<PaymentAnomaly>, ApiError> {
+    let rows = sqlx::query("SELECT * FROM payment_anomalies ORDER BY created_at DESC, id DESC")
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(anomaly_from_row).collect()
+}
+
+/// Prefixes left in `payment_pending` for more than `older_than_secs`.
+///
+/// The checkout was abandoned (or its expiry never reached us), nothing was
+/// ever paid, and no work queue will touch it — so it is invisible to the
+/// normal flow and needs a human. This is the half of the "needs attention"
+/// list that needs no webhook to record it: it falls straight out of the
+/// prefixes table. `status_changed_at` is stored as SQLite `datetime('now')`,
+/// so staleness is computed with `strftime('%s', ...)` in the same units.
+pub async fn abandoned_payment_pending(
+    pool: &SqlitePool,
+    older_than_secs: i64,
+) -> Result<Vec<Prefix>, ApiError> {
+    let rows = sqlx::query(&format!(
+        "{PREFIX_SELECT}
+         WHERE p.status = ?1
+           AND CAST(strftime('%s', p.status_changed_at) AS INTEGER)
+                 < (CAST(strftime('%s', 'now') AS INTEGER) - ?2)
+         ORDER BY p.status_changed_at ASC"
+    ))
+    .bind(PrefixStatus::PaymentPending.as_str())
+    .bind(older_than_secs)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(prefix_from_row).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +810,87 @@ mod tests {
         .await
         .expect("upsert");
         assert!(card.back_image_content_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn abandoned_payment_pending_flags_only_stale_prefixes() {
+        let pool = test_pool().await;
+        let old = create_prefix(&pool, None, None).await.expect("create");
+        let fresh = create_prefix(&pool, None, None).await.expect("create");
+        set_status(&pool, old.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("pending");
+        set_status(&pool, fresh.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("pending");
+
+        // Backdate the old one's status beyond the 24h abbandoned window.
+        sqlx::query("UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1")
+            .bind(old.uuid.to_string())
+            .execute(&pool)
+            .await
+            .expect("backdate");
+
+        let stuck = abandoned_payment_pending(&pool, 24 * 3600)
+            .await
+            .expect("query");
+        assert_eq!(stuck.len(), 1, "only the stale prefix is abandoned");
+        assert_eq!(stuck[0].uuid, old.uuid);
+    }
+
+    #[tokio::test]
+    async fn abandoned_payment_pending_ignores_fresh_and_non_pending_prefixes() {
+        let pool = test_pool().await;
+        // Fresh pending — the customer may still be at the checkout.
+        let fresh = create_prefix(&pool, None, None).await.expect("create");
+        set_status(&pool, fresh.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("pending");
+        // A paid prefix, however stale, is not abandoned.
+        let paid = create_prefix(&pool, None, None).await.expect("create");
+        set_status(&pool, paid.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("pending");
+        set_status(&pool, paid.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .expect("paid");
+        sqlx::query("UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1")
+            .bind(paid.uuid.to_string())
+            .execute(&pool)
+            .await
+            .expect("backdate");
+
+        let stuck = abandoned_payment_pending(&pool, 24 * 3600)
+            .await
+            .expect("query");
+        assert!(stuck.is_empty());
+    }
+
+    #[tokio::test]
+    async fn payment_anomaly_round_trips() {
+        let pool = test_pool().await;
+        let prefix = Uuid::new_v4();
+        insert_payment_anomaly(
+            &pool,
+            prefix,
+            NeedsAttentionKind::PaymentForDeleted,
+            "a settled payment for a prefix that has since been deleted",
+            "refund_or_rebuild_by_hand",
+            Some("cs_1"),
+            Some(1750),
+            Some("eur"),
+        )
+        .await
+        .expect("insert");
+
+        let rows = list_payment_anomalies(&pool).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].prefix, prefix);
+        assert_eq!(rows[0].kind, NeedsAttentionKind::PaymentForDeleted);
+        assert_eq!(rows[0].action, "refund_or_rebuild_by_hand");
+        assert_eq!(rows[0].session_id.as_deref(), Some("cs_1"));
+        assert_eq!(rows[0].amount_cents, Some(1750));
+        assert_eq!(rows[0].currency.as_deref(), Some("eur"));
     }
 
     #[tokio::test]

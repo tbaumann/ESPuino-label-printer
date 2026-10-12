@@ -118,9 +118,13 @@ unpaid. Without this, the first declined card becomes a support ticket.
     * a prefix stuck in `payment_pending` because the customer abandoned the
       checkout: never paid, and invisible to any work queue
     * a payment that settles for a prefix already past printing
-  Deliverable: a "needs attention" list in the admin UI, driven by a query rather
-  than by scraping the log, with each entry saying what to do about it (refund,
-  honour, rebuild by hand).
+  **Done** — a "needs attention" list in the admin UI (`GET
+  /api/admin/needs-attention`), driven by a query rather than by scraping the
+  log. The webhook writes a `payment_anomalies` row at the moment a settled
+  payment cannot attach to a prefix (cancelled, draft, deleted, past printing),
+  and the endpoint unions those with a live query for `payment_pending` prefixes
+  stuck past the 24h checkout window. Each entry carries an `action` saying what
+  to do (refund, honour, rebuild by hand).
 - **Email notifications, via Resend.** Decided, and the account exists. There is no
   `RESEND_API_KEY` anywhere in the codebase yet; it goes in as an environment
   variable like the Stripe secrets — never in the repo, never logged. Resend also

@@ -65,6 +65,26 @@ export interface CheckoutSession {
   payment_status: string | null
 }
 
+export type NeedsAttentionKind =
+  | 'payment_for_cancelled'
+  | 'payment_for_draft'
+  | 'payment_for_deleted'
+  | 'payment_after_printing'
+  | 'abandoned_checkout'
+
+/** One row in the admin "needs attention" list: money and the order disagree. */
+export interface NeedsAttentionItem {
+  prefix: string
+  kind: NeedsAttentionKind
+  /** Imperative: what to do about it (refund_or_honour, refund_or_rebuild_by_hand, …). */
+  action: string
+  message: string
+  at: string
+  session_id: string | null
+  amount_cents: number | null
+  currency: string | null
+}
+
 /** Required on cookie-authenticated mutations; the server calls this CSRF. */
 const CSRF_HEADER = 'x-esplp-csrf'
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -193,6 +213,14 @@ export const adminApi = {
 
   listPrefixes: (status?: PrefixStatus | ''): Promise<Prefix[]> =>
     req<Prefix[]>(`/api/prefixes${status ? `?status=${status}` : ''}`),
+
+  /**
+   * The "needs attention" list: prefixes where money and the order disagree
+   * (payment settled for a cancelled/draft/deleted/past-printing prefix, or a
+   * checkout abandoned in payment_pending), each saying what to do.
+   */
+  needsAttention: (): Promise<NeedsAttentionItem[]> =>
+    req<NeedsAttentionItem[]>('/api/admin/needs-attention'),
 
   /** The operator may set any status, including backwards out of `printing`. */
   setStatus: (p: string, status: PrefixStatus, orderRef?: string): Promise<Prefix> =>
