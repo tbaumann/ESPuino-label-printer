@@ -223,8 +223,8 @@ line.
    and copy its signing secret into `STRIPE_WEBHOOK_SECRET`;
 4. set `PUBLIC_BASE_URL` to the public origin, e.g. `https://cards.example.com`
    — that is where Stripe sends the customer back;
-5. set the price: `STRIPE_PER_CARD_CENTS`, `STRIPE_SHIPPING_CENTS`,
-   `STRIPE_CURRENCY`;
+5. set the price: per-mode card prices live in the database (`mode_prices`,
+   seeded at 500 cents each), plus `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`;
 6. only then switch to live keys.
 
 During local development the Stripe CLI replaces steps 2–3:
@@ -252,7 +252,7 @@ python3 scripts/mock_stripe.py 12111 &
 DATA_DIR=/tmp/esplp-stripe STRIPE_SECRET_KEY=sk_test_x \
   STRIPE_WEBHOOK_SECRET=whsec_test_secret STRIPE_API_BASE=http://127.0.0.1:12111 \
   PUBLIC_BASE_URL=http://127.0.0.1:8080 \
-  STRIPE_PER_CARD_CENTS=500 STRIPE_SHIPPING_CENTS=250 \
+  STRIPE_SHIPPING_CENTS=250 \
   ./target/debug/espuino-label-printer &
 python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 ```
@@ -273,7 +273,6 @@ python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 | `STRIPE_API_BASE` | `https://api.stripe.com`     | API base; override to point at a mock |
 | `PUBLIC_BASE_URL` | *(unset)*                   | public origin for the post-payment redirect; unset falls back to the request `Host` |
 | `STRIPE_CURRENCY` | `eur`                       | ISO 4217 code |
-| `STRIPE_PER_CARD_CENTS` | `500`                 | price of one card, in minor units (cents) |
 | `STRIPE_SHIPPING_CENTS` | `0`                   | flat shipping charge; `0` adds no shipping line |
 | `STRIPE_COUNTRIES` | `DE,AT,CH`                 | allowed shipping-address countries |
 | `STRIPE_EXCLUDED_PAYMENT_METHODS` | *(none)*       | methods to never offer in a session |
@@ -300,6 +299,12 @@ data/
   `color_front_black_back` (YMCKOKO, colour front + black-only text back; the
   **default**, so existing rows keep their meaning). Set at prefix creation or
   via `PATCH /api/prefixes/{prefix}` while the prefix is still writable.
+- **Pricing** — per-mode card prices live in the database (`mode_prices`,
+  seeded at 500 cents each), not the environment. The shop config serves them
+  and the checkout prices each card by its prefix's mode. When a checkout
+  opens, the mode is snapshotted onto the prefix (`paid_print_mode`), so the
+  spooler prints the mode the customer paid for even if the operator later
+  changes the prefix's mode.
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
   `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
   the back side carries depends on the prefix's `print_mode`: black-back mode

@@ -129,6 +129,7 @@ impl utoipa::Modify for SecurityAddon {
                 models::AdminLogin,
         models::AdminSession,
         models::ShopConfig,
+        models::ModePrice,
         stripe::CheckoutSession,
         error::ErrorBody,
     ))
