@@ -178,7 +178,12 @@ config = config or {}
 check("GET /api/shop/config is 200", status == 200, str(status))
 check("payment reports as enabled", config.get("enabled") is True, str(config))
 check("currency is eur", config.get("currency") == "eur", str(config.get("currency")))
-check("per-card price is 500", config.get("per_card_cents") == 500, str(config.get("per_card_cents")))
+prices = {p.get("print_mode"): p.get("price_cents") for p in config.get("prices", [])}
+check(
+    "per-card price for the default mode is 500",
+    prices.get("color_front_black_back") == 500,
+    str(prices),
+)
 check("shipping is 250", config.get("shipping_cents") == 250, str(config.get("shipping_cents")))
 check("shipping countries include DE", "DE" in config.get("countries", []), str(config.get("countries")))
 

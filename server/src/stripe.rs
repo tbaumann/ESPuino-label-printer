@@ -35,14 +35,15 @@ use crate::error::ApiError;
 /// request cannot be replayed indefinitely. Stripe's own default is 5 minutes.
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 
-/// What one card costs, and how the order is priced.
+/// What the shop charges, and how the order is priced.
 ///
 /// Amounts are in the currency's *minor* unit (cents), the way Stripe wants
-/// them, so `500` with `eur` is €5.00.
+/// them, so `500` with `eur` is €5.00. Per-mode card prices live in the
+/// database (`mode_prices`), not here — this struct only carries the
+/// shop-wide, deployment-level settings that are not per-mode.
 #[derive(Debug, Clone)]
 pub struct Pricing {
     pub currency: String,
-    pub per_card_cents: i64,
     /// Flat shipping charge added as its own line. Zero omits the line.
     pub shipping_cents: i64,
     /// Country codes the shipping address is allowed to be in.
@@ -52,8 +53,8 @@ pub struct Pricing {
 impl Pricing {
     /// Order total in cents. Only used to render a price before paying — the
     /// authoritative figure is the one Stripe computes and reports back.
-    pub fn total_cents(&self, card_count: i64) -> i64 {
-        self.per_card_cents.max(0) * card_count.max(0) + self.shipping_cents.max(0)
+    pub fn total_cents(&self, price_cents: i64, card_count: i64) -> i64 {
+        price_cents.max(0) * card_count.max(0) + self.shipping_cents.max(0)
     }
 }
 
@@ -141,17 +142,9 @@ impl Stripe {
             currency: env("STRIPE_CURRENCY")
                 .unwrap_or_else(|| "eur".to_string())
                 .to_ascii_lowercase(),
-            per_card_cents: env_i64("STRIPE_PER_CARD_CENTS").unwrap_or(500),
             shipping_cents: env_i64("STRIPE_SHIPPING_CENTS").unwrap_or(0),
             countries,
         };
-        if pricing.per_card_cents <= 0 {
-            tracing::warn!(
-                "STRIPE_PER_CARD_CENTS is {}: every checkout will total zero and Stripe \
-                 will reject it",
-                pricing.per_card_cents
-            );
-        }
 
         let api_base = env("STRIPE_API_BASE")
             .unwrap_or_else(|| "https://api.stripe.com".to_string())
@@ -185,9 +178,8 @@ impl Stripe {
             .expect("building the reqwest client cannot fail with these options");
 
         tracing::info!(
-            "stripe payment enabled: {} {:.2}/card, shipping {:.2}, excluded methods [{}], countries [{}]",
+            "stripe payment enabled: currency {}, shipping {:.2}, excluded methods [{}], countries [{}]",
             pricing.currency.to_uppercase(),
-            pricing.per_card_cents as f64 / 100.0,
             pricing.shipping_cents as f64 / 100.0,
             excluded_payment_methods.join(","),
             // Read through `pricing`, which already owns it.
@@ -231,6 +223,7 @@ impl Stripe {
         &self,
         prefix: Uuid,
         card_count: i64,
+        price_cents: i64,
         base_url: &str,
     ) -> Result<CheckoutSession, ApiError> {
         let page = format!("{base_url}/p/{prefix}");
@@ -268,7 +261,7 @@ impl Stripe {
         ));
         form.push((
             "line_items[0][price_data][unit_amount]".into(),
-            p.per_card_cents.to_string(),
+            price_cents.to_string(),
         ));
         form.push((
             "line_items[0][price_data][product_data][name]".into(),
@@ -691,19 +684,18 @@ mod tests {
     fn pricing_totals_and_clamps() {
         let p = Pricing {
             currency: "eur".into(),
-            per_card_cents: 500,
             shipping_cents: 250,
             countries: vec!["DE".into()],
         };
-        assert_eq!(p.total_cents(3), 1750);
-        assert_eq!(p.total_cents(0), 250);
-        assert_eq!(p.total_cents(-5), 250);
+        assert_eq!(p.total_cents(500, 3), 1750);
+        assert_eq!(p.total_cents(500, 0), 250);
+        assert_eq!(p.total_cents(500, -5), 250);
 
         let free = Pricing {
             shipping_cents: 0,
             ..p
         };
-        assert_eq!(free.total_cents(2), 1000);
+        assert_eq!(free.total_cents(500, 2), 1000);
     }
 
     #[test]

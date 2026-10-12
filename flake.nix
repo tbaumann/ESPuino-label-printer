@@ -48,7 +48,7 @@
           pname = "espuino-label-printer-web";
           version = "0.1.0";
           src = webSrc;
-          npmDepsHash = "sha256-RiV949pC4zPKtzPXbGm1X+oJYpcXYqby2GXU+B659w8=";
+          npmDepsHash = "sha256-m7rIhYggK2Lp9kTGAxY+1to04nbgckNf69CvUumF0kI=";
           # vite would otherwise write to ../server/static, i.e. outside the
           # source tree. Keep the output inside and install it from there.
           buildPhase = ''

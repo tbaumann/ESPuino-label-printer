@@ -850,12 +850,13 @@ fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
 /// The customer UI needs this to show a total before sending anyone to Stripe.
 #[utoipa::path(get, path = "/api/shop/config", tag = "shop",
     responses((status = 200, body = ShopConfig)))]
-pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
+pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>, ApiError> {
+    let prices = db::list_mode_prices(&st.pool).await?;
     let body = match st.stripe.as_deref() {
         None => ShopConfig {
             enabled: false,
             currency: "eur".into(),
-            per_card_cents: 0,
+            prices,
             shipping_cents: 0,
             countries: vec![],
         },
@@ -864,13 +865,13 @@ pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
             ShopConfig {
                 enabled: true,
                 currency: p.currency.clone(),
-                per_card_cents: p.per_card_cents,
+                prices,
                 shipping_cents: p.shipping_cents,
                 countries: p.countries.clone(),
             }
         }
     };
-    Json(body)
+    Ok(Json(body))
 }
 
 /// Start a Stripe Checkout session for a prefix and return where to send the
@@ -881,10 +882,17 @@ pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
 /// order real, so a `draft` goes straight to `payment_pending` here. Nothing here
 /// marks the prefix paid — that happens when Stripe confirms the money, via the
 /// webhook.
+///
+/// Rate-limited per prefix: opening a Checkout session costs a Stripe round
+/// trip, so a loop on one prefix is throttled to a handful per minute. A brand
+/// new prefix can still be paid for whenever, so a customer's own re-opens are
+/// never in the way — this bounds the Stripe traffic from a hammering caller,
+/// which is all it is for.
 #[utoipa::path(post, path = "/api/prefixes/{prefix}/checkout", tag = "shop",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 200, body = stripe::CheckoutSession),
+        (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
         (status = 409, description = "the prefix has no cards, or is already past payment", body = crate::error::ErrorBody),
         (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
@@ -896,6 +904,17 @@ pub async fn create_checkout(
     Path(prefix): Path<String>,
 ) -> Result<Json<stripe::CheckoutSession>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+
+    // Throttle before doing any work: created sessions cost a Stripe round
+    // trip, and each one also flips the prefix out of draft, so re-opening
+    // beyond the limit is either a loop or a broken customer flow — both should
+    // slow down.
+    if !st.checkout_limiter.allow(&prefix.to_string()) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many checkout sessions for prefix {prefix}; try again in a minute"
+        )));
+    }
+
     let stripe = st.stripe.as_deref().ok_or_else(|| {
         ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
     })?;
@@ -915,6 +934,11 @@ pub async fn create_checkout(
         )));
     }
 
+    // The price is the mode's, looked up from the database — not a single
+    // environment-wide per-card figure. A mode with no configured price is a
+    // misconfiguration and refuses the checkout rather than pricing at zero.
+    let price_cents = db::mode_price(&st.pool, p.print_mode).await?;
+
     // Flip to payment_pending BEFORE opening the session, and note the order: a
     // customer can pay the moment they land on Stripe's page, and the webhook
     // deliberately refuses to force a payment through for a prefix that still
@@ -925,9 +949,15 @@ pub async fn create_checkout(
         db::set_status(&st.pool, prefix, PrefixStatus::PaymentPending, None, false).await?;
     }
 
+    // Freeze the mode this order is being charged for, so the spooler prints
+    // what the customer paid for even if the operator changes the mode later.
+    // Done alongside the status flip, before the session opens, so the frozen
+    // mode always matches the price locked into the session.
+    db::set_paid_print_mode(&st.pool, prefix, p.print_mode).await?;
+
     let base = public_base_url(&st, &headers);
     let session = match stripe
-        .create_checkout_session(prefix, p.card_count, &base)
+        .create_checkout_session(prefix, p.card_count, price_cents, &base)
         .await
     {
         Ok(s) => s,
@@ -1303,6 +1333,9 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_limit;
+    use std::sync::Arc;
+    use std::time::Duration;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     /// A fresh in-memory database with all migrations applied.
@@ -1558,5 +1591,43 @@ mod tests {
             .await
             .unwrap();
         assert!(anomaly_kinds(&pool).await.is_empty());
+    }
+
+    fn state_with(limiter: rate_limit::RateLimiter, pool: SqlitePool) -> AppState {
+        AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(PathBuf::new()),
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
+            checkout_limiter: limiter,
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_is_throttled_per_prefix() {
+        let pool = test_pool().await;
+        // Limit 1 per window: the first call is admitted and proceeds to the
+        // (off) shop check — 503 — and the second is throttled with 429 before
+        // it touches the database or Stripe.
+        let st = state_with(
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60)),
+            pool,
+        );
+        let p = Uuid::new_v4().to_string();
+
+        let first = create_checkout(State(st.clone()), HeaderMap::new(), Path(p.clone())).await;
+        assert!(
+            matches!(first, Err(ApiError::Unavailable(_))),
+            "first use should pass the limiter and hit the not-configured shop, got {first:?}"
+        );
+
+        let second = create_checkout(State(st), HeaderMap::new(), Path(p)).await;
+        assert!(
+            matches!(second, Err(ApiError::TooManyRequests(_))),
+            "second use inside the window should be throttled, got {second:?}"
+        );
     }
 }

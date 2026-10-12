@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::models::{
-    Card, CardPatch, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus, PrintMode,
-    PrintQueue, PrintQueueCard,
+    Card, CardPatch, ModePrice, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus,
+    PrintMode, PrintQueue, PrintQueueCard,
 };
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -36,7 +36,7 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.print_mode,
+        p.order_ref, p.print_mode, p.paid_print_mode,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count
  FROM prefixes p";
 
@@ -44,7 +44,7 @@ const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_cha
 /// the print queue UI can tell a `printing` prefix that is a resume (still has
 /// unprinted cards) from one that is done.
 const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.print_mode,
+        p.order_ref, p.print_mode, p.paid_print_mode,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid AND c.printed_at IS NULL)
             AS unprinted_count
@@ -57,6 +57,14 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let mode_raw: String = row.get("print_mode");
     let print_mode = PrintMode::parse(&mode_raw)
         .ok_or_else(|| ApiError::Internal(format!("unknown prefix print_mode '{mode_raw}'")))?;
+    let paid_raw: Option<String> = row.get("paid_print_mode");
+    let paid_print_mode = match paid_raw.as_deref() {
+        None => None,
+        Some(s) => Some(
+            PrintMode::parse(s)
+                .ok_or_else(|| ApiError::Internal(format!("unknown prefix paid_print_mode '{s}'")))?,
+        ),
+    };
     Ok(Prefix {
         uuid: Uuid::parse_str(row.get::<String, _>("uuid").as_str())
             .map_err(|e| ApiError::Internal(e.to_string()))?,
@@ -64,6 +72,7 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
         status,
         status_changed_at: row.get("status_changed_at"),
         print_mode,
+        paid_print_mode,
         order_ref: row.get("order_ref"),
         card_count: row.get("card_count"),
         // The public view never carries operator-only print state.
@@ -130,6 +139,55 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("prefix {uuid}")))?;
     prefix_from_row(&row)
+}
+
+/// Every print mode's price, ordered by mode, for the shop config.
+pub async fn list_mode_prices(pool: &SqlitePool) -> Result<Vec<ModePrice>, ApiError> {
+    let rows = sqlx::query("SELECT print_mode, price_cents FROM mode_prices ORDER BY print_mode")
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| {
+            let mode_raw: String = r.get("print_mode");
+            let print_mode = PrintMode::parse(&mode_raw).ok_or_else(|| {
+                ApiError::Internal(format!("unknown print_mode '{mode_raw}' in mode_prices"))
+            })?;
+            Ok(ModePrice {
+                print_mode,
+                price_cents: r.get("price_cents"),
+            })
+        })
+        .collect()
+}
+
+/// The price of one card in a given mode, in the currency's minor unit.
+///
+/// A mode with no configured price is a misconfiguration, not a free card, so
+/// it surfaces as an error rather than silently pricing at zero.
+pub async fn mode_price(pool: &SqlitePool, mode: PrintMode) -> Result<i64, ApiError> {
+    let row = sqlx::query("SELECT price_cents FROM mode_prices WHERE print_mode = ?1")
+        .bind(mode.as_str())
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Internal(format!("no price configured for print mode {mode}"))
+        })?;
+    Ok(row.get("price_cents"))
+}
+
+/// Freeze the mode a prefix was charged for, so the spooler prints what the
+/// customer paid for even if the operator later changes the prefix's mode.
+pub async fn set_paid_print_mode(
+    pool: &SqlitePool,
+    uuid: Uuid,
+    mode: PrintMode,
+) -> Result<(), ApiError> {
+    sqlx::query("UPDATE prefixes SET paid_print_mode = ?2 WHERE uuid = ?1")
+        .bind(uuid.to_string())
+        .bind(mode.as_str())
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Create a prefix at a customer-chosen uuid, or return the existing one if it
@@ -463,9 +521,15 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
         .collect::<Vec<_>>();
     let unprinted_count = cards.iter().filter(|c| c.printed_at.is_none()).count() as i64;
     let resume = p.status == PrefixStatus::Printing && unprinted_count > 0;
+    // The spooler prints the mode that was paid for, not the prefix's current
+    // one — an operator changing the mode after payment must not change what
+    // gets printed. Prefixes never priced through checkout fall back to the
+    // current mode.
+    let print_mode = p.paid_print_mode.unwrap_or(p.print_mode);
     Ok(PrintQueue {
         prefix,
         status: p.status,
+        print_mode,
         cards,
         unprinted_count,
         resume,
@@ -815,5 +879,60 @@ mod tests {
         assert_eq!(rows[0].session_id.as_deref(), Some("cs_1"));
         assert_eq!(rows[0].amount_cents, Some(1750));
         assert_eq!(rows[0].currency.as_deref(), Some("eur"));
+    }
+
+    #[tokio::test]
+    async fn mode_prices_are_seeded_for_every_mode() {
+        let pool = test_pool().await;
+        let prices = list_mode_prices(&pool).await.expect("list");
+        // The migration seeds every mode at the historical default of 500.
+        assert_eq!(prices.len(), 3);
+        for p in &prices {
+            assert_eq!(p.price_cents, 500, "mode {:?} should default to 500", p.print_mode);
+        }
+        let modes: Vec<_> = prices.iter().map(|p| p.print_mode).collect();
+        assert!(modes.contains(&PrintMode::SingleSided));
+        assert!(modes.contains(&PrintMode::DoubleSidedColor));
+        assert!(modes.contains(&PrintMode::ColorFrontBlackBack));
+    }
+
+    #[tokio::test]
+    async fn mode_price_lookup_returns_the_configured_price() {
+        let pool = test_pool().await;
+        assert_eq!(
+            mode_price(&pool, PrintMode::ColorFrontBlackBack).await.expect("price"),
+            500
+        );
+        assert_eq!(
+            mode_price(&pool, PrintMode::SingleSided).await.expect("price"),
+            500
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_print_mode_is_snapshotted_and_used_by_the_print_queue() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::ColorFrontBlackBack))
+            .await
+            .expect("create");
+        // A prefix never priced through checkout has no paid mode; the queue
+        // falls back to the current mode.
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.print_mode, PrintMode::ColorFrontBlackBack);
+
+        // Freeze the mode as if a checkout had priced it.
+        set_paid_print_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect("freeze");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
+
+        // Even if the operator later changes the prefix's current mode, the
+        // queue still reports the paid-for one.
+        set_prefix_mode(&pool, p.uuid, PrintMode::SingleSided)
+            .await
+            .expect("operator changes mode");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
     }
 }

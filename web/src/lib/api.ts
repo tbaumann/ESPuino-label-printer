@@ -7,11 +7,15 @@ export type PrefixStatus =
   | 'printed'
   | 'cancelled'
 
+export type PrintMode = 'single_sided' | 'double_sided_color' | 'color_front_black_back'
+
 export interface Prefix {
   uuid: string
   created_at: string
   status: PrefixStatus
   status_changed_at: string | null
+  print_mode: PrintMode
+  paid_print_mode?: PrintMode | null
   order_ref: string | null
   card_count: number
 }
@@ -37,11 +41,17 @@ export interface CardPatch {
   back_text?: string
 }
 
+/** One print mode's price, as the shop config serves it. */
+export interface ModePrice {
+  print_mode: PrintMode
+  price_cents: number
+}
+
 /** Public shop settings. `enabled: false` means this deployment takes no money. */
 export interface ShopConfig {
   enabled: boolean
   currency: string
-  per_card_cents: number
+  prices: ModePrice[]
   shipping_cents: number
   countries: string[]
 }

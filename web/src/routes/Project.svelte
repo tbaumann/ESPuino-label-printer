@@ -31,20 +31,25 @@
   const writable = $derived(prefix ? WRITABLE.includes(prefix.status) : false)
 
   // Amounts pre-rendered, so the template never re-derives a price and `shop`
-  // never has to be narrowed there.
+  // never has to be narrowed there. The per-card price is the one for the
+  // prefix's print mode, looked up from the shop config's per-mode prices.
   const shopView = $derived(
-    shop && shop.enabled
-      ? {
-          perCard: formatMoney(shop.per_card_cents, shop.currency),
-          shipping:
-            shop.shipping_cents > 0
-              ? formatMoney(shop.shipping_cents, shop.currency)
-              : null,
-          total: formatMoney(
-            shop.per_card_cents * (prefix?.card_count ?? 0) + shop.shipping_cents,
-            shop.currency,
-          ),
-        }
+    shop && shop.enabled && prefix
+      ? (() => {
+          const price = shop.prices.find((p) => p.print_mode === prefix!.print_mode)
+          if (!price) return null
+          return {
+            perCard: formatMoney(price.price_cents, shop.currency),
+            shipping:
+              shop.shipping_cents > 0
+                ? formatMoney(shop.shipping_cents, shop.currency)
+                : null,
+            total: formatMoney(
+              price.price_cents * (prefix?.card_count ?? 0) + shop.shipping_cents,
+              shop.currency,
+            ),
+          }
+        })()
       : null,
   )
 
