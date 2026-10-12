@@ -367,7 +367,13 @@ When `ADMIN_TOKEN` is unset the admin API is switched off: admin-only calls
 answer `503` with an explanatory body while everything customer-facing keeps
 working. An unset token is never an open door.
 
-The token is compared in constant time. There is no rate limiting yet.
+The token is compared in constant time. Failed admin-credential attempts are
+rate-limited per client address: 5 misses inside 15 minutes (a wrong bearer
+token on any request, or a wrong token at login) lock that address out for 15
+minutes, during which further attempts answer `429`. The counters are
+in-memory, so a restart clears them. The key is the left-most `X-Forwarded-For`
+entry (or `X-Real-Ip`, or a shared constant for direct clients), so put the
+server behind a proxy that sets it or every direct client shares one bucket.
 
 ### Admin session
 

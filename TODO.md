@@ -255,7 +255,10 @@ To settle when it is built:
 
 ## Also outstanding
 
-- Rate-limit failed admin logins and the bearer path.
+- Rate-limit failed admin logins and the bearer path. **Done** — a per-client
+  `LoginLimiter` (5 misses / 15 min → 15 min lockout, in-memory) gates both the
+  login endpoint and the bearer path in `auth::resolve`; a locked-out key
+  answers 429. Keyed on `X-Forwarded-For`/`X-Real-Ip`.
 - Server-side render of the black-only card back (client-side preview only so
   far) — needed by the print queue, and per print mode.
 - Admin sessions live in memory, so a restart logs the operator out. Fine for

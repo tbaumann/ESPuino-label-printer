@@ -263,7 +263,7 @@ pub async fn list_prefixes(
     headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Vec<Prefix>>, ApiError> {
-    auth::resolve(&st, &headers).await.require_admin()?;
+    auth::resolve(&st, &headers).await?.require_admin()?;
     let status = match q.status.as_deref() {
         None => None,
         Some(s) => Some(
@@ -314,7 +314,7 @@ pub async fn put_card(
     mp: Multipart,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
         .await?
         .print_mode;
@@ -350,7 +350,7 @@ pub async fn post_card(
     mp: Multipart,
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
         .await?
         .print_mode;
@@ -472,7 +472,7 @@ pub async fn delete_card(
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     db::delete_card(&st.pool, prefix, id).await?;
@@ -507,7 +507,7 @@ pub async fn delete_prefix(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     let p = db::get_prefix(&st.pool, prefix).await?;
     if !caller.is_admin() && !p.status.is_customer_writable() {
         return Err(ApiError::Conflict(format!(
@@ -534,7 +534,7 @@ pub async fn delete_cards(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     db::delete_all_cards(&st.pool, prefix).await?;
     let _ = std::fs::remove_dir_all(st.data_dir.join("blobs").join(prefix.to_string()));
@@ -558,7 +558,7 @@ pub async fn patch_card(
     Json(patch): Json<CardPatch>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     Ok(Json(
         db::update_card_meta(&st.pool, prefix, id, &patch).await?,
@@ -586,7 +586,7 @@ pub async fn get_print_queue(
     Path(prefix): Path<String>,
 ) -> Result<Json<PrintQueue>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(db::print_queue(&st.pool, prefix).await?))
 }
@@ -609,7 +609,7 @@ pub async fn mark_card_printed(
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(db::mark_card_printed(&st.pool, prefix, id).await?))
 }
@@ -636,7 +636,7 @@ pub async fn patch_status(
     Json(input): Json<StatusInput>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(
         db::set_status(
@@ -685,7 +685,17 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(input): Json<AdminLogin>,
 ) -> Result<Response, ApiError> {
-    auth::verify_token(&st, &input.token)?;
+    let key = auth::client_ip(&headers);
+    // Refuse before even comparing once this client is locked out.
+    st.login_limiter.check(&key)?;
+    if let Err(e) = auth::verify_token(&st, &input.token) {
+        // Only a *wrong token* (401) counts against the key; a 503 (admin API
+        // disabled) is not a failed guess and must not lock anyone out.
+        if matches!(e, ApiError::Unauthorized(_)) {
+            st.login_limiter.record_failure(&key);
+        }
+        return Err(e);
+    }
     let id = st.sessions.create().await;
     let secure = cookie_secure(&st, &headers);
     let cookie = format!(
@@ -724,7 +734,7 @@ pub async fn admin_session(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AdminSession>, ApiError> {
-    auth::resolve(&st, &headers).await.require_admin()?;
+    auth::resolve(&st, &headers).await?.require_admin()?;
     Ok(Json(AdminSession {
         authenticated: true,
     }))

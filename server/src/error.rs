@@ -23,6 +23,12 @@ pub enum ApiError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The caller has too many failed admin-credential attempts in a window and
+    /// is temporarily locked out. `Retry-After` advertises how long. Distinct
+    /// from `Forbidden` (a permanent rejection) so a client can back off.
+    #[error("rate limited: {0}")]
+    TooManyRequests(String),
+
     /// A feature this deployment has not been configured for. The message says
     /// which: the admin API wants `ADMIN_TOKEN`, the shop wants
     /// `STRIPE_SECRET_KEY`. Deliberately generic, because both use it and
@@ -54,6 +60,7 @@ impl ApiError {
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Upstream(_) => StatusCode::BAD_GATEWAY,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,

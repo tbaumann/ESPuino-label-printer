@@ -24,6 +24,9 @@ pub struct AppState {
     pub admin_token: Option<Arc<str>>,
     /// Live admin UI logins (the session cookie), persisted in the database.
     pub sessions: auth::Sessions,
+    /// Throttle on failed admin-credential attempts (wrong bearer token or
+    /// wrong login token), keyed by client address.
+    pub login_limiter: auth::LoginLimiter,
     /// Force `Secure` on the session cookie. `None` = infer per request from
     /// `X-Forwarded-Proto`, which is what you want behind a TLS proxy.
     pub cookie_secure: Option<bool>,
@@ -176,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir: Arc::new(data_dir),
             admin_token,
             sessions: auth::Sessions::new(pool),
+            login_limiter: auth::LoginLimiter::default(),
             cookie_secure,
             stripe,
         };
