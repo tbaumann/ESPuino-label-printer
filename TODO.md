@@ -255,7 +255,10 @@ To settle when it is built:
 
 ## Also outstanding
 
-- Rate-limit failed admin logins and the bearer path.
+- Rate-limit failed admin logins and the bearer path. **Done** — a per-client
+  `LoginLimiter` (5 misses / 15 min → 15 min lockout, in-memory) gates both the
+  login endpoint and the bearer path in `auth::resolve`; a locked-out key
+  answers 429. Keyed on `X-Forwarded-For`/`X-Real-Ip`.
 - `CorsLayer::permissive()` is unnecessary now that the admin UI is same-origin;
   permissive CORS beside a cookie-authenticated API is worth revisiting.
 - Server-side render of the black-only card back (client-side preview only so
