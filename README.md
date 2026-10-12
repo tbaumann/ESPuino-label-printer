@@ -72,7 +72,8 @@ Commands (every API field is a flag):
 | Command | Purpose |
 |---------|---------|
 | `prefix create [--uuid U]` | create a prefix (server assigns uuid if omitted) |
-| `prefix list` / `prefix get <P>` | list prefixes / show one + card count |
+| `prefix list [--status S]` / `prefix get <P>` | list prefixes (optionally filtered by status) / show one + card count |
+| `prefix set-status <P> <STATUS> [--order-ref R]` | set a prefix's status (any transition) |
 | `card list <P>` | index of cards in a prefix |
 | `card get <P> <ID>` / `card delete <P> <ID>` | card metadata / delete |
 | `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back-text T]` | upload one card |
@@ -89,12 +90,11 @@ Notes:
   the plan without uploading.
 - `--quiet` prints just the uuid (prefix commands) or id (card commands) — handy
   for scripting: `P=$(esplp prefix create --quiet)`.
-- Not yet covered by the CLI: the `status` transitions and the `?status=` filter
-  — use the REST API or Swagger UI for those for now.
-- `prefix list` is admin-only, so it needs the operator token: `--token <tok>`
-  or `ESPLP_TOKEN`. Every other command is customer-level and needs no token.
-  Passing the token anyway is harmless — the server ignores it on those routes,
-  so one exported `ESPLP_TOKEN` is fine for everything.
+- `prefix list` and `prefix set-status` are admin-only, so they need the
+  operator token: `--token <tok>` or `ESPLP_TOKEN`. Every other command is
+  customer-level and needs no token. Passing the token anyway is harmless — the
+  server ignores it on those routes, so one exported `ESPLP_TOKEN` is fine for
+  everything.
 
 ## Web UI (`web/`)
 
@@ -284,18 +284,28 @@ Layout on disk:
 ```
 data/
   cards.db                   # prefix + card metadata (the single index)
-  blobs/<prefix>/<id>.<ext>  # card front images
+  blobs/<prefix>/<id>.<ext>       # card front images
+  blobs/<prefix>/<id>-back.<ext>  # colour back images (double_sided_color only)
 ```
 
 ## Data model
 
 - **Prefix** — a UUID that groups one customer's cards (one order/batch). The
   customer picks a UUID or the server assigns one. `card_count` is derived.
-  Carries a `status` (see lifecycle below), `status_changed_at` and an optional
-  `order_ref` (external shop id).
+  Carries a `status` (see lifecycle below), `status_changed_at`, an optional
+  `order_ref` (external shop id), and a `print_mode` that fixes the ribbon-pass
+  scheme and therefore what a card's back side may be.
+- **Print modes** — `single_sided` (YMCKO, front only, no back at all),
+  `double_sided_color` (YMCKO, colour front **and** colour back image),
+  `color_front_black_back` (YMCKOKO, colour front + black-only text back; the
+  **default**, so existing rows keep their meaning). Set at prefix creation or
+  via `PATCH /api/prefixes/{prefix}` while the prefix is still writable.
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
-  `serial_number`, optional `back_text` (black-and-white only half-panel back
-  for song lists), and a front image (ISO/IEC 7810 / CR80, scaled to fit).
+  `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
+  the back side carries depends on the prefix's `print_mode`: black-back mode
+  uses `back_text` (markdown); double-sided colour requires a `back_image` file;
+  single-sided has neither. A back field that does not fit the mode is rejected
+  by the API, never silently stored.
 
 ## Prefix lifecycle
 
@@ -357,7 +367,13 @@ When `ADMIN_TOKEN` is unset the admin API is switched off: admin-only calls
 answer `503` with an explanatory body while everything customer-facing keeps
 working. An unset token is never an open door.
 
-The token is compared in constant time. There is no rate limiting yet.
+The token is compared in constant time. Failed admin-credential attempts are
+rate-limited per client address: 5 misses inside 15 minutes (a wrong bearer
+token on any request, or a wrong token at login) lock that address out for 15
+minutes, during which further attempts answer `429`. The counters are
+in-memory, so a restart clears them. The key is the left-most `X-Forwarded-For`
+entry (or `X-Real-Ip`, or a shared constant for direct clients), so put the
+server behind a proxy that sets it or every direct client shares one bucket.
 
 ### Admin session
 
@@ -393,8 +409,10 @@ an admin session.
 | Method | Path                                   | Purpose                       |
 |--------|----------------------------------------|-------------------------------|
 | POST   | `/api/prefixes`                        | create prefix (optional uuid) |
+| PUT    | `/api/prefixes/{prefix}`               | create prefix at path uuid, idempotent |
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
+| PATCH  | `/api/prefixes/{prefix}`               | set the print mode (while writable) |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
 | POST   | `/api/prefixes/{prefix}/submit`        | **removed** — answers `410`, use checkout |
 | PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
@@ -406,6 +424,7 @@ an admin session.
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | colour back image bytes (double_sided_color only) |
 | GET    | `/api/shop/config`                     | price, currency, and whether payment is on |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
 | POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |
@@ -414,7 +433,11 @@ an admin session.
 | DELETE | `/api/admin/session`                   | log out                       |
 
 Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
-`name`, `serial_number`, `back_text` and a file part `image`.
+`name`, `serial_number`, `back_text` and a file part `image`; a
+`double_sided_color` prefix additionally requires a `back_image` file part.
+`back_text` is only accepted in `color_front_black_back` mode, and `back_image`
+only in `double_sided_color` — a back field that does not fit the prefix's mode
+is rejected with `400`, never silently stored.
 
 `PUT` is full-replace and **requires** the image; use `PATCH` to edit
 name/serial/back text without re-uploading it. Re-uploading an image in a

@@ -2,20 +2,27 @@ mod auth;
 mod db;
 mod error;
 mod models;
+mod rate_limit;
 mod routes;
 mod stripe;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use sqlx::SqlitePool;
-use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+/// How many checkout sessions one prefix may open per window. A customer
+/// re-opening after a card decline or an abandoned page is a handful, never
+/// dozens — anything above this in a minute is a loop.
+const CHECKOUT_LIMIT_PER_PREFIX: u32 = 5;
+const CHECKOUT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,11 +32,17 @@ pub struct AppState {
     pub admin_token: Option<Arc<str>>,
     /// Live admin UI logins (the session cookie), persisted in the database.
     pub sessions: auth::Sessions,
+    /// Throttle on failed admin-credential attempts (wrong bearer token or
+    /// wrong login token), keyed by client address.
+    pub login_limiter: auth::LoginLimiter,
     /// Force `Secure` on the session cookie. `None` = infer per request from
     /// `X-Forwarded-Proto`, which is what you want behind a TLS proxy.
     pub cookie_secure: Option<bool>,
     /// Payment integration. `None` disables checkout and the webhook (503).
     pub stripe: Option<Arc<stripe::Stripe>>,
+    /// Throttles checkout-session creation, keyed by prefix. Persisted per
+    /// deployment, not part of the admin/session machinery.
+    pub checkout_limiter: rate_limit::RateLimiter,
 }
 
 /// Declares the bearer scheme so Swagger UI offers an Authorize button and
@@ -80,6 +93,7 @@ impl utoipa::Modify for SecurityAddon {
     modifiers(&SecurityAddon),
     paths(
         routes::create_prefix,
+        routes::put_prefix,
         routes::list_prefixes,
         routes::get_prefix,
         routes::delete_prefix,
@@ -176,8 +190,10 @@ async fn main() -> anyhow::Result<()> {
             data_dir: Arc::new(data_dir),
             admin_token,
             sessions: auth::Sessions::new(pool),
+            login_limiter: auth::LoginLimiter::default(),
             cookie_secure,
             stripe,
+            checkout_limiter: rate_limit::RateLimiter::new(CHECKOUT_LIMIT_PER_PREFIX, CHECKOUT_WINDOW),
         };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be
@@ -196,8 +212,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(routes::router(state))
         .fallback_service(ServeDir::new(&static_dir).fallback(ServeFile::new(index_html)))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = bind.parse()?;
     tracing::info!("listening on http://{addr}  (app at /, swagger UI at /swagger-ui)");

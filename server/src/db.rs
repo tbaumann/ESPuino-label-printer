@@ -5,7 +5,9 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::models::{Card, CardPatch, Prefix, PrefixStatus, PrintQueue, PrintQueueCard};
+use crate::models::{
+    Card, CardPatch, Prefix, PrefixStatus, PrintMode, PrintQueue, PrintQueueCard,
+};
 
 /// Open (creating if needed) the SQLite database and run migrations.
 pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
@@ -33,7 +35,7 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref,
+        p.order_ref, p.print_mode,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count
  FROM prefixes p";
 
@@ -41,7 +43,7 @@ const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_cha
 /// the print queue UI can tell a `printing` prefix that is a resume (still has
 /// unprinted cards) from one that is done.
 const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref,
+        p.order_ref, p.print_mode,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid AND c.printed_at IS NULL)
             AS unprinted_count
@@ -51,12 +53,16 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let status_raw: String = row.get("status");
     let status = PrefixStatus::parse(&status_raw)
         .ok_or_else(|| ApiError::Internal(format!("unknown prefix status '{status_raw}'")))?;
+    let mode_raw: String = row.get("print_mode");
+    let print_mode = PrintMode::parse(&mode_raw)
+        .ok_or_else(|| ApiError::Internal(format!("unknown prefix print_mode '{mode_raw}'")))?;
     Ok(Prefix {
         uuid: Uuid::parse_str(row.get::<String, _>("uuid").as_str())
             .map_err(|e| ApiError::Internal(e.to_string()))?,
         created_at: row.get("created_at"),
         status,
         status_changed_at: row.get("status_changed_at"),
+        print_mode,
         order_ref: row.get("order_ref"),
         card_count: row.get("card_count"),
         // The public view never carries operator-only print state.
@@ -71,13 +77,19 @@ fn admin_prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiErr
     Ok(p)
 }
 
-pub async fn create_prefix(pool: &SqlitePool, uuid: Option<Uuid>) -> Result<Prefix, ApiError> {
+pub async fn create_prefix(
+    pool: &SqlitePool,
+    uuid: Option<Uuid>,
+    print_mode: Option<PrintMode>,
+) -> Result<Prefix, ApiError> {
     let uuid = uuid.unwrap_or_else(Uuid::new_v4);
+    let print_mode = print_mode.unwrap_or(PrintMode::ColorFrontBlackBack);
     let res = sqlx::query(
-        "INSERT INTO prefixes (uuid, status, status_changed_at)
-         VALUES (?1, 'draft', datetime('now'))",
+        "INSERT INTO prefixes (uuid, status, status_changed_at, print_mode)
+         VALUES (?1, 'draft', datetime('now'), ?2)",
     )
     .bind(uuid.to_string())
+    .bind(print_mode.as_str())
     .execute(pool)
     .await;
 
@@ -92,6 +104,24 @@ pub async fn create_prefix(pool: &SqlitePool, uuid: Option<Uuid>) -> Result<Pref
     get_prefix(pool, uuid).await
 }
 
+/// Change a prefix's print mode. Idempotent: re-applying the current mode is a
+/// no-op that still returns the prefix.
+pub async fn set_prefix_mode(
+    pool: &SqlitePool,
+    uuid: Uuid,
+    mode: PrintMode,
+) -> Result<Prefix, ApiError> {
+    let current = get_prefix(pool, uuid).await?;
+    if current.print_mode != mode {
+        sqlx::query("UPDATE prefixes SET print_mode = ?2 WHERE uuid = ?1")
+            .bind(uuid.to_string())
+            .bind(mode.as_str())
+            .execute(pool)
+            .await?;
+    }
+    get_prefix(pool, uuid).await
+}
+
 pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiError> {
     let row = sqlx::query(&format!("{PREFIX_SELECT} WHERE p.uuid = ?1"))
         .bind(uuid.to_string())
@@ -99,6 +129,18 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("prefix {uuid}")))?;
     prefix_from_row(&row)
+}
+
+/// Create a prefix at a customer-chosen uuid, or return the existing one if it
+/// is already there (idempotent `PUT /api/prefixes/{prefix}`). Returns
+/// `(prefix, created)` so the caller can answer 201 vs 200.
+pub async fn upsert_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<(Prefix, bool), ApiError> {
+    match create_prefix(pool, Some(uuid), None).await {
+        Ok(p) => Ok((p, true)),
+        // Already exists: an idempotent PUT returns it rather than 409ing.
+        Err(ApiError::Conflict(_)) => Ok((get_prefix(pool, uuid).await?, false)),
+        Err(e) => Err(e),
+    }
 }
 
 /// List prefixes, optionally filtered by status (e.g. `paid` for the print queue).
@@ -198,6 +240,7 @@ fn card_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Card, ApiError> {
         serial_number: row.get("serial_number"),
         back_text: row.get("back_text"),
         image_content_type: row.get("image_content_type"),
+        back_image_content_type: row.get("back_image_content_type"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         printed_at: row.get("printed_at"),
@@ -233,6 +276,10 @@ pub async fn next_card_id(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiErr
 }
 
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
+///
+/// A `back_image_path`/`back_image_content_type` of `None` clears any stored
+/// colour back image. Which back fields are valid at all is enforced by the
+/// route layer against the prefix's `print_mode` before this is called.
 pub async fn upsert_card(
     pool: &SqlitePool,
     prefix: Uuid,
@@ -242,17 +289,22 @@ pub async fn upsert_card(
     back_text: Option<&str>,
     image_path: &str,
     image_content_type: &str,
+    back_image_path: Option<&str>,
+    back_image_content_type: Option<&str>,
 ) -> Result<Card, ApiError> {
     sqlx::query(
         "INSERT INTO cards
-            (prefix_uuid, id, name, serial_number, back_text, image_path, image_content_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            (prefix_uuid, id, name, serial_number, back_text, image_path, image_content_type,
+             back_image_path, back_image_content_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (prefix_uuid, id) DO UPDATE SET
             name = excluded.name,
             serial_number = excluded.serial_number,
             back_text = excluded.back_text,
             image_path = excluded.image_path,
             image_content_type = excluded.image_content_type,
+            back_image_path = excluded.back_image_path,
+            back_image_content_type = excluded.back_image_content_type,
             updated_at = datetime('now')",
     )
     .bind(prefix.to_string())
@@ -262,6 +314,8 @@ pub async fn upsert_card(
     .bind(back_text)
     .bind(image_path)
     .bind(image_content_type)
+    .bind(back_image_path)
+    .bind(back_image_content_type)
     .execute(pool)
     .await?;
 
@@ -276,6 +330,7 @@ pub async fn update_card_meta(
     patch: &CardPatch,
 ) -> Result<Card, ApiError> {
     get_card(pool, prefix, id).await?; // 404 if the card is unknown
+    let mode = get_prefix(pool, prefix).await?.print_mode;
 
     if let Some(raw) = patch.name.as_deref() {
         let name = raw.trim();
@@ -299,6 +354,11 @@ pub async fn update_card_meta(
         ("back_text", patch.back_text.as_deref()),
     ] {
         if let Some(v) = value {
+            if col == "back_text" && !mode.allows_back_text() {
+                return Err(ApiError::BadRequest(format!(
+                    "back_text is only valid in a colour_front_black_back prefix, not {mode}"
+                )));
+            }
             let v = if v.trim().is_empty() { None } else { Some(v) };
             sqlx::query(&format!(
                 "UPDATE cards SET {col} = ?3, updated_at = datetime('now')
@@ -409,4 +469,182 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
         unprinted_count,
         resume,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    /// A fresh in-memory database with all migrations applied.
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
+
+    #[tokio::test]
+    async fn upsert_creates_and_is_idempotent() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+
+        // First PUT creates.
+        let (p, created) = upsert_prefix(&pool, uuid).await.expect("first upsert");
+        assert!(created);
+        assert_eq!(p.uuid, uuid);
+        assert_eq!(p.status, PrefixStatus::Draft);
+
+        // Second PUT is a no-op, not an error, and returns the same prefix.
+        let (p2, created2) = upsert_prefix(&pool, uuid).await.expect("second upsert");
+        assert!(!created2);
+        assert_eq!(p2.uuid, uuid);
+        assert_eq!(p2.status, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn upsert_does_not_disturb_an_existing_prefix() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+        upsert_prefix(&pool, uuid).await.expect("create");
+
+        // Shuffle the status (only legal from draft in a real transition, so go
+        // via the transition table) — the point is that a repeat upsert must not
+        // reset it back to draft.
+        set_status(&pool, uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("transition to payment_pending");
+
+        let (p, created) = upsert_prefix(&pool, uuid).await.expect("repeat upsert");
+        assert!(!created);
+        // Force must stay false here: set_status was called non-force above.
+        assert_eq!(p.status, PrefixStatus::PaymentPending);
+    }
+
+    #[tokio::test]
+    async fn create_prefix_still_conflicts_on_duplicate() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+        upsert_prefix(&pool, uuid).await.expect("first create");
+        let err = create_prefix(&pool, Some(uuid), None).await.expect_err(
+            "a bare POST create must still 409 on a duplicate uuid",
+        );
+        assert!(matches!(err, ApiError::Conflict(_)));
+    }
+
+
+
+    #[test]
+    fn print_mode_parse_round_trips_all_modes() {
+        for (text, mode) in [
+            ("single_sided", PrintMode::SingleSided),
+            ("double_sided_color", PrintMode::DoubleSidedColor),
+            ("color_front_black_back", PrintMode::ColorFrontBlackBack),
+        ] {
+            assert_eq!(PrintMode::parse(text), Some(mode));
+            assert_eq!(mode.as_str(), text);
+        }
+        assert_eq!(PrintMode::parse("colour_front_black"), None);
+    }
+
+    #[test]
+    fn print_mode_back_field_capabilities() {
+        // Only the black-back mode renders markdown back text.
+        assert!(PrintMode::ColorFrontBlackBack.allows_back_text());
+        assert!(!PrintMode::SingleSided.allows_back_text());
+        assert!(!PrintMode::DoubleSidedColor.allows_back_text());
+
+        // Only double-sided colour takes a colour back image.
+        assert!(PrintMode::DoubleSidedColor.allows_back_image());
+        assert!(!PrintMode::SingleSided.allows_back_image());
+        assert!(!PrintMode::ColorFrontBlackBack.allows_back_image());
+    }
+
+    #[tokio::test]
+    async fn prefix_defaults_to_color_front_black_back() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        assert_eq!(p.print_mode, PrintMode::ColorFrontBlackBack);
+    }
+
+    #[tokio::test]
+    async fn prefix_accepts_an_explicit_mode() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::SingleSided))
+            .await
+            .expect("create");
+        assert_eq!(p.print_mode, PrintMode::SingleSided);
+    }
+
+    #[tokio::test]
+    async fn set_prefix_mode_is_idempotent_and_persists() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        let switched = set_prefix_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect("switch");
+        assert_eq!(switched.print_mode, PrintMode::DoubleSidedColor);
+        // Re-applying is a no-op that still returns the prefix.
+        let again = set_prefix_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect("switch again");
+        assert_eq!(again.print_mode, PrintMode::DoubleSidedColor);
+    }
+
+    #[tokio::test]
+    async fn back_image_content_type_round_trips_on_card() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .expect("create");
+        let card = upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "front",
+            None,
+            None,               // back_text is meaningless in colour mode
+            "blobs/1.png",
+            "image/png",
+            Some("blobs/1-back.png"),
+            Some("image/png"),
+        )
+        .await
+        .expect("upsert");
+        assert_eq!(card.image_content_type, "image/png");
+        assert_eq!(card.back_image_content_type.as_deref(), Some("image/png"));
+        assert!(card.back_text.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_black_back_mode_keeps_back_text_field_null() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::SingleSided))
+            .await
+            .expect("create");
+        let card = upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "front",
+            None,
+            None,
+            "blobs/1.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        assert!(card.back_image_content_type.is_none());
+    }
 }

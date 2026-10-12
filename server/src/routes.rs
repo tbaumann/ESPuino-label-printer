@@ -6,14 +6,15 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::auth;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{
-    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus,
-    PrintQueue, ShopConfig, StatusInput,
+    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixModePatch,
+    PrefixStatus, PrintMode, PrintQueue, ShopConfig, StatusInput,
 };
 use crate::stripe;
 use crate::AppState;
@@ -50,18 +51,52 @@ fn content_type_for(ext: &str) -> &'static str {
     }
 }
 
-/// Pull `name`, `serial_number`, `back_text` and an `image` file out of a
-/// multipart form, writing the image under the data dir.
+/// Write an image blob under `blobs/{prefix}/`, replacing any earlier blob for
+/// the same filename (e.g. a re-upload as jpg over a stored png). `filename`
+/// is the full file name, e.g. `"3.png"` (front) or `"3-back.png"` (back).
+/// Returns the blob's path relative to the data dir, as stored in the DB.
+fn write_blob(data_dir: &PathBuf, prefix: Uuid, filename: &str, bytes: &[u8]) -> Result<String, ApiError> {
+    let rel = format!("blobs/{prefix}/{filename}");
+    let abs = data_dir.join(&rel);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+        // Match by bare name prefix (e.g. "3-"), so re-uploading a front image
+        // can delete the old front `3.png` without touching the back `3-back.png`
+        // (which starts with a different prefix), and vice versa.
+        let keep = abs.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let name_prefix = filename
+            .split_once('.')
+            .map(|(stem, _)| format!("{stem}."))
+            .unwrap_or_default();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                if fname.starts_with(&name_prefix) && fname != keep {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    std::fs::write(&abs, bytes)?;
+    Ok(rel)
+}
+
+/// Pull `name`, `serial_number`, `back_text`, an `image` file and an optional
+/// `back_image` file out of a multipart form, validating the back fields
+/// against the prefix's `print_mode` *before* writing anything to disk.
 async fn store_card_form(
     mut mp: Multipart,
     data_dir: &PathBuf,
     prefix: Uuid,
     id: i64,
-) -> Result<(String, Option<String>, Option<String>, String, String), ApiError> {
+    mode: PrintMode,
+) -> Result<(String, Option<String>, Option<String>, String, String, Option<String>, Option<String>), ApiError> {
     let mut name: Option<String> = None;
     let mut serial: Option<String> = None;
     let mut back: Option<String> = None;
     let mut image: Option<(Vec<u8>, String)> = None;
+    let mut back_image: Option<(Vec<u8>, String)> = None;
 
     while let Some(field) = mp
         .next_field()
@@ -106,6 +141,17 @@ async fn store_card_form(
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 image = Some((bytes.to_vec(), ct));
             }
+            Some("back_image") => {
+                let ct = field
+                    .content_type()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                back_image = Some((bytes.to_vec(), ct));
+            }
             _ => {}
         }
     }
@@ -117,27 +163,43 @@ async fn store_card_form(
         return Err(ApiError::BadRequest("image is empty".into()));
     }
 
-    let rel = format!("blobs/{}/{}.{}", prefix, id, extension_for(&ct));
-    let abs = data_dir.join(&rel);
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent)?;
-        // Drop any previous blob for this card with a different extension,
-        // e.g. when a card is re-uploaded as jpg over an existing png.
-        let keep = abs.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-        let id_prefix = format!("{id}.");
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                let fname = fname.to_string_lossy();
-                if fname.starts_with(&id_prefix) && fname != keep {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
+    // Back side validity is fixed by the prefix's print mode. Reject rather
+    // than silently store a field the mode will never render.
+    if back.is_some() && !mode.allows_back_text() {
+        return Err(ApiError::BadRequest(format!(
+            "back_text is only valid in a colour_front_black_back prefix, not {mode}"
+        )));
     }
-    std::fs::write(&abs, &bytes)?;
+    if mode.allows_back_image() {
+        let Some((_, bct)) = &back_image else {
+            return Err(ApiError::BadRequest(
+                "a double_sided_color prefix requires a back_image on every card".into(),
+            ));
+        };
+        if bct.is_empty() {
+            return Err(ApiError::BadRequest("back_image is empty".into()));
+        }
+    } else if back_image.is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "a back_image is only valid in a double_sided_color prefix, not {mode}"
+        )));
+    }
 
-    Ok((name, serial, back, rel, ct))
+    let image_rel = write_blob(data_dir, prefix, &format!("{id}.{}", extension_for(&ct)), &bytes)?;
+    let (back_rel, back_ct) = match back_image {
+        Some((bbytes, bct)) => {
+            let rel = write_blob(
+                data_dir,
+                prefix,
+                &format!("{id}-back.{}", extension_for(&bct)),
+                &bbytes,
+            )?;
+            (Some(rel), Some(bct))
+        }
+        None => (None, None),
+    };
+
+    Ok((name, serial, back, image_rel, ct, back_rel, back_ct))
 }
 
 /// Create a prefix, optionally choosing its uuid.
@@ -150,8 +212,34 @@ pub async fn create_prefix(
     State(st): State<AppState>,
     Json(input): Json<PrefixInput>,
 ) -> Result<(StatusCode, Json<Prefix>), ApiError> {
-    let p = db::create_prefix(&st.pool, input.uuid).await?;
+    let p = db::create_prefix(&st.pool, input.uuid, input.print_mode).await?;
     Ok((StatusCode::CREATED, Json(p)))
+}
+
+/// Create a prefix at the uuid in the path, or return the existing one if it
+/// is already there. Idempotent: the same PUT twice is harmless, and answers
+/// 201 on first creation and 200 on subsequent (no-op) calls.
+#[utoipa::path(
+    put, path = "/api/prefixes/{prefix}", tag = "prefixes",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    responses(
+        (status = 201, description = "created", body = Prefix),
+        (status = 200, description = "already exists", body = Prefix),
+        (status = 400, description = "invalid uuid", body = crate::error::ErrorBody)
+    )
+)]
+pub async fn put_prefix(
+    State(st): State<AppState>,
+    Path(prefix): Path<String>,
+) -> Result<(StatusCode, Json<Prefix>), ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let (p, created) = db::upsert_prefix(&st.pool, prefix).await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(p)))
 }
 
 /// Query for listing prefixes.
@@ -176,7 +264,7 @@ pub async fn list_prefixes(
     headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Vec<Prefix>>, ApiError> {
-    auth::resolve(&st, &headers).await.require_admin()?;
+    auth::resolve(&st, &headers).await?.require_admin()?;
     let status = match q.status.as_deref() {
         None => None,
         Some(s) => Some(
@@ -227,9 +315,12 @@ pub async fn put_card(
     mp: Multipart,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
-    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let caller = auth::resolve(&st, &headers).await?;
+    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+        .await?
+        .print_mode;
+    let (name, serial, back, rel, ct, back_rel, back_ct) =
+        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -239,6 +330,8 @@ pub async fn put_card(
         back.as_deref(),
         &rel,
         &ct,
+        back_rel.as_deref(),
+        back_ct.as_deref(),
     )
     .await?;
     Ok(Json(card))
@@ -258,10 +351,13 @@ pub async fn post_card(
     mp: Multipart,
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
-    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    let caller = auth::resolve(&st, &headers).await?;
+    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+        .await?
+        .print_mode;
     let id = db::next_card_id(&st.pool, prefix).await?;
-    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let (name, serial, back, rel, ct, back_rel, back_ct) =
+        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -271,6 +367,8 @@ pub async fn post_card(
         back.as_deref(),
         &rel,
         &ct,
+        back_rel.as_deref(),
+        back_ct.as_deref(),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(card)))
@@ -312,6 +410,59 @@ pub async fn get_card_image(
         .into_response())
 }
 
+/// Fetch a card's colour back image bytes (only present in `double_sided_color`).
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/back-image", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
+pub async fn get_card_back_image(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    let Some(ct) = &card.back_image_content_type else {
+        return Err(ApiError::NotFound(format!(
+            "back image for card {id} in prefix {prefix} has never been uploaded"
+        )));
+    };
+    let ext = extension_for(ct);
+    let rel = format!("blobs/{prefix}/{id}-back.{ext}");
+    let bytes = std::fs::read(st.data_dir.join(&rel))
+        .map_err(|_| ApiError::NotFound(format!("back image for card {id}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type_for(ext)),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Change a prefix's print mode while it is still writable.
+#[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    request_body = PrefixModePatch,
+    responses(
+        (status = 200, body = Prefix),
+        (status = 400, body = crate::error::ErrorBody),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+    ))]
+pub async fn patch_prefix_mode(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+    Json(input): Json<PrefixModePatch>,
+) -> Result<Json<Prefix>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers).await?;
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    Ok(Json(
+        db::set_prefix_mode(&st.pool, prefix, input.print_mode).await?,
+    ))
+}
+
 /// Delete a card (metadata + image).
 #[utoipa::path(delete, path = "/api/prefixes/{prefix}/cards/{id}", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
@@ -322,7 +473,7 @@ pub async fn delete_card(
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     db::delete_card(&st.pool, prefix, id).await?;
@@ -333,6 +484,10 @@ pub async fn delete_card(
         extension_for(&card.image_content_type)
     );
     let _ = std::fs::remove_file(st.data_dir.join(&rel));
+    if let Some(ct) = &card.back_image_content_type {
+        let back_rel = format!("blobs/{prefix}/{id}-back.{}", extension_for(ct));
+        let _ = std::fs::remove_file(st.data_dir.join(&back_rel));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -353,7 +508,7 @@ pub async fn delete_prefix(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     let p = db::get_prefix(&st.pool, prefix).await?;
     if !caller.is_admin() && !p.status.is_customer_writable() {
         return Err(ApiError::Conflict(format!(
@@ -380,7 +535,7 @@ pub async fn delete_cards(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     db::delete_all_cards(&st.pool, prefix).await?;
     let _ = std::fs::remove_dir_all(st.data_dir.join("blobs").join(prefix.to_string()));
@@ -404,7 +559,7 @@ pub async fn patch_card(
     Json(patch): Json<CardPatch>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     Ok(Json(
         db::update_card_meta(&st.pool, prefix, id, &patch).await?,
@@ -432,7 +587,7 @@ pub async fn get_print_queue(
     Path(prefix): Path<String>,
 ) -> Result<Json<PrintQueue>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(db::print_queue(&st.pool, prefix).await?))
 }
@@ -455,7 +610,7 @@ pub async fn mark_card_printed(
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(db::mark_card_printed(&st.pool, prefix, id).await?))
 }
@@ -482,7 +637,7 @@ pub async fn patch_status(
     Json(input): Json<StatusInput>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
     Ok(Json(
         db::set_status(
@@ -531,7 +686,17 @@ pub async fn admin_login(
     headers: HeaderMap,
     Json(input): Json<AdminLogin>,
 ) -> Result<Response, ApiError> {
-    auth::verify_token(&st, &input.token)?;
+    let key = auth::client_ip(&headers);
+    // Refuse before even comparing once this client is locked out.
+    st.login_limiter.check(&key)?;
+    if let Err(e) = auth::verify_token(&st, &input.token) {
+        // Only a *wrong token* (401) counts against the key; a 503 (admin API
+        // disabled) is not a failed guess and must not lock anyone out.
+        if matches!(e, ApiError::Unauthorized(_)) {
+            st.login_limiter.record_failure(&key);
+        }
+        return Err(e);
+    }
     let id = st.sessions.create().await;
     let secure = cookie_secure(&st, &headers);
     let cookie = format!(
@@ -570,7 +735,7 @@ pub async fn admin_session(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AdminSession>, ApiError> {
-    auth::resolve(&st, &headers).await.require_admin()?;
+    auth::resolve(&st, &headers).await?.require_admin()?;
     Ok(Json(AdminSession {
         authenticated: true,
     }))
@@ -640,10 +805,17 @@ pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
 /// order real, so a `draft` goes straight to `payment_pending` here. Nothing here
 /// marks the prefix paid — that happens when Stripe confirms the money, via the
 /// webhook.
+///
+/// Rate-limited per prefix: opening a Checkout session costs a Stripe round
+/// trip, so a loop on one prefix is throttled to a handful per minute. A brand
+/// new prefix can still be paid for whenever, so a customer's own re-opens are
+/// never in the way — this bounds the Stripe traffic from a hammering caller,
+/// which is all it is for.
 #[utoipa::path(post, path = "/api/prefixes/{prefix}/checkout", tag = "shop",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 200, body = stripe::CheckoutSession),
+        (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
         (status = 409, description = "the prefix has no cards, or is already past payment", body = crate::error::ErrorBody),
         (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
@@ -655,6 +827,17 @@ pub async fn create_checkout(
     Path(prefix): Path<String>,
 ) -> Result<Json<stripe::CheckoutSession>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+
+    // Throttle before doing any work: created sessions cost a Stripe round
+    // trip, and each one also flips the prefix out of draft, so re-opening
+    // beyond the limit is either a loop or a broken customer flow — both should
+    // slow down.
+    if !st.checkout_limiter.allow(&prefix.to_string()) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many checkout sessions for prefix {prefix}; try again in a minute"
+        )));
+    }
+
     let stripe = st.stripe.as_deref().ok_or_else(|| {
         ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
     })?;
@@ -746,6 +929,9 @@ pub async fn stripe_webhook(
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             record_payment(&st, &event).await?;
         }
+        "checkout.session.expired" => {
+            revert_expired_checkout(&st.pool, &event.data.object).await?;
+        }
         other => {
             tracing::debug!(event = other, id = %event.id, "ignoring Stripe event type");
         }
@@ -829,6 +1015,67 @@ async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiE
     Ok(())
 }
 
+/// Revert a Checkout session that expired without payment back to `draft`.
+///
+/// `checkout.session.expired` fires when a session times out (the customer
+/// abandoned it, or a card was declined) — nothing was paid, so the prefix
+/// should stop reading as `payment_pending` and give the customer back their
+/// write window instead of stranding a half-open order. Idempotent like
+/// `record_payment`: a retried delivery finds a draft already and is a no-op.
+///
+/// Deliberately narrow: only a `payment_pending` prefix is reverted. A prefix
+/// already at `draft` is a duplicated delivery; anything past `payment_pending`
+/// means a payment landed despite this expiry, and un-sealing that is a human's
+/// call, not a webhook's.
+async fn revert_expired_checkout(
+    pool: &SqlitePool,
+    session: &stripe::SessionObject,
+) -> Result<(), ApiError> {
+    let Some(raw) = session.prefix_uuid() else {
+        tracing::warn!(session = %session.id,
+            "expired session carries no prefix reference; nothing to revert");
+        return Ok(());
+    };
+    let Ok(prefix) = Uuid::parse_str(&raw) else {
+        tracing::warn!(session = %session.id, reference = %raw,
+            "expired session's prefix reference is not a uuid");
+        return Ok(());
+    };
+
+    let current = match db::get_prefix(pool, prefix).await {
+        Ok(p) => p,
+        Err(ApiError::NotFound(_)) => {
+            // Deleted meanwhile — nothing left to un-seal, and the customer is
+            // not coming back to it. Accept and move on.
+            tracing::debug!(%prefix, session = %session.id,
+                "expired session for a prefix that no longer exists");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    match current.status {
+        PrefixStatus::PaymentPending => {
+            let updated = db::set_status(pool, prefix, PrefixStatus::Draft, None, false).await?;
+            tracing::info!(%prefix, session = %session.id,
+                "checkout expired without payment; prefix reverted to {}", updated.status);
+        }
+        // Already a draft — a duplicated delivery of the same expired event.
+        PrefixStatus::Draft => {
+            tracing::debug!(%prefix, session = %session.id,
+                "checkout already reverted to draft; ignoring the duplicate");
+        }
+        // A payment landed despite the expiry, or the status moved on. Not our
+        // call to un-seal: leave it and flag it for a human.
+        other => {
+            tracing::warn!(%prefix, session = %session.id, status = %other,
+                "expired session met a prefix that is '{}' — past payment_pending, so left alone \
+                 (a payment may have landed; check in the admin UI)", other);
+        }
+    }
+    Ok(())
+}
+
 /// The `submit` step is gone: paying is what makes an order real, so the
 /// checkout call moves a draft straight to `payment_pending`.
 ///
@@ -855,7 +1102,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/prefixes/:prefix",
-            axum::routing::get(get_prefix).delete(delete_prefix),
+            axum::routing::get(get_prefix)
+                .put(put_prefix)
+                .delete(delete_prefix)
+                .patch(patch_prefix_mode),
         )
         // Kept as an explicit tombstone rather than deleted, so a stale client
         // gets a 410 with a reason instead of a 405 from the static fallback.
@@ -885,6 +1135,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(get_card_image),
         )
         .route(
+            "/api/prefixes/:prefix/cards/:id/back-image",
+            axum::routing::get(get_card_back_image),
+        )
+        .route(
             "/api/prefixes/:prefix/cards/:id/printed",
             axum::routing::post(mark_card_printed),
         )
@@ -912,4 +1166,148 @@ pub fn router(state: AppState) -> Router {
         // only, so the SPA and Swagger UI are untouched.
         .layer(axum::middleware::from_fn(auth::csrf_guard))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rate_limit;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    /// A fresh in-memory database with all migrations applied.
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
+
+    /// An expired-session webhook payload keyed to a prefix (or none).
+    fn expired_session(prefix: Option<&str>) -> stripe::SessionObject {
+        stripe::SessionObject {
+            id: "cs_expired".into(),
+            client_reference_id: prefix.map(str::to_string),
+            payment_status: None,
+            amount_total: None,
+            currency: None,
+            metadata: None,
+        }
+    }
+
+    async fn status_of(pool: &SqlitePool, uuid: Uuid) -> PrefixStatus {
+        db::get_prefix(pool, uuid).await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn expired_checkout_reverts_payment_pending_to_draft() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        // Mirror what /checkout does: a draft opens a session, flipping to
+        // payment_pending.
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::PaymentPending);
+
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn replayed_expired_event_leaves_draft_alone() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap(); // already draft
+
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn expired_event_does_not_unseal_a_paid_prefix() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .unwrap();
+
+        // A later, out-of-order expired event must not silently reopen an order
+        // whose money already landed.
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+    }
+
+    #[tokio::test]
+    async fn expired_event_without_a_prefix_is_a_harmless_noop() {
+        let pool = test_pool().await;
+        // Missing reference, and a junk reference — neither should error nor
+        // touch anything.
+        revert_expired_checkout(&pool, &expired_session(None))
+            .await
+            .unwrap();
+        revert_expired_checkout(&pool, &expired_session(Some("not-a-uuid")))
+            .await
+            .unwrap();
+        // And a session for a prefix that never existed is a no-op too.
+        revert_expired_checkout(&pool, &expired_session(Some(&Uuid::new_v4().to_string())))
+            .await
+            .unwrap();
+    }
+
+    fn state_with(limiter: rate_limit::RateLimiter, pool: SqlitePool) -> AppState {
+        AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(PathBuf::new()),
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
+            checkout_limiter: limiter,
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_is_throttled_per_prefix() {
+        let pool = test_pool().await;
+        // Limit 1 per window: the first call is admitted and proceeds to the
+        // (off) shop check — 503 — and the second is throttled with 429 before
+        // it touches the database or Stripe.
+        let st = state_with(
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60)),
+            pool,
+        );
+        let p = Uuid::new_v4().to_string();
+
+        let first = create_checkout(State(st.clone()), HeaderMap::new(), Path(p.clone())).await;
+        assert!(
+            matches!(first, Err(ApiError::Unavailable(_))),
+            "first use should pass the limiter and hit the not-configured shop, got {first:?}"
+        );
+
+        let second = create_checkout(State(st), HeaderMap::new(), Path(p)).await;
+        assert!(
+            matches!(second, Err(ApiError::TooManyRequests(_))),
+            "second use inside the window should be throttled, got {second:?}"
+        );
+    }
 }

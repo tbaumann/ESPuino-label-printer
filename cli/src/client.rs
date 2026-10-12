@@ -99,9 +99,33 @@ impl Client {
         .await
     }
 
-    pub async fn list_prefixes(&self) -> Result<Value> {
-        self.send(self.http.get(format!("{}/api/prefixes", self.base)))
-            .await
+    /// List prefixes, optionally filtered by status (`?status=`). Admin-only on
+    /// the server, so this needs the operator token.
+    pub async fn list_prefixes(&self, status: Option<&str>) -> Result<Value> {
+        let mut req = self.http.get(format!("{}/api/prefixes", self.base));
+        if let Some(s) = status {
+            req = req.query(&[("status", s)]);
+        }
+        self.send(req).await
+    }
+
+    /// Set a prefix's status (any transition). Admin-only on the server.
+    pub async fn set_status(
+        &self,
+        prefix: &str,
+        status: &str,
+        order_ref: Option<&str>,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({ "status": status });
+        if let Some(r) = order_ref {
+            body["order_ref"] = serde_json::json!(r);
+        }
+        self.send(
+            self.http
+                .patch(format!("{}/api/prefixes/{prefix}/status", self.base))
+                .json(&body),
+        )
+        .await
     }
 
     pub async fn get_prefix(&self, prefix: &str) -> Result<Value> {

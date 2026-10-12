@@ -138,8 +138,11 @@ unpaid. Without this, the first declined card becomes a support ticket.
       order unrecorded — the `paid` transition is the part that matters. Send
       after the status write and outside its error path.
 - **Checkout is unthrottled.** Anyone holding a prefix uuid can create checkout
-  sessions in a loop. Harmless to us, mildly annoying to Stripe. The same
-  rate-limiting work as the admin path would cover it.
+  sessions in a loop. Harmless to us, mildly annoying to Stripe. **Done:**
+  `create_checkout` is now throttled to a few sessions per prefix per minute
+  (`server/src/rate_limit.rs`, a keyed in-memory fixed-window limiter, 429 on
+  excess). The `create_prefix` loop-around (spin up a fresh prefix per checkout)
+  is out of scope — the task's threat model was a loop on one prefix.
 - **No VAT handling.** Prices are configured VAT-inclusive and nothing computes
   tax. Fine while the Kleinunternehmer thresholds apply; Stripe Tax (0.45 EUR per
   transaction on the API integration) is the drop-in if that changes.
@@ -257,12 +260,11 @@ To settle when it is built:
 
 ## Also outstanding
 
-- Rate-limit failed admin logins and the bearer path.
-- `CorsLayer::permissive()` is unnecessary now that the admin UI is same-origin;
-  permissive CORS beside a cookie-authenticated API is worth revisiting.
+- Rate-limit failed admin logins and the bearer path. **Done** — a per-client
+  `LoginLimiter` (5 misses / 15 min → 15 min lockout, in-memory) gates both the
+  login endpoint and the bearer path in `auth::resolve`; a locked-out key
+  answers 429. Keyed on `X-Forwarded-For`/`X-Real-Ip`.
 - Server-side render of the black-only card back (client-side preview only so
   far) — needed by the print queue, and per print mode.
-- `PUT /api/prefixes/{prefix}` for an idempotent customer-chosen uuid.
-- CLI: status transitions and the `?status=` filter.
 - Admin sessions live in memory, so a restart logs the operator out. Fine for
   now; move to a table if that becomes annoying.

@@ -19,7 +19,10 @@
 //! them, which keeps "customer may also do this" rules (delete a writable
 //! prefix, write cards while not frozen) in one obvious place per endpoint.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, Method};
@@ -142,12 +145,169 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Per-client throttle on failed admin-credential attempts.
+///
+/// Both ways an attacker can guess `ADMIN_TOKEN` — the login endpoint, and a
+/// wrong bearer token on any request — feed the same counter keyed by the
+/// client address. Once enough failures land inside a window, the key is
+/// locked out for `lockout`; further attempts answer 429 until it lapses.
+///
+/// This is deliberately the coarse thing: it stops online brute force of the
+/// token, not an insider with many addresses (an attacker with a botnet can
+/// rotate IPs regardless of the key we pick). In-memory on purpose — a restart
+/// clears the counters, which is the right failure mode (better to re-arm the
+/// limiter than to lock a legitimately locked-out operator out forever).
+#[derive(Clone)]
+pub struct LoginLimiter {
+    inner: Arc<std::sync::Mutex<HashMap<String, Bucket>>>,
+    /// Failures allowed inside one `window` before a lockout begins.
+    max_failures: u32,
+    window: Duration,
+    lockout: Duration,
+}
+
+struct Bucket {
+    /// Failures recorded since `window_start` (0 once locked out).
+    failures: u32,
+    window_start: Instant,
+    /// Until when the key refuses attempts. None while merely counting.
+    blocked_until: Option<Instant>,
+}
+
+/// Defaults: 5 failures per 15 minutes buys a 15-minute lockout.
+const DEFAULT_MAX_FAILURES: u32 = 5;
+const DEFAULT_WINDOW: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_FAILURES, DEFAULT_WINDOW, DEFAULT_LOCKOUT)
+    }
+}
+
+impl LoginLimiter {
+    pub fn new(max_failures: u32, window: Duration, lockout: Duration) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            window,
+            lockout,
+            max_failures,
+        }
+    }
+
+    /// Refuse the attempt if this key is currently locked out. Call *before*
+    /// verifying, so a locked-out key never even reaches the token comparison.
+    ///
+    /// Prunes the key once its window and lockout have both lapsed, so the map
+    /// does not grow without bound from rotating addresses.
+    pub fn check(&self, key: &str) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let mut map = self.inner.lock().expect("limiter mutex poisoned");
+        let Some(bucket) = map.get(key) else {
+            return Ok(());
+        };
+        // Both lapsed: the attempt history is spent, drop it.
+        let lock_lapsed = bucket
+            .blocked_until
+            .is_some_and(|b| now.duration_since(b) > self.lockout);
+        let window_lapsed = now.duration_since(bucket.window_start) > self.window;
+        if lock_lapsed || (bucket.blocked_until.is_none() && window_lapsed) {
+            map.remove(key);
+            return Ok(());
+        }
+        if bucket
+            .blocked_until
+            .is_some_and(|b| now < b)
+        {
+            return Err(ApiError::TooManyRequests(format!(
+                "too many failed admin attempts; try again in {}s",
+                bucket
+                    .blocked_until
+                    .map(|b| b.duration_since(now).as_secs())
+                    .unwrap_or(self.lockout.as_secs())
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record one failure. Call only after a *verified-wrong* credential, so a
+    /// flood of requests that do not even reach the comparison (malformed,
+    /// no token configured) does not count against the key.
+    pub fn record_failure(&self, key: &str) {
+        let now = Instant::now();
+        let mut map = self.inner.lock().expect("limiter mutex poisoned");
+        // A key can only have a bucket when `check` ran first, but be defensive
+        // about the bucket's age in case windows were configured tiny.
+        let window_lapsed = map
+            .get(key)
+            .is_some_and(|b| now.duration_since(b.window_start) > self.window);
+        let bucket = map.entry(key.to_string()).or_insert(Bucket {
+            failures: 0,
+            window_start: now,
+            blocked_until: None,
+        });
+        if window_lapsed {
+            *bucket = Bucket {
+                failures: 0,
+                window_start: now,
+                blocked_until: None,
+            };
+        }
+        if bucket.blocked_until.is_some() {
+            return; // already locked out; a locked-out request is refused by `check` anyway
+        }
+        bucket.failures += 1;
+        if bucket.failures >= self.max_failures {
+            bucket.blocked_until = Some(now + self.lockout);
+            // Keep the failing key in the map so `check` still refuses it while
+            // locked; failures are zeroed so the post-lockout window starts clean.
+            bucket.failures = 0;
+            bucket.window_start = now;
+        }
+    }
+}
+
+/// The client's address, for rate-limiting.
+///
+/// The rate limiter keys on the network address that owns the credential
+/// attempts. In front of a reverse proxy (the deployment the cookie-secure
+/// logic already assumes) that is the left-most untrusted address in
+/// `X-Forwarded-For`; without one it is whoever `X-Real-Ip` names. Falling back
+/// to a constant when no header is present is a deliberate compromise: direct
+/// clients all share one key, which at worst over-throttles (`too many failed
+/// attempts` now affects every direct client at once). The endpoint cannot see
+/// the peer's socket address — handlers only get the header map — so the header
+/// is the only signal available. Trusting `X-Forwarded-For` is fine because the
+/// limiter only ever *withholds* a credential; a spoofed header cannot mint one.
+pub fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::trim)
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "<direct>".to_string())
+}
+
 /// Resolve the caller from the request headers.
 ///
 /// The bearer token is tried first: it is the CLI's path and cannot be sent by
 /// a browser on its own, so it is never the ambient credential.
-pub async fn resolve(state: &AppState, headers: &HeaderMap) -> Auth {
+///
+/// A presented-but-wrong bearer token is a failed admin-credential attempt and
+/// feeds the rate limiter, so an attacker cannot grind through guesses. A
+/// locked-out key answers [`ApiError::TooManyRequests`] before the token is
+/// even compared. Requests that carry no admin credential at all (a plain
+/// customer, or a session cookie) never touch the limiter.
+pub async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<Auth, ApiError> {
     let configured = state.admin_token.is_some();
+    let key = client_ip(headers);
 
     if let Some(expected) = state.admin_token.as_deref() {
         let presented = headers
@@ -155,28 +315,28 @@ pub async fn resolve(state: &AppState, headers: &HeaderMap) -> Auth {
             .and_then(|v| v.to_str().ok())
             .and_then(bearer_token);
         if let Some(token) = presented {
+            state.login_limiter.check(&key)?;
             if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-                return Auth {
+                return Ok(Auth {
                     role: Role::Admin,
                     configured,
-                };
+                });
             }
-        }
-
-        if let Some(id) = cookie_value(headers, SESSION_COOKIE) {
+            state.login_limiter.record_failure(&key);
+        } else if let Some(id) = cookie_value(headers, SESSION_COOKIE) {
             if state.sessions.is_valid(&id).await {
-                return Auth {
+                return Ok(Auth {
                     role: Role::Admin,
                     configured,
-                };
+                });
             }
         }
     }
 
-    Auth {
+    Ok(Auth {
         role: Role::Customer,
         configured,
-    }
+    })
 }
 
 /// Check the token submitted to the login endpoint. 503 when no token is
@@ -305,6 +465,82 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secret-longer"));
         assert!(!constant_time_eq(b"", b"x"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn client_ip_parses_forwarded_for() {
+        let h = headers_with(&[("x-forwarded-for", "203.0.113.7, 10.0.0.2")]);
+        assert_eq!(client_ip(&h), "203.0.113.7");
+        // Left-most (untrusted) entry wins; whitespace is trimmed.
+        let h = headers_with(&[("x-forwarded-for", " 203.0.113.9 "), ("x-real-ip", "10.1.2.3")]);
+        assert_eq!(client_ip(&h), "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_falls_back() {
+        // X-Real-Ip when no X-Forwarded-For.
+        let h = headers_with(&[("x-real-ip", "10.1.2.3")]);
+        assert_eq!(client_ip(&h), "10.1.2.3");
+        // A constant when neither is present.
+        let h = HeaderMap::new();
+        assert_eq!(client_ip(&h), "<direct>");
+    }
+
+    /// A limiter with a tiny window and lockout so tests hit real time.
+    fn tiny_limiter() -> (LoginLimiter, Duration) {
+        let d = Duration::from_millis(50);
+        (LoginLimiter::new(3, d, d), d)
+    }
+
+    #[test]
+    fn rejects_after_max_failures() {
+        let (lim, _) = tiny_limiter();
+        // Two failures below the limit are allowed.
+        for _ in 0..2 {
+            assert!(lim.check("203.0.113.7").is_ok());
+            lim.record_failure("203.0.113.7");
+        }
+        assert!(lim.check("203.0.113.7").is_ok());
+        // Third tips it over the lockout threshold.
+        lim.record_failure("203.0.113.7");
+        assert!(matches!(
+            lim.check("203.0.113.7"),
+            Err(ApiError::TooManyRequests(_))
+        ));
+    }
+
+    #[test]
+    fn keys_are_independent() {
+        let (lim, _) = tiny_limiter();
+        for _ in 0..5 {
+            lim.record_failure("attacker");
+        }
+        // Even after the attacker is locked out, a clean key is unaffected.
+        assert!(lim.check("legit").is_ok());
+    }
+
+    #[test]
+    fn lockout_lapses_and_allows_again() {
+        let (lim, d) = tiny_limiter();
+        for _ in 0..3 {
+            lim.record_failure("203.0.113.7");
+        }
+        assert!(lim.check("203.0.113.7").is_err());
+        std::thread::sleep(d * 3);
+        assert!(lim.check("203.0.113.7").is_ok());
+        // A fresh failure window starts clean after the lockout: one more miss
+        // is not instantly a lockout again.
+        assert!(lim.check("203.0.113.7").is_ok());
+        lim.record_failure("203.0.113.7");
+        assert!(lim.check("203.0.113.7").is_ok());
+    }
+
+    #[test]
+    fn different_keys_share_no_counter() {
+        let (lim, _) = tiny_limiter();
+        lim.record_failure("a");
+        lim.record_failure("b");
+        assert!(lim.check("c").is_ok());
     }
 
     #[test]
