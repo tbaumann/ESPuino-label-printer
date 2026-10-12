@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { adminApi, STATUSES, type Prefix, type PrefixStatus } from '../lib/api'
+  import {
+    adminApi,
+    STATUSES,
+    formatMoney,
+    type NeedsAttentionItem,
+    type Prefix,
+    type PrefixStatus,
+  } from '../lib/api'
   import { navigate } from '../lib/router'
 
   /** 'checking' until we have asked the server whether a session exists. */
@@ -11,6 +18,7 @@
 
   let prefixes = $state<Prefix[]>([])
   let filter = $state<PrefixStatus | ''>('')
+  let attention = $state<NeedsAttentionItem[]>([])
 
   onMount(async () => {
     auth = await adminApi.session()
@@ -20,7 +28,12 @@
   async function load() {
     error = null
     try {
-      prefixes = await adminApi.listPrefixes(filter)
+      const [list, flag] = await Promise.all([
+        adminApi.listPrefixes(filter),
+        adminApi.needsAttention(),
+      ])
+      prefixes = list
+      attention = flag
     } catch (e) {
       error = (e as Error).message
     }
@@ -124,6 +137,41 @@
   {:else}
     {#if error}
       <div class="error">{error}</div>
+    {/if}
+
+    {#if attention.length > 0}
+      <section class="panel">
+        <div class="row">
+          <h2>Needs attention</h2>
+          <span class="badge">{attention.length}</span>
+          <span class="muted" style="margin-left:8px">
+            money and the order disagree — deal with each one
+          </span>
+        </div>
+        <div class="alist">
+          {#each attention as a (a.prefix + a.at)}
+            <div class="ablock">
+              <div class="row">
+                <a
+                  class="mono"
+                  href={`/admin/p/${a.prefix}`}
+                  onclick={(e) => { e.preventDefault(); open(a.prefix) }}
+                >
+                  {a.prefix}
+                </a>
+                <span class="badge kind-{a.kind}">{a.kind.replace(/_/g, ' ')}</span>
+                <span class="action mono">{a.action}</span>
+                {#if a.currency !== null && a.amount_cents !== null}
+                  <span class="muted">{formatMoney(a.amount_cents as number, a.currency as string)}</span>
+                {/if}
+                <span style="flex:1"></span>
+                <span class="muted">{a.at}</span>
+              </div>
+              <p class="amessage">{a.message}</p>
+            </div>
+          {/each}
+        </div>
+      </section>
     {/if}
 
     <section class="panel">

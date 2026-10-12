@@ -451,6 +451,55 @@ select:focus {
   text-decoration: underline;
 }
 
+/* Needs-attention list */
+
+.alist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ablock {
+  padding: 12px 16px;
+  background: color-mix(in srgb, var(--danger) 5%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--danger) 25%, var(--border));
+  border-radius: var(--radius);
+}
+
+.ablock .row a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.ablock .row a:hover {
+  text-decoration: underline;
+}
+
+.ablock .action {
+  color: var(--danger);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+}
+
+.ablock .amessage {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ablock .badge.kind-payment_for_deleted {
+  color: var(--danger);
+  border-color: #e3a9a2;
+}
+
+.ablock .badge.kind-abandoned_checkout {
+  color: #b07000;
+  border-color: #e8c07a;
+}
+
 /* Print preview rows: two columns, no editor, no delete. */
 
 .card.preview-only {

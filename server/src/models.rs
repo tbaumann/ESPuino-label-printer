@@ -302,3 +302,95 @@ pub struct ShopConfig {
     /// Countries the shipping address may be in.
     pub countries: Vec<String>,
 }
+
+/// Why a prefix needs the operator's attention: money and the order disagree.
+///
+/// A settled payment normally changes the prefix to `paid`. These are exactly
+/// the dead ends where that cannot happen, and the item's `action` says what a
+/// human should do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedsAttentionKind {
+    /// A settled payment landed on a prefix that was cancelled first.
+    PaymentForCancelled,
+    /// A settled payment landed on a prefix that still reads as a draft.
+    PaymentForDraft,
+    /// A settled payment for a prefix that has since been deleted.
+    PaymentForDeleted,
+    /// A settled payment for a prefix that is already past printing — it must
+    /// have been paid to get there, so this is most likely a duplicate charge.
+    PaymentAfterPrinting,
+    /// A prefix left sitting in `payment_pending`: the checkout was abandoned
+    /// and nothing was ever paid, so no work queue will ever pick it up.
+    AbandonedCheckout,
+}
+
+impl NeedsAttentionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PaymentForCancelled => "payment_for_cancelled",
+            Self::PaymentForDraft => "payment_for_draft",
+            Self::PaymentForDeleted => "payment_for_deleted",
+            Self::PaymentAfterPrinting => "payment_after_printing",
+            Self::AbandonedCheckout => "abandoned_checkout",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "payment_for_cancelled" => Self::PaymentForCancelled,
+            "payment_for_draft" => Self::PaymentForDraft,
+            "payment_for_deleted" => Self::PaymentForDeleted,
+            "payment_after_printing" => Self::PaymentAfterPrinting,
+            "abandoned_checkout" => Self::AbandonedCheckout,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for NeedsAttentionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One dead-end event, persisted when a settled payment could not attach to a
+/// prefix. Backs the admin "needs attention" list so the list is a query, not
+/// a log scrape.
+///
+/// Unlike the `prefixes` row this deliberately survives a prefix deletion: a
+/// payment for a deleted prefix is one of the cases it has to catch, and its
+/// `prefix` column may name a row that no longer exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentAnomaly {
+    pub id: i64,
+    /// The prefix the payment was for. May no longer exist in `prefixes`
+    /// (deleted) — the row is retained so the money is not lost.
+    pub prefix: Uuid,
+    pub kind: NeedsAttentionKind,
+    pub message: String,
+    /// Imperative: what to do about it (e.g. `refund_or_honour`).
+    pub action: String,
+    /// The Stripe Checkout session the payment came in on, when known.
+    pub session_id: Option<String>,
+    pub amount_cents: Option<i64>,
+    pub currency: Option<String>,
+    pub created_at: String,
+}
+
+/// One row in the admin "needs attention" list: a prefix where money and the
+/// order disagree, and what to do about it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NeedsAttentionItem {
+    pub prefix: Uuid,
+    pub kind: NeedsAttentionKind,
+    pub action: String,
+    pub message: String,
+    /// When this was recorded (anomaly) or when the prefix's status last
+    /// changed (abandoned checkout). ISO-ish `YYYY-MM-DD HH:MM:SS`; callers
+    /// order by it, so it only has to sort lexicographically.
+    pub at: String,
+    pub session_id: Option<String>,
+    pub amount_cents: Option<i64>,
+    pub currency: Option<String>,
+}
