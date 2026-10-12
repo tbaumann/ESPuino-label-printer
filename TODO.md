@@ -136,8 +136,11 @@ unpaid. Without this, the first declined card becomes a support ticket.
       order unrecorded — the `paid` transition is the part that matters. Send
       after the status write and outside its error path.
 - **Checkout is unthrottled.** Anyone holding a prefix uuid can create checkout
-  sessions in a loop. Harmless to us, mildly annoying to Stripe. The same
-  rate-limiting work as the admin path would cover it.
+  sessions in a loop. Harmless to us, mildly annoying to Stripe. **Done:**
+  `create_checkout` is now throttled to a few sessions per prefix per minute
+  (`server/src/rate_limit.rs`, a keyed in-memory fixed-window limiter, 429 on
+  excess). The `create_prefix` loop-around (spin up a fresh prefix per checkout)
+  is out of scope — the task's threat model was a loop on one prefix.
 - **No VAT handling.** Prices are configured VAT-inclusive and nothing computes
   tax. Fine while the Kleinunternehmer thresholds apply; Stripe Tax (0.45 EUR per
   transaction on the API integration) is the drop-in if that changes.

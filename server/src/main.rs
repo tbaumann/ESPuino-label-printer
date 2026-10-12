@@ -2,12 +2,14 @@ mod auth;
 mod db;
 mod error;
 mod models;
+mod rate_limit;
 mod routes;
 mod stripe;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use sqlx::SqlitePool;
@@ -16,6 +18,12 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+/// How many checkout sessions one prefix may open per window. A customer
+/// re-opening after a card decline or an abandoned page is a handful, never
+/// dozens — anything above this in a minute is a loop.
+const CHECKOUT_LIMIT_PER_PREFIX: u32 = 5;
+const CHECKOUT_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,6 +38,9 @@ pub struct AppState {
     pub cookie_secure: Option<bool>,
     /// Payment integration. `None` disables checkout and the webhook (503).
     pub stripe: Option<Arc<stripe::Stripe>>,
+    /// Throttles checkout-session creation, keyed by prefix. Persisted per
+    /// deployment, not part of the admin/session machinery.
+    pub checkout_limiter: rate_limit::RateLimiter,
 }
 
 /// Declares the bearer scheme so Swagger UI offers an Authorize button and
@@ -178,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
             sessions: auth::Sessions::new(pool),
             cookie_secure,
             stripe,
+            checkout_limiter: rate_limit::RateLimiter::new(CHECKOUT_LIMIT_PER_PREFIX, CHECKOUT_WINDOW),
         };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be

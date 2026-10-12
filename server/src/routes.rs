@@ -640,10 +640,17 @@ pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
 /// order real, so a `draft` goes straight to `payment_pending` here. Nothing here
 /// marks the prefix paid — that happens when Stripe confirms the money, via the
 /// webhook.
+///
+/// Rate-limited per prefix: opening a Checkout session costs a Stripe round
+/// trip, so a loop on one prefix is throttled to a handful per minute. A brand
+/// new prefix can still be paid for whenever, so a customer's own re-opens are
+/// never in the way — this bounds the Stripe traffic from a hammering caller,
+/// which is all it is for.
 #[utoipa::path(post, path = "/api/prefixes/{prefix}/checkout", tag = "shop",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 200, body = stripe::CheckoutSession),
+        (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
         (status = 409, description = "the prefix has no cards, or is already past payment", body = crate::error::ErrorBody),
         (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
@@ -655,6 +662,17 @@ pub async fn create_checkout(
     Path(prefix): Path<String>,
 ) -> Result<Json<stripe::CheckoutSession>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
+
+    // Throttle before doing any work: created sessions cost a Stripe round
+    // trip, and each one also flips the prefix out of draft, so re-opening
+    // beyond the limit is either a loop or a broken customer flow — both should
+    // slow down.
+    if !st.checkout_limiter.allow(&prefix.to_string()) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many checkout sessions for prefix {prefix}; try again in a minute"
+        )));
+    }
+
     let stripe = st.stripe.as_deref().ok_or_else(|| {
         ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
     })?;
@@ -912,4 +930,70 @@ pub fn router(state: AppState) -> Router {
         // only, so the SPA and Swagger UI are untouched.
         .layer(axum::middleware::from_fn(auth::csrf_guard))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rate_limit;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::extract::{Path, State};
+    use axum::http::HeaderMap;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
+
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
+
+    fn state_with(limiter: rate_limit::RateLimiter, pool: SqlitePool) -> AppState {
+        AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(PathBuf::new()),
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            checkout_limiter: limiter,
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_is_throttled_per_prefix() {
+        let pool = test_pool().await;
+        // Limit 1 per window: the first call is admitted and proceeds to the
+        // (off) shop check — 503 — and the second is throttled with 429 before
+        // it touches the database or Stripe.
+        let st = state_with(
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60)),
+            pool,
+        );
+        let p = Uuid::new_v4().to_string();
+
+        let first = create_checkout(State(st.clone()), HeaderMap::new(), Path(p.clone())).await;
+        assert!(
+            matches!(first, Err(ApiError::Unavailable(_))),
+            "first use should pass the limiter and hit the not-configured shop, got {first:?}"
+        );
+
+        let second = create_checkout(State(st), HeaderMap::new(), Path(p)).await;
+        assert!(
+            matches!(second, Err(ApiError::TooManyRequests(_))),
+            "second use inside the window should be throttled, got {second:?}"
+        );
+    }
 }
