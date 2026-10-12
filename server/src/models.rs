@@ -155,6 +155,12 @@ pub struct Prefix {
     /// The ribbon-pass scheme this order is printed with; governs what a card
     /// may carry on its back. Defaults to `color_front_black_back`.
     pub print_mode: PrintMode,
+    /// The mode that was actually charged, snapshotted when the checkout
+    /// session was created. The spooler prints this, not `print_mode`, so an
+    /// operator changing the mode after payment cannot change what gets
+    /// printed. `None` for prefixes never priced through checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_print_mode: Option<PrintMode>,
     /// External shop/order reference, typically set when the order is paid.
     pub order_ref: Option<String>,
     /// Number of cards currently stored under this prefix.
@@ -209,6 +215,10 @@ pub struct PrintQueueCard {
 pub struct PrintQueue {
     pub prefix: Uuid,
     pub status: PrefixStatus,
+    /// The mode the spooler must print with: the one that was paid for
+    /// (`paid_print_mode`), falling back to the prefix's current mode for
+    /// prefixes never priced through checkout.
+    pub print_mode: PrintMode,
     pub cards: Vec<PrintQueueCard>,
     pub unprinted_count: i64,
     pub resume: bool,
@@ -284,6 +294,14 @@ pub struct AdminSession {
     pub authenticated: bool,
 }
 
+/// One print mode's price, as the shop config serves it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModePrice {
+    pub print_mode: PrintMode,
+    /// Price of one card in this mode, in the currency's minor unit (cents).
+    pub price_cents: i64,
+}
+
 /// Public shop configuration, so the customer UI can show a price and a Pay
 /// button — or hide both — without the browser knowing anything secret.
 ///
@@ -294,8 +312,8 @@ pub struct ShopConfig {
     pub enabled: bool,
     /// ISO 4217 code, lower case as Stripe wants it.
     pub currency: String,
-    /// Price of one card, in the currency's minor unit (cents).
-    pub per_card_cents: i64,
+    /// Price of one card per print mode, in the currency's minor unit (cents).
+    pub prices: Vec<ModePrice>,
     /// Flat shipping charge in cents; 0 means shipping is free and no shipping
     /// line is added to the checkout.
     pub shipping_cents: i64,

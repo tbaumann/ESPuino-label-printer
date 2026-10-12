@@ -774,12 +774,13 @@ fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
 /// The customer UI needs this to show a total before sending anyone to Stripe.
 #[utoipa::path(get, path = "/api/shop/config", tag = "shop",
     responses((status = 200, body = ShopConfig)))]
-pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
+pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>, ApiError> {
+    let prices = db::list_mode_prices(&st.pool).await?;
     let body = match st.stripe.as_deref() {
         None => ShopConfig {
             enabled: false,
             currency: "eur".into(),
-            per_card_cents: 0,
+            prices,
             shipping_cents: 0,
             countries: vec![],
         },
@@ -788,13 +789,13 @@ pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
             ShopConfig {
                 enabled: true,
                 currency: p.currency.clone(),
-                per_card_cents: p.per_card_cents,
+                prices,
                 shipping_cents: p.shipping_cents,
                 countries: p.countries.clone(),
             }
         }
     };
-    Json(body)
+    Ok(Json(body))
 }
 
 /// Start a Stripe Checkout session for a prefix and return where to send the
@@ -839,6 +840,11 @@ pub async fn create_checkout(
         )));
     }
 
+    // The price is the mode's, looked up from the database — not a single
+    // environment-wide per-card figure. A mode with no configured price is a
+    // misconfiguration and refuses the checkout rather than pricing at zero.
+    let price_cents = db::mode_price(&st.pool, p.print_mode).await?;
+
     // Flip to payment_pending BEFORE opening the session, and note the order: a
     // customer can pay the moment they land on Stripe's page, and the webhook
     // deliberately refuses to force a payment through for a prefix that still
@@ -849,9 +855,15 @@ pub async fn create_checkout(
         db::set_status(&st.pool, prefix, PrefixStatus::PaymentPending, None, false).await?;
     }
 
+    // Freeze the mode this order is being charged for, so the spooler prints
+    // what the customer paid for even if the operator changes the mode later.
+    // Done alongside the status flip, before the session opens, so the frozen
+    // mode always matches the price locked into the session.
+    db::set_paid_print_mode(&st.pool, prefix, p.print_mode).await?;
+
     let base = public_base_url(&st, &headers);
     let session = match stripe
-        .create_checkout_session(prefix, p.card_count, &base)
+        .create_checkout_session(prefix, p.card_count, price_cents, &base)
         .await
     {
         Ok(s) => s,
