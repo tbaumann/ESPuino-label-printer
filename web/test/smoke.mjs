@@ -410,5 +410,109 @@ console.log('\nG. pay button')
   }
 }
 
+// ---- scenario H: ribbon availability --------------------------------------
+// One stock flag (YMCKO) covers three-of-four modes: single-sided and
+// double-sided colour share the ribbon, so they go out together, and the
+// black-back mode is independent. The unavailable options must stay *visible*
+// and be disabled — never dropped from the chooser.
+console.log('\nH. ribbon availability: disabled, not absent')
+{
+  cookieJar = ''
+
+  /** Flip a ribbon's stock flag through the real admin API. */
+  const setRibbon = async (ribbon, in_stock) => {
+    const res = await realFetch(`${BASE}/api/shop/ribbons/${ribbon}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ in_stock }),
+    })
+    return res.status
+  }
+  check('operator can clear a ribbon flag', (await setRibbon('ymcko', false)) === 200)
+
+  const config = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
+  const availability = Object.fromEntries(config.prices.map((p) => [p.print_mode, p.available]))
+  check('both colour modes go out of stock together',
+    availability.single_sided === false && availability.double_sided_color === false,
+    JSON.stringify(availability))
+  check('the black-back mode is untouched',
+    availability.color_front_black_back === true, JSON.stringify(availability))
+  check('both stock flags are served', config.ribbons?.length === 2,
+    JSON.stringify(config.ribbons))
+
+  // A project on the out-of-stock ribbon: single-sided is YMCKO. It needs a
+  // card, or the checkout would refuse it for having nothing to print and the
+  // 409 below would prove the wrong thing.
+  const prefix = (
+    await api('/api/prefixes', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ print_mode: 'single_sided' }),
+    })
+  ).uuid
+
+  const fd = new NodeFormData()
+  fd.append('name', 'Ribbon Card')
+  fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'ribbon.png')
+  await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+
+  const w = await mount(`/p/${prefix}`, { bust: 'h1' })
+  await settle(1200)
+  const options = [...w.document.querySelectorAll('.mode')]
+  const byMode = (mode) =>
+    options.find((el) => el.querySelector(`input[value="${mode}"]`))
+
+  check('every mode is still offered, none removed', options.length === 3,
+    String(options.length))
+  check('an out-of-stock mode is rendered disabled',
+    byMode('single_sided')?.querySelector('input')?.disabled === true)
+  check('its ribbon-mate is disabled too',
+    byMode('double_sided_color')?.querySelector('input')?.disabled === true)
+  check('the in-stock mode is selectable',
+    byMode('color_front_black_back')?.querySelector('input')?.disabled === false)
+  check('the disabled option says it is out of stock',
+    /out of stock/i.test(byMode('single_sided')?.textContent ?? ''))
+  check('the unavailable option is marked, not hidden',
+    byMode('single_sided')?.classList.contains('unavailable') === true)
+
+  // Paying for a mode that cannot be printed is refused on both layers: the
+  // button here, and a 409 from the server. Both need payment configured — an
+  // unconfigured deployment answers 503 before it ever looks at the ribbon.
+  if (!config.enabled) {
+    console.log('  skip pay refusal: no payment configured (STRIPE_SECRET_KEY unset)')
+  } else {
+    const payButton = [...w.document.querySelectorAll('button')].find((b) =>
+      /Pay now/.test(b.textContent),
+    )
+    check('the Pay button is disabled while the chosen ribbon is out',
+      payButton?.disabled === true)
+    const refused = await realFetch(`${BASE}/api/prefixes/${prefix}/checkout`, {
+      method: 'POST',
+    })
+    check('the server refuses the checkout with 409', refused.status === 409,
+      String(refused.status))
+  }
+
+  // Switching to an available mode goes through the real PATCH route.
+  const pick = byMode('color_front_black_back').querySelector('input')
+  pick.checked = true
+  pick.dispatchEvent(new w.Event('change', { bubbles: true }))
+  await settle(900)
+  check('choosing another mode PATCHes the prefix',
+    seen.some((r) => r.method === 'PATCH' && r.url.includes(`/api/prefixes/${prefix}`)),
+    JSON.stringify(seen.slice(-3)))
+  const after = await api(`/api/prefixes/${prefix}`)
+  check('the mode change took effect', after.print_mode === 'color_front_black_back',
+    after.print_mode)
+
+  // Restock: the options come back with no state to reset.
+  check('operator can restock', (await setRibbon('ymcko', true)) === 200)
+  const w2 = await mount(`/p/${prefix}`, { bust: 'h2' })
+  await settle(1200)
+  const after2 = [...w2.document.querySelectorAll('.mode input')]
+  check('every mode is selectable again', after2.every((i) => !i.disabled),
+    after2.map((i) => i.disabled).join(','))
+}
+
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
