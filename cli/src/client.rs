@@ -91,8 +91,12 @@ impl Client {
             Some(u) => serde_json::json!({ "uuid": u }),
             None => serde_json::json!({}),
         };
-        self.send(self.http.post(format!("{}/api/prefixes", self.base)).json(&body))
-            .await
+        self.send(
+            self.http
+                .post(format!("{}/api/prefixes", self.base))
+                .json(&body),
+        )
+        .await
     }
 
     pub async fn list_prefixes(&self) -> Result<Value> {
@@ -101,8 +105,11 @@ impl Client {
     }
 
     pub async fn get_prefix(&self, prefix: &str) -> Result<Value> {
-        self.send(self.http.get(format!("{}/api/prefixes/{prefix}", self.base)))
-            .await
+        self.send(
+            self.http
+                .get(format!("{}/api/prefixes/{prefix}", self.base)),
+        )
+        .await
     }
 
     pub async fn list_cards(&self, prefix: &str) -> Result<Value> {

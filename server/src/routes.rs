@@ -13,7 +13,7 @@ use crate::db;
 use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus,
-    ShopConfig, StatusInput,
+    PrintQueue, ShopConfig, StatusInput,
 };
 use crate::stripe;
 use crate::AppState;
@@ -29,6 +29,24 @@ fn extension_for(content_type: &str) -> &'static str {
         "image/webp" => "webp",
         "image/gif" => "gif",
         _ => "bin",
+    }
+}
+
+/// The content type we serve for a stored blob, derived from its extension.
+///
+/// The stored `image_content_type` is attacker-chosen (it comes straight from
+/// the multipart upload), so it must never be echoed back verbatim — that is
+/// how a `text/html` upload becomes a served `text/html` page. We only ever
+/// serve one of the accepted image types, or `application/octet-stream` for
+/// anything unrecognised, so a browser can never be tricked into rendering the
+/// bytes as HTML.
+fn content_type_for(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
     }
 }
 
@@ -99,12 +117,7 @@ async fn store_card_form(
         return Err(ApiError::BadRequest("image is empty".into()));
     }
 
-    let rel = format!(
-        "blobs/{}/{}.{}",
-        prefix,
-        id,
-        extension_for(&ct)
-    );
+    let rel = format!("blobs/{}/{}.{}", prefix, id, extension_for(&ct));
     let abs = data_dir.join(&rel);
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent)?;
@@ -163,7 +176,7 @@ pub async fn list_prefixes(
     headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Vec<Prefix>>, ApiError> {
-    auth::resolve(&st, &headers).require_admin()?;
+    auth::resolve(&st, &headers).await.require_admin()?;
     let status = match q.status.as_deref() {
         None => None,
         Some(s) => Some(
@@ -214,10 +227,9 @@ pub async fn put_card(
     mp: Multipart,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    let (name, serial, back, rel, ct) =
-        store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -246,11 +258,10 @@ pub async fn post_card(
     mp: Multipart,
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let id = db::next_card_id(&st.pool, prefix).await?;
-    let (name, serial, back, rel, ct) =
-        store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -287,15 +298,18 @@ pub async fn get_card_image(
 ) -> Result<Response, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let card = db::get_card(&st.pool, prefix, id).await?;
-    let rel = format!(
-        "blobs/{}/{}.{}",
-        prefix,
-        id,
-        extension_for(&card.image_content_type)
-    );
+    let ext = extension_for(&card.image_content_type);
+    let rel = format!("blobs/{}/{}.{}", prefix, id, ext);
     let bytes = std::fs::read(st.data_dir.join(&rel))
         .map_err(|_| ApiError::NotFound(format!("image for card {id}")))?;
-    Ok(([(header::CONTENT_TYPE, card.image_content_type)], bytes).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type_for(ext)),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Delete a card (metadata + image).
@@ -308,7 +322,7 @@ pub async fn delete_card(
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     db::delete_card(&st.pool, prefix, id).await?;
@@ -339,12 +353,11 @@ pub async fn delete_prefix(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     let p = db::get_prefix(&st.pool, prefix).await?;
-    if !caller.is_admin() && !p.status.is_writable() {
+    if !caller.is_admin() && !p.status.is_customer_writable() {
         return Err(ApiError::Conflict(format!(
-            "prefix {prefix} is '{}' and cannot be deleted; only draft, payment_pending, \
-             paid or queued prefixes can be",
+            "prefix {prefix} is '{}' and cannot be deleted; only a draft prefix can be",
             p.status
         )));
     }
@@ -367,7 +380,7 @@ pub async fn delete_cards(
     Path(prefix): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     db::delete_all_cards(&st.pool, prefix).await?;
     let _ = std::fs::remove_dir_all(st.data_dir.join("blobs").join(prefix.to_string()));
@@ -391,9 +404,60 @@ pub async fn patch_card(
     Json(patch): Json<CardPatch>,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    Ok(Json(db::update_card_meta(&st.pool, prefix, id, &patch).await?))
+    Ok(Json(
+        db::update_card_meta(&st.pool, prefix, id, &patch).await?,
+    ))
+}
+
+/// The print queue for one prefix: its cards ordered by id, with the operator's
+/// per-card print state. **Admin only** — this is operator state, kept out of
+/// the customer view and the admin print preview.
+///
+/// `resume` is true when the prefix is `printing` and still has unprinted
+/// cards, i.e. a half-finished order the spooler can pick up where it left off.
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/print-queue", tag = "cards",
+        params(("prefix" = Uuid, Path, description = "prefix uuid")),
+        security(("bearerAuth" = []), ("sessionCookie" = [])),
+        responses(
+            (status = 200, body = PrintQueue),
+            (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+            (status = 404, body = crate::error::ErrorBody),
+            (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        ))]
+pub async fn get_print_queue(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+) -> Result<Json<PrintQueue>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers).await;
+    caller.require_admin()?;
+    Ok(Json(db::print_queue(&st.pool, prefix).await?))
+}
+
+/// Mark one card printed. **Admin only.** The spooler calls this once the
+/// printer confirms the card was ejected; it is idempotent, so a retried
+/// delivery can never print a card twice.
+#[utoipa::path(post, path = "/api/prefixes/{prefix}/cards/{id}/printed", tag = "cards",
+        params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+        security(("bearerAuth" = []), ("sessionCookie" = [])),
+        responses(
+            (status = 200, body = Card),
+            (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+            (status = 404, body = crate::error::ErrorBody),
+            (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        ))]
+pub async fn mark_card_printed(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Json<Card>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers).await;
+    caller.require_admin()?;
+    Ok(Json(db::mark_card_printed(&st.pool, prefix, id).await?))
 }
 
 /// Set a prefix's status. **Admin only.**
@@ -418,7 +482,7 @@ pub async fn patch_status(
     Json(input): Json<StatusInput>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
+    let caller = auth::resolve(&st, &headers).await;
     caller.require_admin()?;
     Ok(Json(
         db::set_status(
@@ -468,7 +532,7 @@ pub async fn admin_login(
     Json(input): Json<AdminLogin>,
 ) -> Result<Response, ApiError> {
     auth::verify_token(&st, &input.token)?;
-    let id = st.sessions.create();
+    let id = st.sessions.create().await;
     let secure = cookie_secure(&st, &headers);
     let cookie = format!(
         "{name}={id}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={ttl}{secure}",
@@ -484,7 +548,7 @@ pub async fn admin_login(
     responses((status = 204, description = "logged out")))]
 pub async fn admin_logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(id) = auth::cookie_value(&headers, auth::SESSION_COOKIE) {
-        st.sessions.revoke(&id);
+        st.sessions.revoke(&id).await;
     }
     let expired = format!(
         "{name}=; Path=/api; HttpOnly; SameSite=Strict; Max-Age=0",
@@ -506,8 +570,10 @@ pub async fn admin_session(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<AdminSession>, ApiError> {
-    auth::resolve(&st, &headers).require_admin()?;
-    Ok(Json(AdminSession { authenticated: true }))
+    auth::resolve(&st, &headers).await.require_admin()?;
+    Ok(Json(AdminSession {
+        authenticated: true,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +849,10 @@ pub async fn submit_prefix_gone() -> Response {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/prefixes", axum::routing::get(list_prefixes).post(create_prefix))
+        .route(
+            "/api/prefixes",
+            axum::routing::get(list_prefixes).post(create_prefix),
+        )
         .route(
             "/api/prefixes/:prefix",
             axum::routing::get(get_prefix).delete(delete_prefix),
@@ -816,6 +885,14 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(get_card_image),
         )
         .route(
+            "/api/prefixes/:prefix/cards/:id/printed",
+            axum::routing::post(mark_card_printed),
+        )
+        .route(
+            "/api/prefixes/:prefix/print-queue",
+            axum::routing::get(get_print_queue),
+        )
+        .route(
             "/api/admin/session",
             axum::routing::post(admin_login)
                 .get(admin_session)
@@ -829,10 +906,7 @@ pub fn router(state: AppState) -> Router {
         // Stripe's callback. Behind the CSRF layer like everything else, which
         // is harmless: that guard only speaks up when the session cookie is
         // present, and Stripe sends no cookie.
-        .route(
-            "/api/webhooks/stripe",
-            axum::routing::post(stripe_webhook),
-        )
+        .route("/api/webhooks/stripe", axum::routing::post(stripe_webhook))
         // Second CSRF lock, on top of SameSite=Strict: a cookie-authenticated
         // mutation must also carry the custom header. Applied to the API router
         // only, so the SPA and Swagger UI are untouched.

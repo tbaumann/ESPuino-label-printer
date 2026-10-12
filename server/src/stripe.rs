@@ -255,7 +255,10 @@ impl Stripe {
             form.push(("payment_method_configuration".into(), pmc.clone()));
         }
         for (i, method) in self.excluded_payment_methods.iter().enumerate() {
-            form.push((format!("excluded_payment_method_types[{i}]"), method.clone()));
+            form.push((
+                format!("excluded_payment_method_types[{i}]"),
+                method.clone(),
+            ));
         }
 
         form.push(("line_items[0][quantity]".into(), card_count.to_string()));
@@ -303,7 +306,10 @@ impl Stripe {
             .http
             .post(&url)
             .bearer_auth(&*self.secret_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
             .body(encode_form(&form))
             .send()
             .await
@@ -319,7 +325,10 @@ impl Stripe {
         }
 
         serde_json::from_str(&body).map_err(|e| {
-            ApiError::Upstream(format!("unexpected Stripe response: {e}: {}", truncate(&body, 300)))
+            ApiError::Upstream(format!(
+                "unexpected Stripe response: {e}: {}",
+                truncate(&body, 300)
+            ))
         })
     }
 
@@ -663,7 +672,10 @@ mod tests {
                 "line_items[0][price_data][currency]".to_string(),
                 "eur".to_string(),
             ),
-            ("success_url".to_string(), "https://h/p/abc?paid=1".to_string()),
+            (
+                "success_url".to_string(),
+                "https://h/p/abc?paid=1".to_string(),
+            ),
         ];
         let encoded = encode_form(&pairs);
         assert_eq!(

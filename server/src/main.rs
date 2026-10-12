@@ -23,7 +23,7 @@ pub struct AppState {
     pub data_dir: Arc<PathBuf>,
     /// Bearer token granting operator rights. `None` disables the admin API.
     pub admin_token: Option<Arc<str>>,
-    /// Live admin UI logins (the session cookie).
+    /// Live admin UI logins (the session cookie), persisted in the database.
     pub sessions: auth::Sessions,
     /// Force `Secure` on the session cookie. `None` = infer per request from
     /// `X-Forwarded-Proto`, which is what you want behind a TLS proxy.
@@ -90,9 +90,11 @@ impl utoipa::Modify for SecurityAddon {
         routes::post_card,
         routes::get_card,
         routes::get_card_image,
-        routes::patch_card,
-        routes::delete_card,
-        routes::admin_login,
+                routes::patch_card,
+                routes::delete_card,
+                routes::get_print_queue,
+                routes::mark_card_printed,
+                routes::admin_login,
         routes::admin_session,
         routes::admin_logout,
         routes::shop_config,
@@ -105,10 +107,12 @@ impl utoipa::Modify for SecurityAddon {
         models::PrefixStatus,
         models::StatusInput,
         models::Card,
-        models::CardIndex,
-        models::CardInput,
-        models::CardPatch,
-        models::AdminLogin,
+                models::CardIndex,
+                models::CardInput,
+                models::CardPatch,
+                models::PrintQueue,
+                models::PrintQueueCard,
+                models::AdminLogin,
         models::AdminSession,
         models::ShopConfig,
         stripe::CheckoutSession,
@@ -151,13 +155,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Force the session cookie's Secure flag, or leave it to be inferred from
     // X-Forwarded-Proto per request. Unrecognised values are ignored.
-    let cookie_secure = std::env::var("SESSION_COOKIE_SECURE")
-        .ok()
-        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+    let cookie_secure = std::env::var("SESSION_COOKIE_SECURE").ok().and_then(|v| {
+        match v.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" => Some(true),
             "0" | "false" | "no" => Some(false),
             _ => None,
-        });
+        }
+    });
 
     // Payment. Unset or blank STRIPE_SECRET_KEY switches checkout and the
     // webhook off — they answer 503 — rather than leaving a half-configured
@@ -168,19 +172,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState {
-        pool,
-        data_dir: Arc::new(data_dir),
-        admin_token,
-        sessions: auth::Sessions::new(),
-        cookie_secure,
-        stripe,
-    };
+            pool: pool.clone(),
+            data_dir: Arc::new(data_dir),
+            admin_token,
+            sessions: auth::Sessions::new(pool),
+            cookie_secure,
+            stripe,
+        };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be
     // rebuilt without recompiling the server. Unknown paths fall back to
     // index.html for client-side routing.
-    let static_dir =
-        std::env::var("STATIC_DIR").unwrap_or_else(|_| "server/static".to_string());
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "server/static".to_string());
     let index_html = PathBuf::from(&static_dir).join("index.html");
     if !index_html.exists() {
         tracing::warn!(

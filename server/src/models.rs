@@ -50,13 +50,22 @@ impl PrefixStatus {
         })
     }
 
-    /// Cards may still be added/changed while the prefix is in these states.
-    /// Once printing starts, the prefix is frozen.
+    /// The operator may still add/change cards while the prefix is in these
+    /// states. Once printing starts, even the operator's writes are frozen.
     pub fn is_writable(self) -> bool {
         matches!(
             self,
             Self::Draft | Self::PaymentPending | Self::Paid | Self::Queued
         )
+    }
+
+    /// The *customer* may only write while the prefix is a draft. The moment
+    /// they click Pay the project is sealed for them — from `payment_pending`
+    /// onward they get the read-only view, and only the operator can still
+    /// change cards. Deliberately narrower than [`Self::is_writable`], which
+    /// is the operator's rule.
+    pub fn is_customer_writable(self) -> bool {
+        matches!(self, Self::Draft)
     }
 
     /// Allowed transitions.
@@ -93,6 +102,12 @@ pub struct Prefix {
     pub order_ref: Option<String>,
     /// Number of cards currently stored under this prefix.
     pub card_count: i64,
+    /// Number of cards not yet printed. Operator-only state for the print
+    /// spooler: `None` in the public view (omitted from the JSON), `Some(n)`
+    /// in the admin list, so the print queue UI can say whether a `printing`
+    /// prefix is a resume (still has unprinted cards).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unprinted_count: Option<i64>,
 }
 
 /// One printable card. `id` is an index within its prefix, not global.
@@ -106,6 +121,35 @@ pub struct Card {
     pub image_content_type: String,
     pub created_at: String,
     pub updated_at: String,
+    /// When the printer confirmed this card was ejected. Operator-only state
+    /// for the print spooler; deliberately not serialized into the public Card
+    /// JSON, so neither the customer view nor the admin print preview sees it.
+    #[serde(skip)]
+    pub printed_at: Option<String>,
+}
+
+/// One card as the print spooler sees it: the operator-only `printed_at` is
+/// included here, unlike in the public `Card`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrintQueueCard {
+    pub id: i64,
+    pub name: String,
+    pub printed_at: Option<String>,
+}
+
+/// The print queue for one prefix: its cards ordered explicitly by id, with
+/// the operator's per-card print state.
+///
+/// `resume` is true when the prefix is `printing` and still has unprinted
+/// cards — i.e. a half-finished order that a spooler can pick up where it left
+/// off after a fault, without reprinting the cards already marked.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrintQueue {
+    pub prefix: Uuid,
+    pub status: PrefixStatus,
+    pub cards: Vec<PrintQueueCard>,
+    pub unprinted_count: i64,
+    pub resume: bool,
 }
 
 /// Index of all cards under a prefix.

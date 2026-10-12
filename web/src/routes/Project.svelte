@@ -23,7 +23,11 @@
   let paying = $state(false)
   let awaitingPayment = $state(false)
 
-  const WRITABLE: string[] = ['draft', 'payment_pending', 'paid', 'queued']
+  // The customer may only write while the prefix is a draft; the moment
+  // they click Pay the project is sealed for them. This deliberately matches
+  // the server's `is_customer_writable()` (draft only), not the operator's
+  // `is_writable()`.
+  const WRITABLE: string[] = ['draft']
   const writable = $derived(prefix ? WRITABLE.includes(prefix.status) : false)
 
   // Amounts pre-rendered, so the template never re-derives a price and `shop`

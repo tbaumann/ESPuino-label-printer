@@ -192,7 +192,17 @@ console.log('\nB. project page renders a card')
   check('set status without a token -> 401',
     (await setStatus(prefix, 'payment_pending', { token: '' })) === 401)
 
-  for (const s of ['payment_pending', 'paid', 'queued', 'printing']) {
+  // The customer's write window closes the moment the prefix leaves draft:
+  // payment_pending is already read-only for them (only the operator can still
+  // edit). This is the seal-on-pay behaviour, asserted here so it cannot drift.
+  check('operator sets status -> payment_pending', (await setStatus(prefix, 'payment_pending')) === 200)
+  const wSealed = await mount(`/p/${prefix}`, { bust: 'c1' })
+  const textSealed = wSealed.document.body.textContent ?? ''
+  check('sealed at payment_pending: no upload dropzone', !wSealed.document.querySelector('.dropzone'))
+  check('sealed at payment_pending: says it can no longer be changed', /can no longer be changed/.test(textSealed))
+  check('sealed at payment_pending: name input disabled', wSealed.document.querySelector('input#name-1')?.disabled === true)
+
+  for (const s of ['paid', 'queued', 'printing']) {
     check(`operator sets status -> ${s}`, (await setStatus(prefix, s)) === 200)
   }
   const w2 = await mount(`/p/${prefix}`, { bust: 'c' })

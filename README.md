@@ -310,9 +310,12 @@ draft ──Pay──▶ payment_pending ──paid──▶ paid ──▶ queu
   `POST .../submit` no longer exists — it answers `410`.
 - A `payment_pending` prefix can be paid for again: a closed window or a declined
   card is not a dead end, and nothing has to be reset by hand.
-- Cards are editable while the prefix is `draft`, `payment_pending`, `paid` or
-  `queued`. Once it reaches `printing` the prefix is **frozen** and card writes
-  (PUT/POST/DELETE) return `409`. Reads always work.
+- A customer may edit cards only while the prefix is `draft`; the moment they
+  click Pay the project is sealed for them, and from `payment_pending` onward
+  they get the read-only view. The operator may still edit while the prefix is
+  `draft`, `payment_pending`, `paid` or `queued`; once it reaches `printing`
+  even the operator's card writes (PUT/POST/DELETE) return `409`. Reads always
+  work.
 - `GET /api/prefixes?status=paid` is the print queue's work list.
 - Transitions are validated; an invalid one returns `409`. Re-applying the
   current status is a no-op, so shop/queue callbacks can safely retry.
@@ -325,8 +328,9 @@ There are no accounts. Two kinds of caller:
 
 - **Customer** — anyone holding a prefix uuid. That uuid *is* the credential,
   and it cannot be discovered: listing is admin-only, so there is no
-  enumeration route. A customer can read and modify their own prefix and its
-  cards, pay for it, and delete it while it is still writable.
+  enumeration route. A customer can read their own prefix and its cards, edit
+  them and delete the prefix while it is still a `draft`, and pay for it. Once
+  it leaves `draft` the project is sealed for them.
 - **Operator** — either sends `Authorization: Bearer $ADMIN_TOKEN` (the CLI), or
   logs in through the admin UI, which trades the token for a session cookie.
   Can list every prefix, set any status at any time, delete a prefix in any
@@ -342,10 +346,12 @@ There are no accounts. Two kinds of caller:
 | set status (`PATCH .../status`)            | ✗             | ✓ (any transition) |
 | delete a prefix                            | ✓ if writable | ✓ always |
 
-"Writable" means `draft`, `payment_pending`, `paid` or `queued`. From `printing`
-onwards a prefix is frozen for customers; the operator can still work on it,
-which is what makes a stuck print job recoverable — a customer has no legal
-edge out of `printing`, and the operator can set any status regardless.
+For a **customer**, "writable" means `draft` only: the moment they click Pay
+the project is sealed for them, and from `payment_pending` onward they get the
+read-only view. For the **operator**, "writable" means `draft`, `payment_pending`,
+`paid` or `queued`; from `printing` onward even the operator's card writes are
+frozen, though they can still set any status — which is what makes a stuck
+print job recoverable, since a customer has no legal edge out of `printing`.
 
 When `ADMIN_TOKEN` is unset the admin API is switched off: admin-only calls
 answer `503` with an explanatory body while everything customer-facing keeps

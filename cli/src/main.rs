@@ -18,7 +18,12 @@ use client::{is_image, Client};
 )]
 struct Cli {
     /// Base URL of the API server.
-    #[arg(long, env = "ESPLP_SERVER", default_value = "http://127.0.0.1:8080", global = true)]
+    #[arg(
+        long,
+        env = "ESPLP_SERVER",
+        default_value = "http://127.0.0.1:8080",
+        global = true
+    )]
     server: String,
 
     /// Operator bearer token. Needed for admin-only commands (`prefix list`);
@@ -134,9 +139,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Prefix { cmd } => match cmd {
-            PrefixCmd::Create { uuid } => {
-                emit(client.create_prefix(uuid.as_deref()).await?, quiet)
-            }
+            PrefixCmd::Create { uuid } => emit(client.create_prefix(uuid.as_deref()).await?, quiet),
             PrefixCmd::List => emit(client.list_prefixes().await?, quiet),
             PrefixCmd::Get { prefix } => emit(client.get_prefix(&prefix).await?, quiet),
         },
@@ -155,9 +158,7 @@ async fn main() -> Result<()> {
             if !a.file.is_file() {
                 bail!("not a file: {}", a.file.display());
             }
-            let name = a
-                .name
-                .unwrap_or_else(|| file_stem(&a.file));
+            let name = a.name.unwrap_or_else(|| file_stem(&a.file));
             let v = client
                 .upload_card(
                     &a.prefix,
@@ -198,7 +199,10 @@ async fn run_batch(client: &Client, a: BatchArgs, quiet: bool) -> Result<()> {
                 "[dry-run] {index}/{total} {} -> id={} name={name:?}{}",
                 path.display(),
                 id.map(|v| v.to_string()).unwrap_or_else(|| "auto".into()),
-                serial.as_deref().map(|s| format!(" serial={s}")).unwrap_or_default(),
+                serial
+                    .as_deref()
+                    .map(|s| format!(" serial={s}"))
+                    .unwrap_or_default(),
             );
             continue;
         }
@@ -217,7 +221,11 @@ async fn run_batch(client: &Client, a: BatchArgs, quiet: bool) -> Result<()> {
             Ok(v) => {
                 ok += 1;
                 if quiet {
-                    println!("ok  {} -> id={}", path.display(), v.get("id").unwrap_or(&Value::Null));
+                    println!(
+                        "ok  {} -> id={}",
+                        path.display(),
+                        v.get("id").unwrap_or(&Value::Null)
+                    );
                 } else {
                     let id = v.get("id").and_then(|x| x.as_i64()).unwrap_or_default();
                     println!("[{index}/{total}] ok   {} -> card id {id}", path.display());
@@ -231,9 +239,15 @@ async fn run_batch(client: &Client, a: BatchArgs, quiet: bool) -> Result<()> {
     }
 
     if a.dry_run {
-        println!("(dry-run) {total} file(s) would be uploaded to {}", a.prefix);
+        println!(
+            "(dry-run) {total} file(s) would be uploaded to {}",
+            a.prefix
+        );
     } else {
-        println!("done: {ok} uploaded, {failed} failed (of {total}) to {}", a.prefix);
+        println!(
+            "done: {ok} uploaded, {failed} failed (of {total}) to {}",
+            a.prefix
+        );
     }
     if failed > 0 {
         bail!("{failed} upload(s) failed");

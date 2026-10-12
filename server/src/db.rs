@@ -5,7 +5,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::models::{Card, CardPatch, Prefix, PrefixStatus};
+use crate::models::{Card, CardPatch, Prefix, PrefixStatus, PrintQueue, PrintQueueCard};
 
 /// Open (creating if needed) the SQLite database and run migrations.
 pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
@@ -37,6 +37,16 @@ const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_cha
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count
  FROM prefixes p";
 
+/// Admin-only variant of `PREFIX_SELECT` that also counts unprinted cards, so
+/// the print queue UI can tell a `printing` prefix that is a resume (still has
+/// unprinted cards) from one that is done.
+const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
+        p.order_ref,
+        (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count,
+        (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid AND c.printed_at IS NULL)
+            AS unprinted_count
+ FROM prefixes p";
+
 fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let status_raw: String = row.get("status");
     let status = PrefixStatus::parse(&status_raw)
@@ -49,7 +59,16 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
         status_changed_at: row.get("status_changed_at"),
         order_ref: row.get("order_ref"),
         card_count: row.get("card_count"),
+        // The public view never carries operator-only print state.
+        unprinted_count: None,
     })
+}
+
+/// Like `prefix_from_row`, but for the admin list: carries `unprinted_count`.
+fn admin_prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
+    let mut p = prefix_from_row(row)?;
+    p.unprinted_count = Some(row.get("unprinted_count"));
+    Ok(p)
 }
 
 pub async fn create_prefix(pool: &SqlitePool, uuid: Option<Uuid>) -> Result<Prefix, ApiError> {
@@ -83,17 +102,18 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
 }
 
 /// List prefixes, optionally filtered by status (e.g. `paid` for the print queue).
+/// Admin-only: carries the operator's `unprinted_count` per prefix.
 pub async fn list_prefixes(
     pool: &SqlitePool,
     status: Option<PrefixStatus>,
 ) -> Result<Vec<Prefix>, ApiError> {
     let rows = sqlx::query(&format!(
-        "{PREFIX_SELECT} WHERE (?1 IS NULL OR p.status = ?1) ORDER BY p.created_at DESC"
+        "{ADMIN_PREFIX_SELECT} WHERE (?1 IS NULL OR p.status = ?1) ORDER BY p.created_at DESC"
     ))
     .bind(status.map(|s| s.as_str().to_string()))
     .fetch_all(pool)
     .await?;
-    rows.iter().map(prefix_from_row).collect()
+    rows.iter().map(admin_prefix_from_row).collect()
 }
 
 /// Move a prefix to a new status. Re-applying the current status is a no-op
@@ -145,15 +165,24 @@ pub async fn set_status(
     get_prefix(pool, uuid).await
 }
 
-/// Reject card mutations on a frozen prefix (printing or later), unless the
-/// caller is the operator.
+/// Reject card mutations on a sealed prefix, unless the caller is the
+/// operator.
+///
+/// A customer may only write while the prefix is a draft; the operator may
+/// write in any state up to and including `queued` (and even while printing,
+/// which is what makes a stuck print job recoverable).
 pub async fn ensure_writable(
     pool: &SqlitePool,
     uuid: Uuid,
     admin: bool,
 ) -> Result<Prefix, ApiError> {
     let prefix = get_prefix(pool, uuid).await?;
-    if !admin && !prefix.status.is_writable() {
+    let writable = if admin {
+        prefix.status.is_writable()
+    } else {
+        prefix.status.is_customer_writable()
+    };
+    if !writable {
         return Err(ApiError::Conflict(format!(
             "prefix {uuid} is '{}' and can no longer be modified",
             prefix.status
@@ -171,6 +200,7 @@ fn card_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Card, ApiError> {
         image_content_type: row.get("image_content_type"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+        printed_at: row.get("printed_at"),
     })
 }
 
@@ -194,12 +224,11 @@ pub async fn get_card(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<Card, 
 
 /// Next free card id within a prefix (1-based).
 pub async fn next_card_id(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiError> {
-    let row = sqlx::query(
-        "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM cards WHERE prefix_uuid = ?1",
-    )
-    .bind(prefix.to_string())
-    .fetch_one(pool)
-    .await?;
+    let row =
+        sqlx::query("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM cards WHERE prefix_uuid = ?1")
+            .bind(prefix.to_string())
+            .fetch_one(pool)
+            .await?;
     Ok(row.get("next_id"))
 }
 
@@ -325,4 +354,59 @@ pub async fn delete_card(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<(),
         return Err(ApiError::NotFound(format!("card {id} in prefix {prefix}")));
     }
     Ok(())
+}
+
+/// Mark a card printed, once. The spooler calls this only after the printer
+/// confirms the card was ejected.
+///
+/// Idempotent on purpose: the `AND printed_at IS NULL` guard means a second
+/// call is a no-op, so a retried delivery can never print a card twice. (The
+/// spooler walks *unprinted* cards, so marking at queue time would silently
+/// skip a card if the process died in between — that is why the mark happens
+/// here, after ejection, and not when the card is queued.)
+pub async fn mark_card_printed(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<Card, ApiError> {
+    get_card(pool, prefix, id).await?; // 404 if the card is unknown
+    sqlx::query(
+        "UPDATE cards SET printed_at = datetime('now')
+          WHERE prefix_uuid = ?1 AND id = ?2 AND printed_at IS NULL",
+    )
+    .bind(prefix.to_string())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_card(pool, prefix, id).await
+}
+
+/// The print queue for one prefix: every card ordered explicitly by `id` (not
+/// the database's natural order), with the operator-only `printed_at`.
+///
+/// The spooler walks this to know where to resume after a fault. `resume` is
+/// true when the prefix is `printing` and still has unprinted cards — a
+/// half-finished order that can be picked up where it left off.
+pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, ApiError> {
+    let p = get_prefix(pool, prefix).await?;
+    let rows = sqlx::query(
+        "SELECT id, name, printed_at FROM cards
+          WHERE prefix_uuid = ?1 ORDER BY id ASC",
+    )
+    .bind(prefix.to_string())
+    .fetch_all(pool)
+    .await?;
+    let cards = rows
+        .iter()
+        .map(|r| PrintQueueCard {
+            id: r.get("id"),
+            name: r.get("name"),
+            printed_at: r.get("printed_at"),
+        })
+        .collect::<Vec<_>>();
+    let unprinted_count = cards.iter().filter(|c| c.printed_at.is_none()).count() as i64;
+    let resume = p.status == PrefixStatus::Printing && unprinted_count > 0;
+    Ok(PrintQueue {
+        prefix,
+        status: p.status,
+        cards,
+        unprinted_count,
+        resume,
+    })
 }

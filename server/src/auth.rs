@@ -19,14 +19,13 @@
 //! them, which keeps "customer may also do this" rules (delete a writable
 //! prefix, write cards while not frozen) in one obvious place per endpoint.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::Response;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -78,58 +77,76 @@ impl Auth {
     }
 }
 
-/// Live admin sessions, keyed by session id.
+/// Persisted admin sessions, keyed by session id.
 ///
-/// Deliberately in-memory: a restart logs the operator out, which is a
-/// reasonable default for a single-operator tool and avoids a table plus a
-/// migration. Sessions are keyed by a random v4 uuid (122 bits), so lookup by
-/// string comparison is not a practical timing oracle.
-#[derive(Clone, Default)]
+/// Stored in the same SQLite database as the rest of the data, so a restart
+/// does not log the operator out — there is no account system to log back in
+/// with, so losing a session would mean re-entering the token by hand.
+/// Expired rows are pruned lazily when a new session is created; a lookup
+/// simply ignores them. Sessions are keyed by a random v4 uuid (122 bits), so
+/// lookup by string comparison is not a practical timing oracle.
+#[derive(Clone)]
 pub struct Sessions {
-    inner: Arc<RwLock<HashMap<String, Instant>>>,
+    pool: SqlitePool,
 }
 
 impl Sessions {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 
-    /// Start a session, pruning expired ones while the write lock is held.
-    pub fn create(&self) -> String {
+    /// Start a session, pruning expired ones while we have the connection.
+    pub async fn create(&self) -> String {
         let id = Uuid::new_v4().simple().to_string();
-        let now = Instant::now();
-        let mut map = self.write();
-        map.retain(|_, expires| *expires > now);
-        map.insert(id.clone(), now + SESSION_TTL);
+        let expires = unix_now() + SESSION_TTL.as_secs() as i64;
+        let _ = sqlx::query("DELETE FROM admin_sessions WHERE expires_at < ?1")
+            .bind(unix_now())
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("INSERT INTO admin_sessions (id, expires_at) VALUES (?1, ?2)")
+            .bind(&id)
+            .bind(expires)
+            .execute(&self.pool)
+            .await;
         id
     }
 
-    pub fn is_valid(&self, id: &str) -> bool {
-        let now = Instant::now();
-        self.read().get(id).is_some_and(|expires| *expires > now)
+    pub async fn is_valid(&self, id: &str) -> bool {
+        matches!(
+            sqlx::query("SELECT 1 FROM admin_sessions WHERE id = ?1 AND expires_at > ?2")
+                .bind(id)
+                .bind(unix_now())
+                .fetch_optional(&self.pool)
+                .await,
+            Ok(Some(_))
+        )
     }
 
     /// Drop one session. Returns whether it existed.
-    pub fn revoke(&self, id: &str) -> bool {
-        self.write().remove(id).is_some()
+    pub async fn revoke(&self, id: &str) -> bool {
+        matches!(
+            sqlx::query("DELETE FROM admin_sessions WHERE id = ?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await,
+            Ok(res) if res.rows_affected() > 0
+        )
     }
+}
 
-    /// A poisoned lock only means some other thread panicked; the map itself is
-    /// still consistent, so recover rather than propagating the panic.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Instant>> {
-        self.inner.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Instant>> {
-        self.inner.write().unwrap_or_else(|e| e.into_inner())
-    }
+/// Current unix time in whole seconds (what `admin_sessions.expires_at` holds).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Resolve the caller from the request headers.
 ///
 /// The bearer token is tried first: it is the CLI's path and cannot be sent by
 /// a browser on its own, so it is never the ambient credential.
-pub fn resolve(state: &AppState, headers: &HeaderMap) -> Auth {
+pub async fn resolve(state: &AppState, headers: &HeaderMap) -> Auth {
     let configured = state.admin_token.is_some();
 
     if let Some(expected) = state.admin_token.as_deref() {
@@ -147,7 +164,7 @@ pub fn resolve(state: &AppState, headers: &HeaderMap) -> Auth {
         }
 
         if let Some(id) = cookie_value(headers, SESSION_COOKIE) {
-            if state.sessions.is_valid(&id) {
+            if state.sessions.is_valid(&id).await {
                 return Auth {
                     role: Role::Admin,
                     configured,
@@ -239,6 +256,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    /// A fresh in-memory database with all migrations applied.
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -275,7 +310,10 @@ mod tests {
     #[test]
     fn cookie_is_found_among_others() {
         let h = headers_with(&[("cookie", "a=1; esplp_admin=deadbeef; b=2")]);
-        assert_eq!(cookie_value(&h, SESSION_COOKIE).as_deref(), Some("deadbeef"));
+        assert_eq!(
+            cookie_value(&h, SESSION_COOKIE).as_deref(),
+            Some("deadbeef")
+        );
         assert_eq!(cookie_value(&h, "a").as_deref(), Some("1"));
         assert_eq!(cookie_value(&h, "missing"), None);
     }
@@ -286,25 +324,40 @@ mod tests {
         assert_eq!(cookie_value(&h, SESSION_COOKIE), None);
     }
 
-    #[test]
-    fn session_lifecycle() {
-        let s = Sessions::new();
-        let id = s.create();
-        assert!(s.is_valid(&id));
-        assert!(!s.is_valid("not-a-session"));
-        assert!(s.revoke(&id));
-        assert!(!s.is_valid(&id));
+    #[tokio::test]
+    async fn session_lifecycle() {
+        let s = Sessions::new(test_pool().await);
+        let id = s.create().await;
+        assert!(s.is_valid(&id).await);
+        assert!(!s.is_valid("not-a-session").await);
+        assert!(s.revoke(&id).await);
+        assert!(!s.is_valid(&id).await);
         // Revoking twice is not an error, just false.
-        assert!(!s.revoke(&id));
+        assert!(!s.revoke(&id).await);
     }
 
-    #[test]
-    fn session_ids_are_unique() {
-        let s = Sessions::new();
-        let a = s.create();
-        let b = s.create();
+    #[tokio::test]
+    async fn session_ids_are_unique() {
+        let s = Sessions::new(test_pool().await);
+        let a = s.create().await;
+        let b = s.create().await;
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_rejected() {
+        let s = Sessions::new(test_pool().await);
+        let id = s.create().await;
+        assert!(s.is_valid(&id).await);
+        // Backdate the expiry into the past; only the wall clock matters now.
+        sqlx::query("UPDATE admin_sessions SET expires_at = ?2 WHERE id = ?1")
+            .bind(&id)
+            .bind(unix_now() - 3600)
+            .execute(&s.pool)
+            .await
+            .expect("backdate the session");
+        assert!(!s.is_valid(&id).await);
     }
 }
