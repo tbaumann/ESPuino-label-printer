@@ -256,8 +256,6 @@ To settle when it is built:
 ## Also outstanding
 
 - Rate-limit failed admin logins and the bearer path.
-- `CorsLayer::permissive()` is unnecessary now that the admin UI is same-origin;
-  permissive CORS beside a cookie-authenticated API is worth revisiting.
 - Server-side render of the black-only card back (client-side preview only so
   far) — needed by the print queue, and per print mode.
 - `PUT /api/prefixes/{prefix}` for an idempotent customer-chosen uuid.

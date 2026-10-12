@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use axum::Router;
 use sqlx::SqlitePool;
-use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
@@ -196,8 +195,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(routes::router(state))
         .fallback_service(ServeDir::new(&static_dir).fallback(ServeFile::new(index_html)))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = bind.parse()?;
     tracing::info!("listening on http://{addr}  (app at /, swagger UI at /swagger-ui)");
