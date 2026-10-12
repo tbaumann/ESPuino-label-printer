@@ -1171,6 +1171,9 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_limit;
+    use std::sync::Arc;
+    use std::time::Duration;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     /// A fresh in-memory database with all migrations applied.
@@ -1278,6 +1281,7 @@ mod tests {
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
             stripe: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
             checkout_limiter: limiter,
         }
     }
