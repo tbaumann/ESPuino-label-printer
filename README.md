@@ -284,18 +284,28 @@ Layout on disk:
 ```
 data/
   cards.db                   # prefix + card metadata (the single index)
-  blobs/<prefix>/<id>.<ext>  # card front images
+  blobs/<prefix>/<id>.<ext>       # card front images
+  blobs/<prefix>/<id>-back.<ext>  # colour back images (double_sided_color only)
 ```
 
 ## Data model
 
 - **Prefix** — a UUID that groups one customer's cards (one order/batch). The
   customer picks a UUID or the server assigns one. `card_count` is derived.
-  Carries a `status` (see lifecycle below), `status_changed_at` and an optional
-  `order_ref` (external shop id).
+  Carries a `status` (see lifecycle below), `status_changed_at`, an optional
+  `order_ref` (external shop id), and a `print_mode` that fixes the ribbon-pass
+  scheme and therefore what a card's back side may be.
+- **Print modes** — `single_sided` (YMCKO, front only, no back at all),
+  `double_sided_color` (YMCKO, colour front **and** colour back image),
+  `color_front_black_back` (YMCKOKO, colour front + black-only text back; the
+  **default**, so existing rows keep their meaning). Set at prefix creation or
+  via `PATCH /api/prefixes/{prefix}` while the prefix is still writable.
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
-  `serial_number`, optional `back_text` (black-and-white only half-panel back
-  for song lists), and a front image (ISO/IEC 7810 / CR80, scaled to fit).
+  `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
+  the back side carries depends on the prefix's `print_mode`: black-back mode
+  uses `back_text` (markdown); double-sided colour requires a `back_image` file;
+  single-sided has neither. A back field that does not fit the mode is rejected
+  by the API, never silently stored.
 
 ## Prefix lifecycle
 
@@ -396,6 +406,7 @@ an admin session.
 | PUT    | `/api/prefixes/{prefix}`               | create prefix at path uuid, idempotent |
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
+| PATCH  | `/api/prefixes/{prefix}`               | set the print mode (while writable) |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
 | POST   | `/api/prefixes/{prefix}/submit`        | **removed** — answers `410`, use checkout |
 | PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
@@ -407,6 +418,7 @@ an admin session.
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | colour back image bytes (double_sided_color only) |
 | GET    | `/api/shop/config`                     | price, currency, and whether payment is on |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
 | POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |
@@ -415,7 +427,11 @@ an admin session.
 | DELETE | `/api/admin/session`                   | log out                       |
 
 Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
-`name`, `serial_number`, `back_text` and a file part `image`.
+`name`, `serial_number`, `back_text` and a file part `image`; a
+`double_sided_color` prefix additionally requires a `back_image` file part.
+`back_text` is only accepted in `color_front_black_back` mode, and `back_image`
+only in `double_sided_color` — a back field that does not fit the prefix's mode
+is rejected with `400`, never silently stored.
 
 `PUT` is full-replace and **requires** the image; use `PATCH` to edit
 name/serial/back text without re-uploading it. Re-uploading an image in a
