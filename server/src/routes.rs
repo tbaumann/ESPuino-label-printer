@@ -1191,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn expired_checkout_reverts_payment_pending_to_draft() {
         let pool = test_pool().await;
-        let p = db::create_prefix(&pool, None).await.unwrap();
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
         // Mirror what /checkout does: a draft opens a session, flipping to
         // payment_pending.
         db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
@@ -1208,7 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn replayed_expired_event_leaves_draft_alone() {
         let pool = test_pool().await;
-        let p = db::create_prefix(&pool, None).await.unwrap(); // already draft
+        let p = db::create_prefix(&pool, None, None).await.unwrap(); // already draft
 
         revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
             .await
@@ -1219,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn expired_event_does_not_unseal_a_paid_prefix() {
         let pool = test_pool().await;
-        let p = db::create_prefix(&pool, None).await.unwrap();
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
         db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
             .await
             .unwrap();
