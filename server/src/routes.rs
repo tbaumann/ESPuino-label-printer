@@ -6,6 +6,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::auth;
@@ -910,6 +911,9 @@ pub async fn stripe_webhook(
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             record_payment(&st, &event).await?;
         }
+        "checkout.session.expired" => {
+            revert_expired_checkout(&st.pool, &event.data.object).await?;
+        }
         other => {
             tracing::debug!(event = other, id = %event.id, "ignoring Stripe event type");
         }
@@ -988,6 +992,67 @@ async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiE
             tracing::warn!(%prefix, session = %session.id, status = %current.status,
                 "payment settled for a prefix that is neither payment_pending nor paid; it has been \
                  left alone — decide in the admin UI whether to refund or to honour it");
+        }
+    }
+    Ok(())
+}
+
+/// Revert a Checkout session that expired without payment back to `draft`.
+///
+/// `checkout.session.expired` fires when a session times out (the customer
+/// abandoned it, or a card was declined) — nothing was paid, so the prefix
+/// should stop reading as `payment_pending` and give the customer back their
+/// write window instead of stranding a half-open order. Idempotent like
+/// `record_payment`: a retried delivery finds a draft already and is a no-op.
+///
+/// Deliberately narrow: only a `payment_pending` prefix is reverted. A prefix
+/// already at `draft` is a duplicated delivery; anything past `payment_pending`
+/// means a payment landed despite this expiry, and un-sealing that is a human's
+/// call, not a webhook's.
+async fn revert_expired_checkout(
+    pool: &SqlitePool,
+    session: &stripe::SessionObject,
+) -> Result<(), ApiError> {
+    let Some(raw) = session.prefix_uuid() else {
+        tracing::warn!(session = %session.id,
+            "expired session carries no prefix reference; nothing to revert");
+        return Ok(());
+    };
+    let Ok(prefix) = Uuid::parse_str(&raw) else {
+        tracing::warn!(session = %session.id, reference = %raw,
+            "expired session's prefix reference is not a uuid");
+        return Ok(());
+    };
+
+    let current = match db::get_prefix(pool, prefix).await {
+        Ok(p) => p,
+        Err(ApiError::NotFound(_)) => {
+            // Deleted meanwhile — nothing left to un-seal, and the customer is
+            // not coming back to it. Accept and move on.
+            tracing::debug!(%prefix, session = %session.id,
+                "expired session for a prefix that no longer exists");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    match current.status {
+        PrefixStatus::PaymentPending => {
+            let updated = db::set_status(pool, prefix, PrefixStatus::Draft, None, false).await?;
+            tracing::info!(%prefix, session = %session.id,
+                "checkout expired without payment; prefix reverted to {}", updated.status);
+        }
+        // Already a draft — a duplicated delivery of the same expired event.
+        PrefixStatus::Draft => {
+            tracing::debug!(%prefix, session = %session.id,
+                "checkout already reverted to draft; ignoring the duplicate");
+        }
+        // A payment landed despite the expiry, or the status moved on. Not our
+        // call to un-seal: leave it and flag it for a human.
+        other => {
+            tracing::warn!(%prefix, session = %session.id, status = %other,
+                "expired session met a prefix that is '{}' — past payment_pending, so left alone \
+                 (a payment may have landed; check in the admin UI)", other);
         }
     }
     Ok(())
@@ -1083,4 +1148,107 @@ pub fn router(state: AppState) -> Router {
         // only, so the SPA and Swagger UI are untouched.
         .layer(axum::middleware::from_fn(auth::csrf_guard))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    /// A fresh in-memory database with all migrations applied.
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::new()
+            .in_memory(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("in-memory sqlite pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("migrations applied to the test pool");
+        pool
+    }
+
+    /// An expired-session webhook payload keyed to a prefix (or none).
+    fn expired_session(prefix: Option<&str>) -> stripe::SessionObject {
+        stripe::SessionObject {
+            id: "cs_expired".into(),
+            client_reference_id: prefix.map(str::to_string),
+            payment_status: None,
+            amount_total: None,
+            currency: None,
+            metadata: None,
+        }
+    }
+
+    async fn status_of(pool: &SqlitePool, uuid: Uuid) -> PrefixStatus {
+        db::get_prefix(pool, uuid).await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn expired_checkout_reverts_payment_pending_to_draft() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None).await.unwrap();
+        // Mirror what /checkout does: a draft opens a session, flipping to
+        // payment_pending.
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::PaymentPending);
+
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn replayed_expired_event_leaves_draft_alone() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None).await.unwrap(); // already draft
+
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn expired_event_does_not_unseal_a_paid_prefix() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .unwrap();
+
+        // A later, out-of-order expired event must not silently reopen an order
+        // whose money already landed.
+        revert_expired_checkout(&pool, &expired_session(Some(&p.uuid.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+    }
+
+    #[tokio::test]
+    async fn expired_event_without_a_prefix_is_a_harmless_noop() {
+        let pool = test_pool().await;
+        // Missing reference, and a junk reference — neither should error nor
+        // touch anything.
+        revert_expired_checkout(&pool, &expired_session(None))
+            .await
+            .unwrap();
+        revert_expired_checkout(&pool, &expired_session(Some("not-a-uuid")))
+            .await
+            .unwrap();
+        // And a session for a prefix that never existed is a no-op too.
+        revert_expired_checkout(&pool, &expired_session(Some(&Uuid::new_v4().to_string())))
+            .await
+            .unwrap();
+    }
 }
