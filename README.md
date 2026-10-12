@@ -72,7 +72,8 @@ Commands (every API field is a flag):
 | Command | Purpose |
 |---------|---------|
 | `prefix create [--uuid U]` | create a prefix (server assigns uuid if omitted) |
-| `prefix list` / `prefix get <P>` | list prefixes / show one + card count |
+| `prefix list [--status S]` / `prefix get <P>` | list prefixes (optionally filtered by status) / show one + card count |
+| `prefix set-status <P> <STATUS> [--order-ref R]` | set a prefix's status (any transition) |
 | `card list <P>` | index of cards in a prefix |
 | `card get <P> <ID>` / `card delete <P> <ID>` | card metadata / delete |
 | `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back-text T]` | upload one card |
@@ -89,12 +90,11 @@ Notes:
   the plan without uploading.
 - `--quiet` prints just the uuid (prefix commands) or id (card commands) — handy
   for scripting: `P=$(esplp prefix create --quiet)`.
-- Not yet covered by the CLI: the `status` transitions and the `?status=` filter
-  — use the REST API or Swagger UI for those for now.
-- `prefix list` is admin-only, so it needs the operator token: `--token <tok>`
-  or `ESPLP_TOKEN`. Every other command is customer-level and needs no token.
-  Passing the token anyway is harmless — the server ignores it on those routes,
-  so one exported `ESPLP_TOKEN` is fine for everything.
+- `prefix list` and `prefix set-status` are admin-only, so they need the
+  operator token: `--token <tok>` or `ESPLP_TOKEN`. Every other command is
+  customer-level and needs no token. Passing the token anyway is harmless — the
+  server ignores it on those routes, so one exported `ESPLP_TOKEN` is fine for
+  everything.
 
 ## Web UI (`web/`)
 

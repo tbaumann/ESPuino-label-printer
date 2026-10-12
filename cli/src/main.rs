@@ -65,10 +65,25 @@ enum PrefixCmd {
         #[arg(long)]
         uuid: Option<String>,
     },
-    /// List all prefixes.
-    List,
+    /// List all prefixes, optionally filtered by status.
+    List {
+        /// Only show prefixes in this status
+        /// (draft|payment_pending|paid|queued|printing|printed|cancelled).
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+    },
     /// Show one prefix and its card count.
     Get { prefix: String },
+    /// Set a prefix's status (any transition). Requires the operator token.
+    SetStatus {
+        prefix: String,
+        /// Target status
+        /// (draft|payment_pending|paid|queued|printing|printed|cancelled).
+        status: String,
+        /// Optional external order reference (typically set when marking paid).
+        #[arg(long)]
+        order_ref: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -140,8 +155,20 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Prefix { cmd } => match cmd {
             PrefixCmd::Create { uuid } => emit(client.create_prefix(uuid.as_deref()).await?, quiet),
-            PrefixCmd::List => emit(client.list_prefixes().await?, quiet),
+            PrefixCmd::List { status } => {
+                emit(client.list_prefixes(status.as_deref()).await?, quiet)
+            }
             PrefixCmd::Get { prefix } => emit(client.get_prefix(&prefix).await?, quiet),
+            PrefixCmd::SetStatus {
+                prefix,
+                status,
+                order_ref,
+            } => emit(
+                client
+                    .set_status(&prefix, &status, order_ref.as_deref())
+                    .await?,
+                quiet,
+            ),
         },
         Command::Card { cmd } => match cmd {
             CardCmd::List { prefix } => emit(client.list_cards(&prefix).await?, quiet),
