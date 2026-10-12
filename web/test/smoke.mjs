@@ -83,7 +83,8 @@ async function mount(path, { bust }) {
     const headers = new Headers(opts.headers ?? {})
     if (cookieJar && !headers.has('cookie')) headers.set('cookie', cookieJar)
     opts.headers = headers
-    if (method !== 'GET') seen.push({ method, csrf: headers.get('x-esplp-csrf') })
+    if (method !== 'GET')
+      seen.push({ method, csrf: headers.get('x-esplp-csrf'), url: String(url) })
 
     const res = await realFetch(url, opts)
 
@@ -189,9 +190,9 @@ console.log('\nB. project page renders a card')
   check('list prefixes with a wrong token -> 401', (await listPrefixes('nope')) === 401)
   check('list prefixes with the admin token -> 200', (await listPrefixes(TOKEN)) === 200)
   check('set status without a token -> 401',
-    (await setStatus(prefix, 'submitted', { token: '' })) === 401)
+    (await setStatus(prefix, 'payment_pending', { token: '' })) === 401)
 
-  for (const s of ['submitted', 'paid', 'queued', 'printing']) {
+  for (const s of ['payment_pending', 'paid', 'queued', 'printing']) {
     check(`operator sets status -> ${s}`, (await setStatus(prefix, s)) === 200)
   }
   const w2 = await mount(`/p/${prefix}`, { bust: 'c' })
@@ -297,6 +298,67 @@ console.log('\nF. admin: list, status change, print preview, delete')
     headers: { authorization: `Bearer ${TOKEN}` },
   })
   check('prefix is gone from the server', gone.status === 404, String(gone.status))
+}
+
+// ---- scenario G: the Pay button, straight from a draft ---------------------
+// Only meaningful when the server has Stripe configured, so it is skipped on a
+// deployment without it — same idea as the admin scenarios and ADMIN_TOKEN.
+console.log('\nG. pay button')
+{
+  // Scenario F logged in, and the shim's jar would otherwise carry that admin
+  // session into this customer flow — where a cookie-authenticated mutation
+  // needs the CSRF header the test's own api() helper does not send.
+  cookieJar = ''
+
+  const shop = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
+  if (!shop.enabled) {
+    console.log('  skip no payment configured on this server (STRIPE_SECRET_KEY unset)')
+  } else {
+    const prefix = (
+      await api('/api/prefixes', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      })
+    ).uuid
+
+    const fd = new NodeFormData()
+    fd.append('name', 'Payable Card')
+    fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'pay.png')
+    await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+
+    // No submit step any more: a draft is payable straight away, and paying is
+    // what makes the order real.
+    const w = await mount(`/p/${prefix}`, { bust: 'g1' })
+    await settle(1400)
+    const text = w.document.body.textContent ?? ''
+    check(
+      'a draft project offers to pay straight away',
+      /Pay now/.test(text),
+      text.slice(0, 160),
+    )
+    check('there is no submit button', !/Submit/.test(text), text.slice(0, 200))
+    // 1 card at 500 + 250 shipping = 750 minor units. Match the digits, not the
+    // currency formatting, which depends on the host locale.
+    check('the total is shown', /7[.,]50/.test(text), text.slice(0, 300))
+
+    const before = seen.length
+    const payButton = [...w.document.querySelectorAll('button')].find((b) =>
+      /Pay now/.test(b.textContent),
+    )
+    check('the Pay button is a real button', !!payButton)
+    payButton?.click()
+    await settle(1600)
+
+    const posted = seen.slice(before)
+    check(
+      'clicking Pay opens a checkout session on the server',
+      posted.some(
+        (r) => r.method === 'POST' && r.url.includes(`/api/prefixes/${prefix}/checkout`),
+      ),
+      JSON.stringify(posted),
+    )
+  }
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

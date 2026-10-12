@@ -89,8 +89,8 @@ Notes:
   the plan without uploading.
 - `--quiet` prints just the uuid (prefix commands) or id (card commands) — handy
   for scripting: `P=$(esplp prefix create --quiet)`.
-- Not yet covered by the CLI: the `submit` / `status` transitions and the
-  `?status=` filter — use the REST API or Swagger UI for those for now.
+- Not yet covered by the CLI: the `status` transitions and the `?status=` filter
+  — use the REST API or Swagger UI for those for now.
 - `prefix list` is admin-only, so it needs the operator token: `--token <tok>`
   or `ESPLP_TOKEN`. Every other command is customer-level and needs no token.
   Passing the token anyway is harmless — the server ignores it on those routes,
@@ -122,6 +122,10 @@ DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 ./target/d
 ADMIN_TOKEN=secret npm --prefix web test
 ```
 
+Its last scenario (the Pay button) needs payment configured on that server and is
+skipped with a note when it is not; `scripts/stripe_e2e_test.py` is the test that
+covers payment properly.
+
 Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
 *is* the prefix. Use "Open" to return to an existing project code; recent
 projects are remembered in `localStorage`. A project page holds the drop zone
@@ -146,6 +150,113 @@ separate bundle. Since the session cookie is `HttpOnly`, the UI cannot read it,
 so every mutation goes through the shared `req()` helper in `web/src/lib/api.ts`,
 which attaches the `x-esplp-csrf` header automatically.
 
+## Payments (Stripe)
+
+Checkout goes through **Stripe Checkout**, which collects the shipping address
+and the money. There is no shop system and no second service: the server does
+exactly two things — open a session, and listen for the webhook that says the
+money arrived.
+
+1. the customer clicks Pay on the project page. There is no submit step: paying
+   is what makes an order real, and nothing is printed until it is paid;
+2. `POST /api/prefixes/{prefix}/checkout` moves the prefix to `payment_pending`,
+   creates a Checkout Session, and returns its `url`; the browser is sent there;
+3. Stripe takes the address and the payment, then redirects back to
+   `/p/<uuid>?paid=1` **and** calls `POST /api/webhooks/stripe`;
+4. the webhook is the only thing that marks an order paid. It verifies the
+   `Stripe-Signature` header, reads the prefix uuid out of `client_reference_id`,
+   moves `payment_pending → paid`, and stores the Stripe session id as
+   `order_ref`.
+
+**The redirect is not proof of payment.** It is a separate event from the webhook
+and can arrive first — or be typed in by hand. So the project page never trusts
+`?paid=1`: it shows "waiting for the payment to be confirmed" and polls the
+prefix until the status changes. Only the signed webhook writes `paid`.
+
+Payment methods are not chosen in code. Stripe removed the
+`payment_method_types` parameter from Checkout Session creation: the methods you
+accept are configured in the Stripe Dashboard (Settings → Payment methods), and
+Stripe decides which of them to show each customer, and in what order. Enable
+PayPal, Klarna and SEPA direct debit there — they are worth having for a German
+shop, and none of them needs a code change. Leaving that section empty means
+card-only. (The old `STRIPE_PAYMENT_METHODS` variable is now inert, and logs a
+warning if you still have it set.)
+
+A session can still narrow that list, or be pinned to one:
+
+```sh
+STRIPE_EXCLUDED_PAYMENT_METHODS=klarna          # never offer these, whatever the Dashboard says
+STRIPE_PAYMENT_METHOD_CONFIGURATION=pmc_1234    # pin sessions to a Dashboard pmc_… configuration
+```
+
+Shipping is one flat charge (`STRIPE_SHIPPING_CENTS`) for every destination, and
+that is a Stripe limitation rather than a shortcut. A Shipping Rate has no
+destination field — `active`, `created`, `delivery_estimate`, `display_name`,
+`fixed_amount`, `livemode`, `metadata`, `tax_behavior`, `tax_code`, `type`, and
+nothing else — so a rate cannot vary by country. Region-based shipping exists
+only in the embedded Checkout form and Elements integrations, where Stripe calls
+an endpoint of yours with the address and you return the price; hosted Checkout
+has no such hook. Note that `STRIPE_COUNTRIES` is not a pricing knob: it restricts
+which addresses are accepted at all, and the same shipping line is charged
+whatever is entered.
+
+Delayed methods are handled properly: Klarna and SEPA report
+`checkout.session.completed` while still unpaid, and only settle with a later
+`checkout.session.async_payment_succeeded`. The server waits for
+`payment_status == "paid"` either way, so credit is never given early.
+
+A payment that lands on a prefix which is neither `payment_pending` nor `paid` — a
+draft, or a cancelled order — is deliberately **not** forced through. It is logged
+at `WARN` and left for the operator to refund or honour, because guessing either
+way is worse than asking. That refusal is also why the checkout moves the status
+*before* opening the session: a customer can pay the moment they land on Stripe's
+page, and a slow status write would otherwise strand a real payment on that WARN
+line.
+
+### Setting it up
+
+1. create the Stripe account and stay in **test mode** to begin with;
+2. copy the secret key (Developers → API keys) into `STRIPE_SECRET_KEY`;
+3. add a webhook endpoint (Developers → Webhooks) at
+   `https://<your-host>/api/webhooks/stripe`, subscribed to
+   `checkout.session.completed` and `checkout.session.async_payment_succeeded`,
+   and copy its signing secret into `STRIPE_WEBHOOK_SECRET`;
+4. set `PUBLIC_BASE_URL` to the public origin, e.g. `https://cards.example.com`
+   — that is where Stripe sends the customer back;
+5. set the price: `STRIPE_PER_CARD_CENTS`, `STRIPE_SHIPPING_CENTS`,
+   `STRIPE_CURRENCY`;
+6. only then switch to live keys.
+
+During local development the Stripe CLI replaces steps 2–3:
+
+```sh
+stripe listen --forward-to 127.0.0.1:8080/api/webhooks/stripe   # prints a whsec_…
+```
+
+`STRIPE_SECRET_KEY` unset switches payments off: `/api/shop/config` reports
+`enabled: false`, the customer UI shows no way to pay, and both payment endpoints
+answer `503`. Same convention as `ADMIN_TOKEN` — unset is never open. Unset
+`STRIPE_WEBHOOK_SECRET` is the one combination to avoid: checkout still works,
+but every webhook is rejected and no order ever becomes `paid`.
+
+### Testing payments without a Stripe account
+
+`scripts/mock_stripe.py` stands in for `api.stripe.com` and records the form body
+it receives. `scripts/stripe_e2e_test.py` drives the real API against it — it
+creates a prefix, uploads cards, asks for a checkout session, asserts on exactly
+what was sent, then delivers webhook events to the live endpoint, signed the way
+Stripe signs them:
+
+```sh
+python3 scripts/mock_stripe.py 12111 &
+DATA_DIR=/tmp/esplp-stripe STRIPE_SECRET_KEY=sk_test_x \
+  STRIPE_WEBHOOK_SECRET=whsec_test_secret STRIPE_API_BASE=http://127.0.0.1:12111 \
+  PUBLIC_BASE_URL=http://127.0.0.1:8080 \
+  STRIPE_PER_CARD_CENTS=500 STRIPE_SHIPPING_CENTS=250 \
+  ./target/debug/espuino-label-printer &
+python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
+```
+
 ## Configuration (server environment)
 
 | Variable       | Default                        | Meaning                              |
@@ -157,6 +268,16 @@ which attaches the `x-esplp-csrf` header automatically.
 | `STATIC_DIR`   | `server/static`                | built SPA to serve at `/`            |
 | `ADMIN_TOKEN`  | *(unset)*                      | operator bearer token; unset switches the admin API off |
 | `SESSION_COOKIE_SECURE` | *(unset)*             | force the `Secure` flag on the admin session cookie; unset = infer from `X-Forwarded-Proto` |
+| `STRIPE_SECRET_KEY` | *(unset)*                 | Stripe API key; unset switches checkout and the webhook off (`503`) |
+| `STRIPE_WEBHOOK_SECRET` | *(unset)*             | signing secret for the webhook; without it every webhook is rejected |
+| `STRIPE_API_BASE` | `https://api.stripe.com`     | API base; override to point at a mock |
+| `PUBLIC_BASE_URL` | *(unset)*                   | public origin for the post-payment redirect; unset falls back to the request `Host` |
+| `STRIPE_CURRENCY` | `eur`                       | ISO 4217 code |
+| `STRIPE_PER_CARD_CENTS` | `500`                 | price of one card, in minor units (cents) |
+| `STRIPE_SHIPPING_CENTS` | `0`                   | flat shipping charge; `0` adds no shipping line |
+| `STRIPE_COUNTRIES` | `DE,AT,CH`                 | allowed shipping-address countries |
+| `STRIPE_EXCLUDED_PAYMENT_METHODS` | *(none)*       | methods to never offer in a session |
+| `STRIPE_PAYMENT_METHOD_CONFIGURATION` | *(unset)*  | pin sessions to a Dashboard `pmc_…` configuration |
 
 Layout on disk:
 
@@ -179,13 +300,17 @@ data/
 ## Prefix lifecycle
 
 ```
-draft ──submit──▶ submitted ──paid──▶ paid ──▶ queued ──▶ printing ──▶ printed
-  └──────────── cancelled (reachable from any pre-printing state) ────────┘
+draft ──Pay──▶ payment_pending ──paid──▶ paid ──▶ queued ──▶ printing ──▶ printed
+  └─────────────────── cancelled (reachable from any pre-printing state) ───────────────────┘
 ```
 
-- The customer submits (`POST .../submit`); the shop marks it paid
-  (`PATCH .../status`); the print queue advances `queued → printing → printed`.
-- Cards are editable while the prefix is `draft`, `submitted`, `paid` or
+- The customer's Pay button opens a checkout (`POST .../checkout`), which moves a
+  draft to `payment_pending`; Stripe's webhook marks it paid; the print queue
+  advances `queued → printing → printed`. There is no submit step, and
+  `POST .../submit` no longer exists — it answers `410`.
+- A `payment_pending` prefix can be paid for again: a closed window or a declined
+  card is not a dead end, and nothing has to be reset by hand.
+- Cards are editable while the prefix is `draft`, `payment_pending`, `paid` or
   `queued`. Once it reaches `printing` the prefix is **frozen** and card writes
   (PUT/POST/DELETE) return `409`. Reads always work.
 - `GET /api/prefixes?status=paid` is the print queue's work list.
@@ -201,7 +326,7 @@ There are no accounts. Two kinds of caller:
 - **Customer** — anyone holding a prefix uuid. That uuid *is* the credential,
   and it cannot be discovered: listing is admin-only, so there is no
   enumeration route. A customer can read and modify their own prefix and its
-  cards, submit it, and delete it while it is still writable.
+  cards, pay for it, and delete it while it is still writable.
 - **Operator** — either sends `Authorization: Bearer $ADMIN_TOKEN` (the CLI), or
   logs in through the admin UI, which trades the token for a session cookie.
   Can list every prefix, set any status at any time, delete a prefix in any
@@ -213,11 +338,11 @@ There are no accounts. Two kinds of caller:
 | create a prefix                            | ✓             | ✓        |
 | read a prefix / its cards / an image       | ✓             | ✓        |
 | add, edit or delete cards                  | ✓ if writable | ✓ always |
-| submit (`draft → submitted`)               | ✓             | ✓        |
+| pay (`draft → payment_pending`)            | ✓             | ✓        |
 | set status (`PATCH .../status`)            | ✗             | ✓ (any transition) |
 | delete a prefix                            | ✓ if writable | ✓ always |
 
-"Writable" means `draft`, `submitted`, `paid` or `queued`. From `printing`
+"Writable" means `draft`, `payment_pending`, `paid` or `queued`. From `printing`
 onwards a prefix is frozen for customers; the operator can still work on it,
 which is what makes a stuck print job recoverable — a customer has no legal
 edge out of `printing`, and the operator can set any status regardless.
@@ -265,7 +390,7 @@ an admin session.
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
-| POST   | `/api/prefixes/{prefix}/submit`        | submit for payment (draft→submitted) |
+| POST   | `/api/prefixes/{prefix}/submit`        | **removed** — answers `410`, use checkout |
 | PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
 | GET    | `/api/prefixes/{prefix}/cards`         | index of cards in the prefix  |
 | POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id  |
@@ -275,6 +400,9 @@ an admin session.
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
+| GET    | `/api/shop/config`                     | price, currency, and whether payment is on |
+| POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
+| POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |
 | POST   | `/api/admin/session`                   | log in: token → session cookie |
 | GET    | `/api/admin/session`                   | am I logged in? **(admin)**   |
 | DELETE | `/api/admin/session`                   | log out                       |

@@ -4,13 +4,19 @@ use uuid::Uuid;
 
 /// Lifecycle of a prefix (one customer order).
 ///
-/// `draft -> submitted -> paid -> queued -> printing -> printed`, with
+/// `draft -> payment_pending -> paid -> queued -> printing -> printed`, with
 /// `cancelled` reachable from any pre-printing state.
+///
+/// There is deliberately no "submitted" step. The customer's Pay button opens a
+/// Stripe Checkout session, and *that* is what moves a draft to
+/// `payment_pending`; paying is the only thing that makes an order real. A
+/// submitted-but-unpaid state said nothing a `payment_pending` does not already
+/// say, and cost the customer a click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PrefixStatus {
     Draft,
-    Submitted,
+    PaymentPending,
     Paid,
     Queued,
     Printing,
@@ -22,7 +28,7 @@ impl PrefixStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Draft => "draft",
-            Self::Submitted => "submitted",
+            Self::PaymentPending => "payment_pending",
             Self::Paid => "paid",
             Self::Queued => "queued",
             Self::Printing => "printing",
@@ -34,7 +40,7 @@ impl PrefixStatus {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "draft" => Self::Draft,
-            "submitted" => Self::Submitted,
+            "payment_pending" => Self::PaymentPending,
             "paid" => Self::Paid,
             "queued" => Self::Queued,
             "printing" => Self::Printing,
@@ -49,7 +55,7 @@ impl PrefixStatus {
     pub fn is_writable(self) -> bool {
         matches!(
             self,
-            Self::Draft | Self::Submitted | Self::Paid | Self::Queued
+            Self::Draft | Self::PaymentPending | Self::Paid | Self::Queued
         )
     }
 
@@ -57,9 +63,10 @@ impl PrefixStatus {
     pub fn can_transition_to(self, next: Self) -> bool {
         use PrefixStatus::*;
         match self {
-            Draft => matches!(next, Submitted | Cancelled),
-            // A submission can be withdrawn back to draft before payment.
-            Submitted => matches!(next, Paid | Draft | Cancelled),
+            Draft => matches!(next, PaymentPending | Cancelled),
+            // A checkout can be abandoned, or fail after the status moved; both
+            // put the order back where it started, with nothing paid.
+            PaymentPending => matches!(next, Paid | Draft | Cancelled),
             Paid => matches!(next, Queued | Cancelled),
             Queued => matches!(next, Printing | Cancelled),
             Printing => matches!(next, Printed),
@@ -154,4 +161,23 @@ pub struct AdminLogin {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AdminSession {
     pub authenticated: bool,
+}
+
+/// Public shop configuration, so the customer UI can show a price and a Pay
+/// button — or hide both — without the browser knowing anything secret.
+///
+/// When payment is not configured, `enabled` is false and the amounts are zero;
+/// the customer UI then simply shows no way to pay.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ShopConfig {
+    pub enabled: bool,
+    /// ISO 4217 code, lower case as Stripe wants it.
+    pub currency: String,
+    /// Price of one card, in the currency's minor unit (cents).
+    pub per_card_cents: i64,
+    /// Flat shipping charge in cents; 0 means shipping is free and no shipping
+    /// line is added to the checkout.
+    pub shipping_cents: i64,
+    /// Countries the shipping address may be in.
+    pub countries: Vec<String>,
 }

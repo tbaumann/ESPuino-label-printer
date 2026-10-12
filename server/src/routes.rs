@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use axum::body::Bytes;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -12,8 +13,9 @@ use crate::db;
 use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus,
-    StatusInput,
+    ShopConfig, StatusInput,
 };
+use crate::stripe;
 use crate::AppState;
 
 fn parse_uuid(s: &str) -> Result<Uuid, ApiError> {
@@ -149,7 +151,7 @@ pub struct StatusQuery {
 /// List prefixes, optionally filtered by status. **Admin only** — the full
 /// list exposes every customer's uuid, which is their only credential.
 #[utoipa::path(get, path = "/api/prefixes", tag = "prefixes",
-    params(("status" = Option<String>, Query, description = "filter by status (draft|submitted|paid|queued|printing|printed|cancelled)")),
+    params(("status" = Option<String>, Query, description = "filter by status (draft|payment_pending|paid|queued|printing|printed|cancelled)")),
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = [Prefix]),
@@ -322,7 +324,7 @@ pub async fn delete_card(
 
 /// Delete a prefix and all of its cards (and their images).
 ///
-/// A customer may delete only a *writable* prefix (draft, submitted, paid or
+/// A customer may delete only a *writable* prefix (draft, payment_pending, paid or
 /// queued). The operator may delete one in any state, including while printing.
 #[utoipa::path(delete, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
@@ -341,7 +343,7 @@ pub async fn delete_prefix(
     let p = db::get_prefix(&st.pool, prefix).await?;
     if !caller.is_admin() && !p.status.is_writable() {
         return Err(ApiError::Conflict(format!(
-            "prefix {prefix} is '{}' and cannot be deleted; only draft, submitted, \
+            "prefix {prefix} is '{}' and cannot be deleted; only draft, payment_pending, \
              paid or queued prefixes can be",
             p.status
         )));
@@ -392,33 +394,6 @@ pub async fn patch_card(
     let caller = auth::resolve(&st, &headers);
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     Ok(Json(db::update_card_meta(&st.pool, prefix, id, &patch).await?))
-}
-
-/// Submit a prefix for payment (draft -> submitted). Customer action.
-#[utoipa::path(post, path = "/api/prefixes/{prefix}/submit", tag = "prefixes",
-    params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    responses(
-        (status = 200, body = Prefix),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "not in draft", body = crate::error::ErrorBody)
-    ))]
-pub async fn submit_prefix(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(prefix): Path<String>,
-) -> Result<Json<Prefix>, ApiError> {
-    let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers);
-    Ok(Json(
-        db::set_status(
-            &st.pool,
-            prefix,
-            PrefixStatus::Submitted,
-            None,
-            caller.is_admin(),
-        )
-        .await?,
-    ))
 }
 
 /// Set a prefix's status. **Admin only.**
@@ -535,6 +510,277 @@ pub async fn admin_session(
     Ok(Json(AdminSession { authenticated: true }))
 }
 
+// ---------------------------------------------------------------------------
+// Shop — Stripe Checkout, and the webhook that records the payment
+// ---------------------------------------------------------------------------
+
+/// Where Stripe should send the customer back to.
+///
+/// `PUBLIC_BASE_URL` wins. Without it we fall back to the request's own `Host`
+/// (and `X-Forwarded-Proto`), which is correct behind a proxy but does mean an
+/// unset deployment lets a client choose its own redirect target — hence the
+/// startup warning. It is not a security hole worth losing sleep over (the
+/// attacker needs the prefix uuid, and the redirect is only ever a `success_url`
+/// on their own session), but set the variable.
+fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
+    if let Some(base) = st.stripe.as_ref().and_then(|s| s.public_base_url()) {
+        return base.trim_end_matches('/').to_string();
+    }
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v == "https" || v == "http")
+        .unwrap_or_else(|| "http".to_string());
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    format!("{proto}://{host}")
+}
+
+/// Public shop settings: price, currency, and whether payment works at all.
+/// The customer UI needs this to show a total before sending anyone to Stripe.
+#[utoipa::path(get, path = "/api/shop/config", tag = "shop",
+    responses((status = 200, body = ShopConfig)))]
+pub async fn shop_config(State(st): State<AppState>) -> Json<ShopConfig> {
+    let body = match st.stripe.as_deref() {
+        None => ShopConfig {
+            enabled: false,
+            currency: "eur".into(),
+            per_card_cents: 0,
+            shipping_cents: 0,
+            countries: vec![],
+        },
+        Some(s) => {
+            let p = s.pricing();
+            ShopConfig {
+                enabled: true,
+                currency: p.currency.clone(),
+                per_card_cents: p.per_card_cents,
+                shipping_cents: p.shipping_cents,
+                countries: p.countries.clone(),
+            }
+        }
+    };
+    Json(body)
+}
+
+/// Start a Stripe Checkout session for a prefix and return where to send the
+/// browser.
+///
+/// Caller: anyone who knows the prefix uuid — the same capability that governs
+/// every other customer action. There is no submit step: paying is what makes an
+/// order real, so a `draft` goes straight to `payment_pending` here. Nothing here
+/// marks the prefix paid — that happens when Stripe confirms the money, via the
+/// webhook.
+#[utoipa::path(post, path = "/api/prefixes/{prefix}/checkout", tag = "shop",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    responses(
+        (status = 200, body = stripe::CheckoutSession),
+        (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
+        (status = 409, description = "the prefix has no cards, or is already past payment", body = crate::error::ErrorBody),
+        (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
+        (status = 502, description = "Stripe refused or could not be reached", body = crate::error::ErrorBody)
+    ))]
+pub async fn create_checkout(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+) -> Result<Json<stripe::CheckoutSession>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let stripe = st.stripe.as_deref().ok_or_else(|| {
+        ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
+    })?;
+
+    let p = db::get_prefix(&st.pool, prefix).await?;
+    // Re-opening a checkout is fine — the customer may have closed the window, or
+    // had a card declined. Anything at or past payment is not.
+    if !matches!(p.status, PrefixStatus::Draft | PrefixStatus::PaymentPending) {
+        return Err(ApiError::Conflict(format!(
+            "prefix {prefix} is '{}': only a draft or payment_pending prefix can be paid for",
+            p.status
+        )));
+    }
+    if p.card_count <= 0 {
+        return Err(ApiError::Conflict(format!(
+            "prefix {prefix} has no cards, so there is nothing to print"
+        )));
+    }
+
+    // Flip to payment_pending BEFORE opening the session, and note the order: a
+    // customer can pay the moment they land on Stripe's page, and the webhook
+    // deliberately refuses to force a payment through for a prefix that still
+    // reads as a draft. Writing the status second would let a fast payment lose
+    // that race and strand real money in a WARN line.
+    let was_draft = p.status == PrefixStatus::Draft;
+    if was_draft {
+        db::set_status(&st.pool, prefix, PrefixStatus::PaymentPending, None, false).await?;
+    }
+
+    let base = public_base_url(&st, &headers);
+    let session = match stripe
+        .create_checkout_session(prefix, p.card_count, &base)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // No session was opened, so nothing should read as awaiting payment.
+            if was_draft {
+                if let Err(back) =
+                    db::set_status(&st.pool, prefix, PrefixStatus::Draft, None, false).await
+                {
+                    tracing::error!(%prefix, error = %back,
+                        "could not put the prefix back to draft after a failed checkout");
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    tracing::info!(%prefix, session = %session.id, cards = p.card_count,
+        "checkout session created; waiting for the payment webhook");
+    Ok(Json(session))
+}
+
+/// Stripe's webhook. This is the only thing that marks an order paid.
+///
+/// Authenticated by the `Stripe-Signature` header over the raw body — there is
+/// no token and no cookie involved, so the CSRF middleware lets it through (it
+/// only speaks up when the session cookie is present). Every answer is 2xx
+/// except a bad signature, because Stripe retries anything else for days and a
+/// permanent, deliberate no-op is not worth that.
+#[utoipa::path(post, path = "/api/webhooks/stripe", tag = "shop",
+    request_body(content = String, content_type = "application/json",
+        description = "Raw Stripe event. Verified by the Stripe-Signature header, not by a token."),
+    responses(
+        (status = 200, description = "accepted, including events deliberately ignored"),
+        (status = 400, description = "missing, stale or mismatching signature", body = crate::error::ErrorBody),
+        (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody)
+    ))]
+pub async fn stripe_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let stripe = st.stripe.as_deref().ok_or_else(|| {
+        ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
+    })?;
+
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::BadRequest("missing Stripe-Signature header".into()))?;
+    stripe.verify_webhook(signature, &body)?;
+
+    let event: stripe::Event = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("malformed Stripe event: {e}")))?;
+
+    match event.kind.as_str() {
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            record_payment(&st, &event).await?;
+        }
+        other => {
+            tracing::debug!(event = other, id = %event.id, "ignoring Stripe event type");
+        }
+    }
+    Ok(StatusCode::OK)
+}
+
+/// Attach a settled payment to the prefix it was made for.
+///
+/// Idempotent on purpose: Stripe retries, and a customer refreshing the success
+/// URL does not produce a second event, but a duplicated delivery is normal
+/// enough that it must be harmless.
+async fn record_payment(st: &AppState, event: &stripe::Event) -> Result<(), ApiError> {
+    let session = &event.data.object;
+
+    // Klarna and SEPA report `completed` before the money actually moves; the
+    // paired `async_payment_succeeded` is the one that means settled. Waiting
+    // for payment_status == "paid" covers both event types in one rule.
+    if session.payment_status.as_deref() != Some("paid") {
+        tracing::debug!(session = %session.id, status = ?session.payment_status,
+            "payment not settled yet; a later event will carry it");
+        return Ok(());
+    }
+
+    let Some(raw) = session.prefix_uuid() else {
+        tracing::error!(session = %session.id, event = %event.id, livemode = ?event.livemode,
+            "Stripe event carries no prefix reference; cannot attribute the payment");
+        return Ok(());
+    };
+    let Ok(prefix) = Uuid::parse_str(&raw) else {
+        tracing::error!(session = %session.id, reference = %raw,
+            "Stripe event's prefix reference is not a uuid");
+        return Ok(());
+    };
+
+    let current = match db::get_prefix(&st.pool, prefix).await {
+        Ok(p) => p,
+        Err(ApiError::NotFound(_)) => {
+            // Paid, then deleted. The money is real and there is nowhere to put
+            // it, so this needs a human — shout, and let it be 200 so Stripe
+            // stops retrying an event that can never succeed.
+            tracing::error!(%prefix, session = %session.id, amount = ?session.amount_total,
+                "payment received for a prefix that no longer exists: refund it, or rebuild \
+                 the order by hand");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    match current.status {
+        PrefixStatus::PaymentPending => {
+            let updated = db::set_status(
+                &st.pool,
+                prefix,
+                PrefixStatus::Paid,
+                Some(&session.id),
+                false,
+            )
+            .await?;
+            tracing::info!(%prefix, session = %session.id, amount = ?session.amount_total,
+                currency = ?session.currency, "payment recorded, prefix is now {}", updated.status);
+        }
+        // Already handled — the normal case for a retried delivery.
+        PrefixStatus::Paid
+        | PrefixStatus::Queued
+        | PrefixStatus::Printing
+        | PrefixStatus::Printed => {
+            tracing::info!(%prefix, session = %session.id, status = %current.status,
+                "payment already recorded; ignoring the duplicate");
+        }
+        // A draft (nothing in flight) or a cancelled order. Deliberately not
+        // forced: whether to refund or to honour the order is the operator's
+        // call, and guessing wrong either prints an order nobody wants or
+        // silently keeps money.
+        PrefixStatus::Draft | PrefixStatus::Cancelled => {
+            tracing::warn!(%prefix, session = %session.id, status = %current.status,
+                "payment settled for a prefix that is neither payment_pending nor paid; it has been \
+                 left alone — decide in the admin UI whether to refund or to honour it");
+        }
+    }
+    Ok(())
+}
+
+/// The `submit` step is gone: paying is what makes an order real, so the
+/// checkout call moves a draft straight to `payment_pending`.
+///
+/// This tombstone answers a stale client explicitly — an unmatched POST would
+/// otherwise fall through to the static-file fallback and come back as a bare
+/// `405`, which reads like a bug rather than a deliberate removal.
+pub async fn submit_prefix_gone() -> Response {
+    (
+        StatusCode::GONE,
+        Json(crate::error::ErrorBody {
+            error: "the submit step was removed: POST /api/prefixes/{prefix}/checkout now moves \
+                    a draft straight to payment_pending"
+                .to_string(),
+        }),
+    )
+        .into_response()
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/prefixes", axum::routing::get(list_prefixes).post(create_prefix))
@@ -542,9 +788,11 @@ pub fn router(state: AppState) -> Router {
             "/api/prefixes/:prefix",
             axum::routing::get(get_prefix).delete(delete_prefix),
         )
+        // Kept as an explicit tombstone rather than deleted, so a stale client
+        // gets a 410 with a reason instead of a 405 from the static fallback.
         .route(
             "/api/prefixes/:prefix/submit",
-            axum::routing::post(submit_prefix),
+            axum::routing::post(submit_prefix_gone),
         )
         .route(
             "/api/prefixes/:prefix/status",
@@ -572,6 +820,18 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(admin_login)
                 .get(admin_session)
                 .delete(admin_logout),
+        )
+        .route("/api/shop/config", axum::routing::get(shop_config))
+        .route(
+            "/api/prefixes/:prefix/checkout",
+            axum::routing::post(create_checkout),
+        )
+        // Stripe's callback. Behind the CSRF layer like everything else, which
+        // is harmless: that guard only speaks up when the session cookie is
+        // present, and Stripe sends no cookie.
+        .route(
+            "/api/webhooks/stripe",
+            axum::routing::post(stripe_webhook),
         )
         // Second CSRF lock, on top of SameSite=Strict: a cookie-authenticated
         // mutation must also carry the custom header. Applied to the API router

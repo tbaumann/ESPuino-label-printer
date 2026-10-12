@@ -192,7 +192,7 @@ section.panel {
 .badge.status-draft {
   color: var(--muted);
 }
-.badge.status-submitted,
+.badge.status-payment_pending,
 .badge.status-queued {
   color: #b07000;
   border-color: #e8c07a;

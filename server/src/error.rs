@@ -23,8 +23,18 @@ pub enum ApiError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
-    #[error("admin API unavailable: {0}")]
+    /// A feature this deployment has not been configured for. The message says
+    /// which: the admin API wants `ADMIN_TOKEN`, the shop wants
+    /// `STRIPE_SECRET_KEY`. Deliberately generic, because both use it and
+    /// "admin API unavailable" was a lie the moment payments arrived.
+    #[error("unavailable: {0}")]
     Unavailable(String),
+
+    /// A third party (Stripe) was unreachable or answered with an error. Kept
+    /// separate from `Internal` so the two are distinguishable in logs and in
+    /// the HTTP status: 502 says "not our fault, retryable".
+    #[error("upstream error: {0}")]
+    Upstream(String),
 
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -45,6 +55,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Upstream(_) => StatusCode::BAD_GATEWAY,
             ApiError::Db(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             ApiError::Db(_) | ApiError::Io(_) | ApiError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -61,8 +72,8 @@ pub struct ErrorBody {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
-        if status == StatusCode::INTERNAL_SERVER_ERROR {
-            tracing::error!(error = %self, "internal server error");
+        if status.is_server_error() {
+            tracing::error!(error = %self, "request failed");
         }
         let body = Json(json!({ "error": self.to_string() }));
         (status, body).into_response()

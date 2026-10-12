@@ -1,6 +1,6 @@
 export type PrefixStatus =
   | 'draft'
-  | 'submitted'
+  | 'payment_pending'
   | 'paid'
   | 'queued'
   | 'printing'
@@ -37,6 +37,24 @@ export interface CardPatch {
   back_text?: string
 }
 
+/** Public shop settings. `enabled: false` means this deployment takes no money. */
+export interface ShopConfig {
+  enabled: boolean
+  currency: string
+  per_card_cents: number
+  shipping_cents: number
+  countries: string[]
+}
+
+/** A Stripe Checkout session, as far as the UI needs to know about it. */
+export interface CheckoutSession {
+  id: string
+  url: string | null
+  amount_total: number | null
+  currency: string | null
+  payment_status: string | null
+}
+
 /** Required on cookie-authenticated mutations; the server calls this CSRF. */
 const CSRF_HEADER = 'x-esplp-csrf'
 const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -71,6 +89,19 @@ export function stem(filename: string): string {
   return filename.replace(/\.[^.]+$/, '')
 }
 
+/** Render an amount in minor units (cents) as a currency string. */
+export function formatMoney(cents: number, currency: string): string {
+  const code = currency.toUpperCase()
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: code }).format(
+      cents / 100,
+    )
+  } catch {
+    // Unknown currency code: still better to show a number than to throw.
+    return `${(cents / 100).toFixed(2)} ${code}`
+  }
+}
+
 export const api = {
   createPrefix: (uuid?: string): Promise<Prefix> =>
     req<Prefix>('/api/prefixes', {
@@ -83,9 +114,6 @@ export const api = {
 
   listCards: (p: string): Promise<CardIndex> =>
     req<CardIndex>(`/api/prefixes/${p}/cards`),
-
-  submitPrefix: (p: string): Promise<Prefix> =>
-    req<Prefix>(`/api/prefixes/${p}/submit`, { method: 'POST' }),
 
   patchCard: (p: string, id: number, patch: CardPatch): Promise<Card> =>
     req<Card>(`/api/prefixes/${p}/cards/${id}`, {
@@ -107,11 +135,22 @@ export const api = {
 
   cardImageUrl: (p: string, id: number): string =>
     `/api/prefixes/${p}/cards/${id}/image`,
+
+  /** Price and currency, so the UI can show a total before sending anyone to Stripe. */
+  shopConfig: (): Promise<ShopConfig> => req<ShopConfig>('/api/shop/config'),
+
+  /**
+   * Open a Stripe Checkout session. Nothing is paid by this call: the caller
+   * redirects the browser to `url`, and the prefix only becomes `paid` once
+   * Stripe's webhook reaches the server.
+   */
+  startCheckout: (p: string): Promise<CheckoutSession> =>
+    req<CheckoutSession>(`/api/prefixes/${p}/checkout`, { method: 'POST' }),
 }
 
 export const STATUSES: PrefixStatus[] = [
   'draft',
-  'submitted',
+  'payment_pending',
   'paid',
   'queued',
   'printing',

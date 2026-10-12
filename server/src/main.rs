@@ -3,6 +3,7 @@ mod db;
 mod error;
 mod models;
 mod routes;
+mod stripe;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,6 +28,8 @@ pub struct AppState {
     /// Force `Secure` on the session cookie. `None` = infer per request from
     /// `X-Forwarded-Proto`, which is what you want behind a TLS proxy.
     pub cookie_secure: Option<bool>,
+    /// Payment integration. `None` disables checkout and the webhook (503).
+    pub stripe: Option<Arc<stripe::Stripe>>,
 }
 
 /// Declares the bearer scheme so Swagger UI offers an Authorize button and
@@ -81,7 +84,6 @@ impl utoipa::Modify for SecurityAddon {
         routes::get_prefix,
         routes::delete_prefix,
         routes::delete_cards,
-        routes::submit_prefix,
         routes::patch_status,
         routes::list_cards,
         routes::put_card,
@@ -93,6 +95,9 @@ impl utoipa::Modify for SecurityAddon {
         routes::admin_login,
         routes::admin_session,
         routes::admin_logout,
+        routes::shop_config,
+        routes::create_checkout,
+        routes::stripe_webhook,
     ),
     components(schemas(
         models::Prefix,
@@ -105,6 +110,8 @@ impl utoipa::Modify for SecurityAddon {
         models::CardPatch,
         models::AdminLogin,
         models::AdminSession,
+        models::ShopConfig,
+        stripe::CheckoutSession,
         error::ErrorBody,
     ))
 )]
@@ -152,12 +159,21 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         });
 
+    // Payment. Unset or blank STRIPE_SECRET_KEY switches checkout and the
+    // webhook off — they answer 503 — rather than leaving a half-configured
+    // payment path that looks like it works.
+    let stripe = stripe::Stripe::from_env().map(Arc::new);
+    if stripe.is_none() {
+        tracing::info!("STRIPE_SECRET_KEY is not set: the shop endpoints will answer 503");
+    }
+
     let state = AppState {
         pool,
         data_dir: Arc::new(data_dir),
         admin_token,
         sessions: auth::Sessions::new(),
         cookie_secure,
+        stripe,
     };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be

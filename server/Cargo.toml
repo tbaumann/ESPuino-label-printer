@@ -19,3 +19,14 @@ utoipa = { version = "4", features = ["uuid"] }
 utoipa-swagger-ui = { version = "7", features = ["axum", "vendored"] }
 thiserror = "1"
 anyhow = "1"
+# Stripe is talked to directly rather than through an SDK: we need exactly one
+# API call plus one HMAC check, so this is less code and a much smaller
+# dependency tree than a full API binding.
+#
+# Features are opt-in rather than default: the default set turns on HTTP/2,
+# which makes `h2` a hard dependency and drags in a second, incompatible HTTP
+# stack next to axum's. Stripe speaks HTTP/1.1 perfectly well.
+# TLS is native-tls (openssl), which the flake already provides.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
