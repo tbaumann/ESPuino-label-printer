@@ -27,9 +27,13 @@ plus `DOMPurify` (`web/src/lib/backText.ts`), no hand-rolled parser.
     No raw HTML passthrough — a `<script>` in the markdown is stripped.
   - **Two renderers have to agree**, or the guarantee is worse than no preview:
     the SPA preview the customer approves, and the server-side renderer the
-    print queue needs (see "Also outstanding"). Same subset, or the card comes
-    out different from what was ordered. The subset contract lives in the doc
-    comment of `web/src/lib/backText.ts`; the server renderer must match it.
+    print queue uses. Same subset, or the card comes out different from what was
+    ordered. The subset contract lives in the doc comment of
+    `web/src/lib/backText.ts` (SPA, marked + DOMPurify) and `server/src/backtext.rs`
+    (print queue, pulldown-cmark + our own writer); the smoke test renders the
+    same markdown through both and asserts the print queue's rendering is the one
+    previewed. `PrintQueueCard.back_html` is that render — the spooler prints it
+    instead of re-rendering the markdown itself.
   - The medium is 1-bit black: no colour, no greys. Images in the markdown are
     **refused outright** (the whole construct is dropped, alt text included).
     The supported subset is small: headings, bold, italic and lists. Links are
@@ -264,7 +268,11 @@ To settle when it is built:
   `LoginLimiter` (5 misses / 15 min → 15 min lockout, in-memory) gates both the
   login endpoint and the bearer path in `auth::resolve`; a locked-out key
   answers 429. Keyed on `X-Forwarded-For`/`X-Real-Ip`.
-- Server-side render of the black-only card back (client-side preview only so
-  far) — needed by the print queue, and per print mode.
+- Server-side render of the black-only card back. **Done** —
+  `server/src/backtext.rs` (pulldown-cmark) renders `back_text` into the same
+  sanitised subset the SPA preview shows, and the print queue carries it as
+  `PrintQueueCard.back_html`, per print mode (only `color_front_black_back` has
+  a black back, so it is `None` everywhere else). Rasterising that HTML to the
+  printer's 1-bit K plane is still the spooler's job.
 - Admin sessions live in memory, so a restart logs the operator out. Fine for
   now; move to a table if that becomes annoying.
