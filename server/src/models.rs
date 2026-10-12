@@ -90,6 +90,60 @@ impl std::fmt::Display for PrefixStatus {
     }
 }
 
+/// The ribbon-pass scheme a prefix is printed with, and therefore what a card
+/// is allowed to carry on its back side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrintMode {
+    /// YMCKO, one panel set per card. Front image only — a card in this mode
+    /// has no back at all (no back_text, no back image).
+    SingleSided,
+    /// YMCKO, two panel sets per card. Colour front AND colour back; the back
+    /// is an uploaded image, not text.
+    DoubleSidedColor,
+    /// YMCKOKO. Colour front, black-only back rendered from markdown
+    /// (`back_text`). The default, matching every pre-existing row.
+    ColorFrontBlackBack,
+}
+
+impl PrintMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleSided => "single_sided",
+            Self::DoubleSidedColor => "double_sided_color",
+            Self::ColorFrontBlackBack => "color_front_black_back",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "single_sided" => Self::SingleSided,
+            "double_sided_color" => Self::DoubleSidedColor,
+            "color_front_black_back" => Self::ColorFrontBlackBack,
+            _ => return None,
+        })
+    }
+
+    /// Whether the black-only `back_text` (markdown) is a valid field for this
+    /// mode. Only the black-back mode renders it; everywhere else it would be
+    /// silently meaningless, so the API rejects it.
+    pub fn allows_back_text(self) -> bool {
+        matches!(self, Self::ColorFrontBlackBack)
+    }
+
+    /// Whether an uploaded colour back image is a valid (and, in double-sided
+    /// colour, required) field for this mode.
+    pub fn allows_back_image(self) -> bool {
+        matches!(self, Self::DoubleSidedColor)
+    }
+}
+
+impl std::fmt::Display for PrintMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A prefix groups one customer's set of cards (one order / label batch).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Prefix {
@@ -98,6 +152,9 @@ pub struct Prefix {
     pub status: PrefixStatus,
     /// When the status last changed.
     pub status_changed_at: Option<String>,
+    /// The ribbon-pass scheme this order is printed with; governs what a card
+    /// may carry on its back. Defaults to `color_front_black_back`.
+    pub print_mode: PrintMode,
     /// External shop/order reference, typically set when the order is paid.
     pub order_ref: Option<String>,
     /// Number of cards currently stored under this prefix.
@@ -119,6 +176,11 @@ pub struct Card {
     /// Black & white only back-side text (half panel, saves ribbon).
     pub back_text: Option<String>,
     pub image_content_type: String,
+    /// Non-None only when this card has an uploaded colour back image
+    /// (`double_sided_color` mode). Never serialized from the path; this holds
+    /// the stored content-type purely as the signal that a back image exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back_image_content_type: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// When the printer confirmed this card was ejected. Operator-only state
@@ -162,18 +224,33 @@ pub struct CardIndex {
 /// Fields accepted when creating/updating a card (image is sent separately
 /// as a multipart file part named "image"). Documents the multipart form for
 /// OpenAPI; the handler parses the fields directly.
+///
+/// `back_text` is only valid in `color_front_black_back` mode; a `back_image`
+/// file part is only valid (and, there, required) in `double_sided_color` mode.
+/// The handler rejects a back field that does not fit the prefix's mode rather
+/// than silently storing it.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct CardInput {
     pub name: String,
     pub serial_number: Option<String>,
     pub back_text: Option<String>,
+    pub back_image: Option<String>,
 }
 
 /// Body for creating a prefix. If `uuid` is omitted the server assigns one.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PrefixInput {
     pub uuid: Option<Uuid>,
+    /// Ribbon-pass scheme. Omitted (or null) means the default
+    /// `color_front_black_back`.
+    pub print_mode: Option<PrintMode>,
+}
+
+/// Body for changing a prefix's print mode while it is still writable.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PrefixModePatch {
+    pub print_mode: PrintMode,
 }
 
 /// Metadata-only card update (no image re-upload). Omitted fields are left

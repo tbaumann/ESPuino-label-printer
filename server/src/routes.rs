@@ -12,8 +12,8 @@ use crate::auth;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{
-    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixStatus,
-    PrintQueue, ShopConfig, StatusInput,
+    AdminLogin, AdminSession, Card, CardIndex, CardPatch, Prefix, PrefixInput, PrefixModePatch,
+    PrefixStatus, PrintMode, PrintQueue, ShopConfig, StatusInput,
 };
 use crate::stripe;
 use crate::AppState;
@@ -50,18 +50,52 @@ fn content_type_for(ext: &str) -> &'static str {
     }
 }
 
-/// Pull `name`, `serial_number`, `back_text` and an `image` file out of a
-/// multipart form, writing the image under the data dir.
+/// Write an image blob under `blobs/{prefix}/`, replacing any earlier blob for
+/// the same filename (e.g. a re-upload as jpg over a stored png). `filename`
+/// is the full file name, e.g. `"3.png"` (front) or `"3-back.png"` (back).
+/// Returns the blob's path relative to the data dir, as stored in the DB.
+fn write_blob(data_dir: &PathBuf, prefix: Uuid, filename: &str, bytes: &[u8]) -> Result<String, ApiError> {
+    let rel = format!("blobs/{prefix}/{filename}");
+    let abs = data_dir.join(&rel);
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+        // Match by bare name prefix (e.g. "3-"), so re-uploading a front image
+        // can delete the old front `3.png` without touching the back `3-back.png`
+        // (which starts with a different prefix), and vice versa.
+        let keep = abs.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let name_prefix = filename
+            .split_once('.')
+            .map(|(stem, _)| format!("{stem}."))
+            .unwrap_or_default();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                if fname.starts_with(&name_prefix) && fname != keep {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    std::fs::write(&abs, bytes)?;
+    Ok(rel)
+}
+
+/// Pull `name`, `serial_number`, `back_text`, an `image` file and an optional
+/// `back_image` file out of a multipart form, validating the back fields
+/// against the prefix's `print_mode` *before* writing anything to disk.
 async fn store_card_form(
     mut mp: Multipart,
     data_dir: &PathBuf,
     prefix: Uuid,
     id: i64,
-) -> Result<(String, Option<String>, Option<String>, String, String), ApiError> {
+    mode: PrintMode,
+) -> Result<(String, Option<String>, Option<String>, String, String, Option<String>, Option<String>), ApiError> {
     let mut name: Option<String> = None;
     let mut serial: Option<String> = None;
     let mut back: Option<String> = None;
     let mut image: Option<(Vec<u8>, String)> = None;
+    let mut back_image: Option<(Vec<u8>, String)> = None;
 
     while let Some(field) = mp
         .next_field()
@@ -106,6 +140,17 @@ async fn store_card_form(
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 image = Some((bytes.to_vec(), ct));
             }
+            Some("back_image") => {
+                let ct = field
+                    .content_type()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                back_image = Some((bytes.to_vec(), ct));
+            }
             _ => {}
         }
     }
@@ -117,27 +162,43 @@ async fn store_card_form(
         return Err(ApiError::BadRequest("image is empty".into()));
     }
 
-    let rel = format!("blobs/{}/{}.{}", prefix, id, extension_for(&ct));
-    let abs = data_dir.join(&rel);
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent)?;
-        // Drop any previous blob for this card with a different extension,
-        // e.g. when a card is re-uploaded as jpg over an existing png.
-        let keep = abs.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-        let id_prefix = format!("{id}.");
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name();
-                let fname = fname.to_string_lossy();
-                if fname.starts_with(&id_prefix) && fname != keep {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
+    // Back side validity is fixed by the prefix's print mode. Reject rather
+    // than silently store a field the mode will never render.
+    if back.is_some() && !mode.allows_back_text() {
+        return Err(ApiError::BadRequest(format!(
+            "back_text is only valid in a colour_front_black_back prefix, not {mode}"
+        )));
     }
-    std::fs::write(&abs, &bytes)?;
+    if mode.allows_back_image() {
+        let Some((_, bct)) = &back_image else {
+            return Err(ApiError::BadRequest(
+                "a double_sided_color prefix requires a back_image on every card".into(),
+            ));
+        };
+        if bct.is_empty() {
+            return Err(ApiError::BadRequest("back_image is empty".into()));
+        }
+    } else if back_image.is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "a back_image is only valid in a double_sided_color prefix, not {mode}"
+        )));
+    }
 
-    Ok((name, serial, back, rel, ct))
+    let image_rel = write_blob(data_dir, prefix, &format!("{id}.{}", extension_for(&ct)), &bytes)?;
+    let (back_rel, back_ct) = match back_image {
+        Some((bbytes, bct)) => {
+            let rel = write_blob(
+                data_dir,
+                prefix,
+                &format!("{id}-back.{}", extension_for(&bct)),
+                &bbytes,
+            )?;
+            (Some(rel), Some(bct))
+        }
+        None => (None, None),
+    };
+
+    Ok((name, serial, back, image_rel, ct, back_rel, back_ct))
 }
 
 /// Create a prefix, optionally choosing its uuid.
@@ -150,7 +211,7 @@ pub async fn create_prefix(
     State(st): State<AppState>,
     Json(input): Json<PrefixInput>,
 ) -> Result<(StatusCode, Json<Prefix>), ApiError> {
-    let p = db::create_prefix(&st.pool, input.uuid).await?;
+    let p = db::create_prefix(&st.pool, input.uuid, input.print_mode).await?;
     Ok((StatusCode::CREATED, Json(p)))
 }
 
@@ -228,8 +289,11 @@ pub async fn put_card(
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await;
-    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+        .await?
+        .print_mode;
+    let (name, serial, back, rel, ct, back_rel, back_ct) =
+        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -239,6 +303,8 @@ pub async fn put_card(
         back.as_deref(),
         &rel,
         &ct,
+        back_rel.as_deref(),
+        back_ct.as_deref(),
     )
     .await?;
     Ok(Json(card))
@@ -259,9 +325,12 @@ pub async fn post_card(
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await;
-    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+        .await?
+        .print_mode;
     let id = db::next_card_id(&st.pool, prefix).await?;
-    let (name, serial, back, rel, ct) = store_card_form(mp, &st.data_dir, prefix, id).await?;
+    let (name, serial, back, rel, ct, back_rel, back_ct) =
+        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
     let card = db::upsert_card(
         &st.pool,
         prefix,
@@ -271,6 +340,8 @@ pub async fn post_card(
         back.as_deref(),
         &rel,
         &ct,
+        back_rel.as_deref(),
+        back_ct.as_deref(),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(card)))
@@ -312,6 +383,59 @@ pub async fn get_card_image(
         .into_response())
 }
 
+/// Fetch a card's colour back image bytes (only present in `double_sided_color`).
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/back-image", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
+pub async fn get_card_back_image(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    let Some(ct) = &card.back_image_content_type else {
+        return Err(ApiError::NotFound(format!(
+            "back image for card {id} in prefix {prefix} has never been uploaded"
+        )));
+    };
+    let ext = extension_for(ct);
+    let rel = format!("blobs/{prefix}/{id}-back.{ext}");
+    let bytes = std::fs::read(st.data_dir.join(&rel))
+        .map_err(|_| ApiError::NotFound(format!("back image for card {id}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type_for(ext)),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Change a prefix's print mode while it is still writable.
+#[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    request_body = PrefixModePatch,
+    responses(
+        (status = 200, body = Prefix),
+        (status = 400, body = crate::error::ErrorBody),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+    ))]
+pub async fn patch_prefix_mode(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+    Json(input): Json<PrefixModePatch>,
+) -> Result<Json<Prefix>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers).await;
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    Ok(Json(
+        db::set_prefix_mode(&st.pool, prefix, input.print_mode).await?,
+    ))
+}
+
 /// Delete a card (metadata + image).
 #[utoipa::path(delete, path = "/api/prefixes/{prefix}/cards/{id}", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
@@ -333,6 +457,10 @@ pub async fn delete_card(
         extension_for(&card.image_content_type)
     );
     let _ = std::fs::remove_file(st.data_dir.join(&rel));
+    if let Some(ct) = &card.back_image_content_type {
+        let back_rel = format!("blobs/{prefix}/{id}-back.{}", extension_for(ct));
+        let _ = std::fs::remove_file(st.data_dir.join(&back_rel));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -855,7 +983,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/prefixes/:prefix",
-            axum::routing::get(get_prefix).delete(delete_prefix),
+            axum::routing::get(get_prefix)
+                .delete(delete_prefix)
+                .patch(patch_prefix_mode),
         )
         // Kept as an explicit tombstone rather than deleted, so a stale client
         // gets a 410 with a reason instead of a 405 from the static fallback.
@@ -883,6 +1013,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/prefixes/:prefix/cards/:id/image",
             axum::routing::get(get_card_image),
+        )
+        .route(
+            "/api/prefixes/:prefix/cards/:id/back-image",
+            axum::routing::get(get_card_back_image),
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/printed",
