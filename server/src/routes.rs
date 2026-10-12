@@ -455,7 +455,7 @@ pub async fn patch_prefix_mode(
     Json(input): Json<PrefixModePatch>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    let caller = auth::resolve(&st, &headers).await;
+    let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     Ok(Json(
         db::set_prefix_mode(&st.pool, prefix, input.print_mode).await?,
