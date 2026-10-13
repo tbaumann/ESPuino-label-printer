@@ -4,6 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::backtext;
 use crate::error::ApiError;
 use crate::models::{
     Card, CardPatch, ModePrice, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus,
@@ -562,8 +563,13 @@ pub async fn mark_card_printed(pool: &SqlitePool, prefix: Uuid, id: i64) -> Resu
 /// half-finished order that can be picked up where it left off.
 pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, ApiError> {
     let p = get_prefix(pool, prefix).await?;
+    // The spooler prints the mode that was paid for, not the prefix's current
+    // one — an operator changing the mode after payment must not change what
+    // gets printed. Prefixes never priced through checkout fall back to the
+    // current mode.
+    let print_mode = p.paid_print_mode.unwrap_or(p.print_mode);
     let rows = sqlx::query(
-        "SELECT id, name, printed_at FROM cards
+        "SELECT id, name, printed_at, back_text FROM cards
           WHERE prefix_uuid = ?1 ORDER BY id ASC",
     )
     .bind(prefix.to_string())
@@ -571,19 +577,25 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
     .await?;
     let cards = rows
         .iter()
-        .map(|r| PrintQueueCard {
-            id: r.get("id"),
-            name: r.get("name"),
-            printed_at: r.get("printed_at"),
+        .map(|r| {
+            let back_text: Option<String> = r.get("back_text");
+            PrintQueueCard {
+                id: r.get("id"),
+                name: r.get("name"),
+                printed_at: r.get("printed_at"),
+                // Only the black-back mode has a back rendered from markdown.
+                // Every other mode has no black back at all, so there is
+                // nothing for the spooler to print there.
+                back_html: if print_mode.allows_back_text() {
+                    back_text.map(|md| backtext::render_back_text(&md))
+                } else {
+                    None
+                },
+            }
         })
         .collect::<Vec<_>>();
     let unprinted_count = cards.iter().filter(|c| c.printed_at.is_none()).count() as i64;
     let resume = p.status == PrefixStatus::Printing && unprinted_count > 0;
-    // The spooler prints the mode that was paid for, not the prefix's current
-    // one — an operator changing the mode after payment must not change what
-    // gets printed. Prefixes never priced through checkout fall back to the
-    // current mode.
-    let print_mode = p.paid_print_mode.unwrap_or(p.print_mode);
     Ok(PrintQueue {
         prefix,
         status: p.status,
@@ -1171,6 +1183,7 @@ mod tests {
         assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
     }
 
+
     #[tokio::test]
     async fn a_notification_claim_is_won_once() {
         let pool = test_pool().await;
@@ -1261,4 +1274,60 @@ mod tests {
         .await
         .expect("reclaim"));
     }
+
+    #[tokio::test]
+    async fn print_queue_renders_the_black_back_per_mode() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::ColorFrontBlackBack))
+            .await
+            .expect("create");
+        upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "card",
+            None,
+            Some("# Title\n\n**bold**\n"),
+            "blobs/1.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        upsert_card(
+            &pool,
+            p.uuid,
+            2,
+            "no back",
+            None,
+            None,
+            "blobs/2.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.print_mode, PrintMode::ColorFrontBlackBack);
+        // The queue hands the spooler the *rendered* back, not the markdown.
+        assert_eq!(
+            q.cards[0].back_html.as_deref(),
+            Some("<h1>Title</h1>\n<p><strong>bold</strong></p>\n")
+        );
+        // A card with no back text has nothing to print on the back.
+        assert!(q.cards[1].back_html.is_none());
+
+        // Priced — and therefore printed — as a mode with no black back: the
+        // render is dropped even though the stored back_text is still there.
+        set_paid_print_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect("freeze");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
+        assert!(q.cards[0].back_html.is_none());
+    }
+
 }

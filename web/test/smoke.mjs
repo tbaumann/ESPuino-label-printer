@@ -43,6 +43,31 @@ function check(name, cond, detail = '') {
   console.log(`  ${mark} ${name}${detail ? ` — ${detail}` : ''}`)
 }
 
+/** Canonical structural form of an HTML fragment: tags by name, text with
+ * whitespace collapsed. Insignificant whitespace between tags is dropped, so
+ * the SPA renderer and the server renderer are compared on the tag structure
+ * and the text, which is what the card is, not on pretty-printing. */
+function canonHtml(html) {
+  const host = document.createElement('div')
+  host.innerHTML = html
+  const out = []
+  const walk = (n) => {
+    for (const c of n.childNodes) {
+      if (c.nodeType === 3) {
+        const t = c.textContent.replace(/\s+/g, ' ').trim()
+        if (t) out.push(`#${t}`)
+      } else if (c.nodeType === 1) {
+        const tag = c.tagName.toLowerCase()
+        out.push(`<${tag}>`)
+        walk(c)
+        out.push(`</${tag}>`)
+      }
+    }
+  }
+  walk(host)
+  return out.join(' ')
+}
+
 /** Mount the bundle in a fresh jsdom at `path` (busts the module cache each time). */
 async function mount(path, { bust }) {
   const dom = new JSDOM('<!doctype html><html><body><div id="app"></div></body></html>', {
@@ -204,6 +229,14 @@ console.log('\nB. project page renders a card')
       '![img](https://example.com/x.png)',
       '',
       '<script>alert(1)</script>',
+      '',
+      // GFM and raw HTML: not in the subset. Both renderers have to treat them
+      // the same way or the preview promises a card the print does not deliver:
+      // `~~x~~` stays literal (no strikethrough is parsed) and an HTML block is
+      // dropped with its text (no DOMPurify-only "keep the content").
+      '~~struck~~',
+      '',
+      '<div>blocked</div>',
     ].join('\n')
     const fd = new NodeFormData()
     fd.append('name', 'MD Card')
@@ -221,6 +254,25 @@ console.log('\nB. project page renders a card')
     check('link is plain text, no <a>', !/<a\b/.test(html) && /link/.test(html))
     check('image is refused', !/<img\b/.test(html))
     check('raw HTML is stripped', !/<script\b/.test(html) && !/alert\(1\)/.test(html))
+    // Neither side parses GFM...
+    check('gfm strikethrough stays literal',
+      html.includes('~~struck~~') && !/<del\b/.test(html), html)
+    // ...and raw HTML goes whole, text included, not tag-only as DOMPurify
+    // alone would do it.
+    check('an HTML block is dropped with its text',
+      !/<div\b/.test(html) && !html.includes('blocked'), html)
+
+    // Two renderers have to agree: the preview above, and the server-side render
+    // the print queue carries (server/src/backtext.rs). Same markdown, same card
+    // — assert the print queue's rendering is the one just previewed.
+    const queue = await api(`/api/prefixes/${mdPrefix}/print-queue`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    })
+    const printed = queue.cards[0]?.back_html ?? ''
+    check('print queue carries the rendered black back', /<h1>Title<\/h1>/.test(printed), printed)
+    check('server render matches the SPA preview', canonHtml(printed) === canonHtml(html),
+      `queue: ${canonHtml(printed)}`)
+    check('the printed back refuses the image too', !/<img\b/.test(printed))
   }
 
   // ---- scenario C: the auth boundary, then a frozen project ---------------

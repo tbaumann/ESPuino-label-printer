@@ -251,6 +251,16 @@ pub struct PrintQueueCard {
     pub id: i64,
     pub name: String,
     pub printed_at: Option<String>,
+    /// The black-only back, rendered server-side from the card's markdown
+    /// `back_text` into the sanitised subset the SPA preview shows
+    /// ([`crate::backtext::render_back_text`]). The spooler prints *this*, so
+    /// the back that comes out is the one the customer approved.
+    ///
+    /// Only `color_front_black_back` has a black back at all, so this is `None`
+    /// in the other modes (where `back_text` is refused by the API and cannot be
+    /// set anyway) and for a black-back card whose `back_text` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back_html: Option<String>,
 }
 
 /// The print queue for one prefix: its cards ordered explicitly by id, with
