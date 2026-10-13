@@ -128,9 +128,11 @@ covers payment properly.
 
 Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
 *is* the prefix. Use "Open" to return to an existing project code; recent
-projects are remembered in `localStorage`. A project page holds the drop zone
-(drag images, or a whole folder) and one row per card: front and back preview
-panes, name, serial number, back text, and delete.
+projects are remembered in `localStorage`. A project page holds the print-option
+chooser (one radio per print mode, with its price; a mode whose ribbon is out of
+stock is shown greyed out and disabled, never removed), the drop zone (drag
+images, or a whole folder) and one row per card: front and back preview panes,
+name, serial number, back text, and delete.
 
 Front and back previews are rendered **client-side** — the front is the stored
 image, the back is `back_text` laid out in a CR80-aspect panel. The server
@@ -224,7 +226,10 @@ line.
 4. set `PUBLIC_BASE_URL` to the public origin, e.g. `https://cards.example.com`
    — that is where Stripe sends the customer back;
 5. set the price: per-mode card prices live in the database (`mode_prices`,
-   seeded at 500 cents each), plus `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`;
+   seeded at 500 cents each), plus `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`.
+   Taking a ribbon out of stock is the same kind of database state
+   (`ribbon_stock`, both ribbons seeded in stock), flipped through
+   `PUT /api/shop/ribbons/{ribbon}` with the operator token;
 6. only then switch to live keys.
 
 During local development the Stripe CLI replaces steps 2–3:
@@ -305,6 +310,16 @@ data/
   opens, the mode is snapshotted onto the prefix (`paid_print_mode`), so the
   spooler prints the mode the customer paid for even if the operator later
   changes the prefix's mode.
+- **Ribbon availability** — two stock flags in the database (`ribbon_stock`,
+  `ymcko` and `ymckoko`, both seeded in stock), because availability is a
+  property of the *ribbon*, not of the mode: single-sided and double-sided
+  colour both run on YMCKO, so they go out of stock together, while the
+  black-back mode (YMCKOKO) is independent. The shop config serves both flags
+  and, for each mode, the derived `available`; the customer UI renders an
+  unavailable mode **disabled rather than absent**, and the checkout refuses it
+  with `409` — a stock flag that only greys out a radio button would still sell
+  a card that cannot be printed. Nothing is reconciled for a prefix that was
+  already priced for a mode whose ribbon has since run out.
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
   `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
   the back side carries depends on the prefix's `print_mode`: black-back mode
@@ -430,7 +445,8 @@ an admin session.
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | colour back image bytes (double_sided_color only) |
-| GET    | `/api/shop/config`                     | price, currency, and whether payment is on |
+| GET    | `/api/shop/config`                     | price, currency, ribbon availability, and whether payment is on |
+| PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
 | POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |
 | POST   | `/api/admin/session`                   | log in: token → session cookie |

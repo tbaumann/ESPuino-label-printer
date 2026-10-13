@@ -14,8 +14,8 @@ use crate::db;
 use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, Card, CardIndex, CardPatch, NeedsAttentionItem, NeedsAttentionKind,
-    Prefix, PrefixInput, PrefixModePatch, PrefixStatus, PrintMode, PrintQueue, ShopConfig,
-    StatusInput,
+    Prefix, PrefixInput, PrefixModePatch, PrefixStatus, PrintMode, PrintQueue, Ribbon, RibbonStock,
+    RibbonStockPatch, ShopConfig, StatusInput,
 };
 use crate::stripe;
 use crate::AppState;
@@ -846,17 +846,24 @@ fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
-/// Public shop settings: price, currency, and whether payment works at all.
-/// The customer UI needs this to show a total before sending anyone to Stripe.
+/// Public shop settings: price, currency, ribbon availability, and whether
+/// payment works at all. The customer UI needs this to show a total — and which
+/// print modes can actually be ordered — before sending anyone to Stripe.
+///
+/// Each mode carries an `available` flag, and the two ribbon stock flags behind
+/// it are served as well. An out-of-stock mode stays in the list rather than
+/// disappearing, so the customer sees that the option exists and is out.
 #[utoipa::path(get, path = "/api/shop/config", tag = "shop",
     responses((status = 200, body = ShopConfig)))]
 pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>, ApiError> {
     let prices = db::list_mode_prices(&st.pool).await?;
+    let ribbons = db::list_ribbon_stock(&st.pool).await?;
     let body = match st.stripe.as_deref() {
         None => ShopConfig {
             enabled: false,
             currency: "eur".into(),
             prices,
+            ribbons,
             shipping_cents: 0,
             countries: vec![],
         },
@@ -866,12 +873,65 @@ pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>,
                 enabled: true,
                 currency: p.currency.clone(),
                 prices,
+                ribbons,
                 shipping_cents: p.shipping_cents,
                 countries: p.countries.clone(),
             }
         }
     };
     Ok(Json(body))
+}
+
+/// Set one ribbon's stock flag. **Admin only.**
+///
+/// This is the operator's "the ribbon ran out" switch: flipping it takes every
+/// mode that prints with that ribbon out of the shop, and the shop config
+/// immediately reports those modes as unavailable. YMCKO covers both
+/// single-sided and double-sided colour, so one flag moves both.
+#[utoipa::path(put, path = "/api/shop/ribbons/{ribbon}", tag = "shop",
+    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckoko")),
+    request_body = RibbonStockPatch,
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, body = RibbonStock),
+        (status = 400, description = "unknown ribbon", body = crate::error::ErrorBody),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
+pub async fn put_ribbon_stock(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(ribbon): Path<String>,
+    Json(input): Json<RibbonStockPatch>,
+) -> Result<Json<RibbonStock>, ApiError> {
+    auth::resolve(&st, &headers).await?.require_admin()?;
+    let ribbon = Ribbon::parse(&ribbon)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown ribbon: {ribbon}")))?;
+    tracing::info!(%ribbon, in_stock = input.in_stock, "ribbon stock flag set");
+    Ok(Json(db::set_ribbon_stock(&st.pool, ribbon, input.in_stock).await?))
+}
+
+/// Refuse to sell a card that cannot be printed.
+///
+/// A mode whose ribbon is out of stock is not orderable, however the customer
+/// got to it: a page rendered before the ribbon ran out, or a direct API call.
+/// The UI already renders such a mode disabled — this is the same rule at the
+/// layer that takes the money, which is where it has to hold.
+///
+/// What it deliberately does *not* do is reconcile anything: a prefix already
+/// priced for a mode whose ribbon has since run out is neither repriced,
+/// refunded nor flagged — it simply cannot open a *new* session until the
+/// ribbon is back. Sorting those out is a background, by-hand matter, and the
+/// gate is kept to the one question it can answer cleanly: may this be sold
+/// right now.
+async fn ensure_mode_orderable(pool: &SqlitePool, mode: PrintMode) -> Result<(), ApiError> {
+    let ribbon = mode.ribbon();
+    if !db::ribbon_in_stock(pool, ribbon).await? {
+        return Err(ApiError::Conflict(format!(
+            "print mode '{mode}' is unavailable: the {ribbon} ribbon is out of stock"
+        )));
+    }
+    Ok(())
 }
 
 /// Start a Stripe Checkout session for a prefix and return where to send the
@@ -894,7 +954,7 @@ pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>,
         (status = 200, body = stripe::CheckoutSession),
         (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
-        (status = 409, description = "the prefix has no cards, or is already past payment", body = crate::error::ErrorBody),
+        (status = 409, description = "the prefix has no cards, is already past payment, or its print mode's ribbon is out of stock", body = crate::error::ErrorBody),
         (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
         (status = 502, description = "Stripe refused or could not be reached", body = crate::error::ErrorBody)
     ))]
@@ -933,6 +993,8 @@ pub async fn create_checkout(
             "prefix {prefix} has no cards, so there is nothing to print"
         )));
     }
+
+    ensure_mode_orderable(&st.pool, p.print_mode).await?;
 
     // The price is the mode's, looked up from the database — not a single
     // environment-wide per-card figure. A mode with no configured price is a
@@ -1316,6 +1378,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/shop/config", axum::routing::get(shop_config))
         .route(
+            "/api/shop/ribbons/:ribbon",
+            axum::routing::put(put_ribbon_stock),
+        )
+        .route(
             "/api/prefixes/:prefix/checkout",
             axum::routing::post(create_checkout),
         )
@@ -1604,6 +1670,133 @@ mod tests {
             login_limiter: crate::auth::LoginLimiter::default(),
             checkout_limiter: limiter,
         }
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_a_mode_whose_ribbon_is_out_of_stock() {
+        let pool = test_pool().await;
+        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymcko, false)
+            .await
+            .unwrap();
+
+        // Both YMCKO modes go: one stock flag, two modes.
+        for mode in [PrintMode::SingleSided, PrintMode::DoubleSidedColor] {
+            let err = ensure_mode_orderable(&pool, mode)
+                .await
+                .expect_err("an out-of-stock ribbon must refuse the sale");
+            assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
+            assert!(err.to_string().contains("ymcko"), "{err}");
+        }
+        // The other ribbon is untouched, so the black-back mode still sells.
+        ensure_mode_orderable(&pool, PrintMode::ColorFrontBlackBack)
+            .await
+            .expect("YMCKOKO is still in stock");
+
+        // Restocking reopens the sale, with no state to reset.
+        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymcko, true)
+            .await
+            .unwrap();
+        ensure_mode_orderable(&pool, PrintMode::DoubleSidedColor)
+            .await
+            .expect("restocked");
+    }
+
+    #[tokio::test]
+    async fn shop_config_serves_both_stock_flags_and_derives_availability() {
+        let pool = test_pool().await;
+        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymckoko, false)
+            .await
+            .unwrap();
+        let Json(config) = shop_config(State(state_with(
+            rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+            pool,
+        )))
+        .await
+        .expect("shop config");
+
+        // Two flags, not three, and both are served.
+        assert_eq!(config.ribbons.len(), 2);
+        assert!(config
+            .ribbons
+            .iter()
+            .any(|r| r.ribbon == crate::models::Ribbon::Ymcko && r.in_stock));
+        assert!(config
+            .ribbons
+            .iter()
+            .any(|r| r.ribbon == crate::models::Ribbon::Ymckoko && !r.in_stock));
+
+        // Every mode is still offered — an out-of-stock one is disabled in the
+        // UI, never dropped from the list.
+        assert_eq!(config.prices.len(), 3);
+        assert!(config
+            .prices
+            .iter()
+            .all(|p| p.available == (p.print_mode != PrintMode::ColorFrontBlackBack)));
+    }
+
+    #[tokio::test]
+    async fn ribbon_stock_is_admin_only() {
+        let pool = test_pool().await;
+        // No ADMIN_TOKEN configured: the admin API is off, so this is a 503
+        // rather than a silent success.
+        let st = state_with(
+            rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+            pool.clone(),
+        );
+        let off = put_ribbon_stock(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path("ymcko".to_string()),
+            Json(crate::models::RibbonStockPatch { in_stock: false }),
+        )
+        .await
+        .expect_err("no admin token configured");
+        assert!(matches!(off, ApiError::Unavailable(_)), "got {off:?}");
+
+        // Configured, but the caller presents no credential: 401, and nothing
+        // was written.
+        let mut st = st;
+        st.admin_token = Some(Arc::from("secret"));
+        let denied = put_ribbon_stock(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path("ymcko".to_string()),
+            Json(crate::models::RibbonStockPatch { in_stock: false }),
+        )
+        .await
+        .expect_err("customer call");
+        assert!(matches!(denied, ApiError::Unauthorized(_)), "got {denied:?}");
+        assert!(db::ribbon_in_stock(&pool, crate::models::Ribbon::Ymcko)
+            .await
+            .unwrap());
+
+        // An unknown ribbon is a 400, even for the operator.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        let bad = put_ribbon_stock(
+            State(st.clone()),
+            headers.clone(),
+            Path("ymckokok".to_string()),
+            Json(crate::models::RibbonStockPatch { in_stock: false }),
+        )
+        .await
+        .expect_err("unknown ribbon");
+        assert!(matches!(bad, ApiError::BadRequest(_)), "got {bad:?}");
+
+        // The operator's call lands.
+        let Json(updated) = put_ribbon_stock(
+            State(st),
+            headers,
+            Path("ymcko".to_string()),
+            Json(crate::models::RibbonStockPatch { in_stock: false }),
+        )
+        .await
+        .expect("operator clears the flag");
+        assert_eq!(updated.ribbon, crate::models::Ribbon::Ymcko);
+        assert!(!updated.in_stock);
+        assert!(!db::ribbon_in_stock(&pool, crate::models::Ribbon::Ymcko)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

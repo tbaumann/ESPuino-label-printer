@@ -41,10 +41,24 @@ export interface CardPatch {
   back_text?: string
 }
 
-/** One print mode's price, as the shop config serves it. */
+/** A ribbon the shop prints with. Availability is a property of the ribbon. */
+export type Ribbon = 'ymcko' | 'ymckoko'
+
+/** One ribbon's stock flag, as the shop config serves it. */
+export interface RibbonStock {
+  ribbon: Ribbon
+  in_stock: boolean
+}
+
+/**
+ * One print mode as the shop offers it. `available: false` means the mode's
+ * ribbon is out of stock: the option is rendered disabled, never dropped, so
+ * the customer can see that it exists and is out.
+ */
 export interface ModePrice {
   print_mode: PrintMode
   price_cents: number
+  available: boolean
 }
 
 /** Public shop settings. `enabled: false` means this deployment takes no money. */
@@ -52,9 +66,34 @@ export interface ShopConfig {
   enabled: boolean
   currency: string
   prices: ModePrice[]
+  /** The two stock flags behind `prices[].available` — YMCKO covers both colour modes. */
+  ribbons: RibbonStock[]
   shipping_cents: number
   countries: string[]
 }
+
+/**
+ * Customer-facing names for the print modes, and what each one actually does.
+ * One place, so the chooser, the read-only view and (later) the per-mode
+ * editor cannot drift apart.
+ */
+export const PRINT_MODES: { mode: PrintMode; label: string; summary: string }[] = [
+  {
+    mode: 'color_front_black_back',
+    label: 'Colour front, black back',
+    summary: 'Full-colour front, black-only text on the back. The economic two-sided option.',
+  },
+  {
+    mode: 'double_sided_color',
+    label: 'Double-sided colour',
+    summary: 'Full-colour front and an uploaded colour image on the back. Costs two ribbon panels.',
+  },
+  {
+    mode: 'single_sided',
+    label: 'Single-sided',
+    summary: 'Full-colour front, blank back.',
+  },
+]
 
 /** A Stripe Checkout session, as far as the UI needs to know about it. */
 export interface CheckoutSession {
@@ -141,6 +180,17 @@ export const api = {
     }),
 
   getPrefix: (p: string): Promise<Prefix> => req<Prefix>(`/api/prefixes/${p}`),
+
+  /**
+   * Choose the prefix's print mode. Only allowed while the prefix is still a
+   * draft for the customer — the server answers 409 once it is sealed.
+   */
+  setPrintMode: (p: string, print_mode: PrintMode): Promise<Prefix> =>
+    req<Prefix>(`/api/prefixes/${p}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ print_mode }),
+    }),
 
   listCards: (p: string): Promise<CardIndex> =>
     req<CardIndex>(`/api/prefixes/${p}/cards`),

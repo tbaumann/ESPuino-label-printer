@@ -222,6 +222,66 @@ section.panel {
   margin-bottom: 12px;
 }
 
+/* ---------- print modes ---------- */
+
+/* One option per row. They undo the global `label` rule (small, muted,
+   uppercase) — these are choices to read, not field captions. */
+.modes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  margin-bottom: 0;
+  cursor: pointer;
+}
+
+.mode.selected {
+  border-color: var(--accent);
+}
+
+.mode input[type='radio'] {
+  margin-top: 3px;
+}
+
+.mode:hover:not(.unavailable) {
+  border-color: var(--accent);
+}
+
+/* An out-of-stock mode is disabled, not hidden: the customer sees that the
+   option exists and is out. */
+.mode.unavailable {
+  background: var(--bg);
+  cursor: not-allowed;
+}
+
+.mode.unavailable .mode-body strong {
+  color: var(--muted);
+}
+
+.mode-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mode-body .summary {
+  font-size: 13px;
+}
+
 /* ---------- uploader ---------- */
 
 .dropzone {

@@ -3,9 +3,11 @@
   import {
     api,
     formatMoney,
+    PRINT_MODES,
     rememberProject,
     type Card,
     type Prefix,
+    type PrintMode,
     type ShopConfig,
   } from '../lib/api'
   import { navigate } from '../lib/router'
@@ -52,6 +54,44 @@
         })()
       : null,
   )
+
+  // One row per print mode, in the order the shop offers them, each with its
+  // price and whether its ribbon is currently in stock. An out-of-stock mode
+  // stays in this list — the customer should see that it exists and is out —
+  // and is rendered disabled rather than dropped.
+  //
+  // Without a shop config there is nothing to say about stock, so everything
+  // reads as available; the server is the one that actually refuses, and a
+  // chooser that greyed itself out on a failed fetch would be a lie.
+  const modes = $derived(
+    PRINT_MODES.map((m) => {
+      const price = shop?.prices.find((p) => p.print_mode === m.mode)
+      return {
+        ...m,
+        available: price ? price.available : true,
+        price: price && shop ? formatMoney(price.price_cents, shop.currency) : null,
+      }
+    }),
+  )
+
+  // The mode the prefix is actually set to, so the panel can mark it and warn
+  // when its ribbon is the one that ran out.
+  const chosen = $derived(modes.find((m) => m.mode === prefix?.print_mode) ?? null)
+
+  let choosing = $state<PrintMode | null>(null)
+
+  async function chooseMode(mode: PrintMode) {
+    if (!prefix || mode === prefix.print_mode) return
+    choosing = mode
+    error = null
+    try {
+      prefix = await api.setPrintMode(uuid, mode)
+    } catch (e) {
+      error = (e as Error).message
+    } finally {
+      choosing = null
+    }
+  }
 
   // Stripe appends ?paid=1 to the success URL. It means "you were sent back
   // here", not "you paid" — see pollForPayment.
@@ -194,6 +234,59 @@
       </div>
     </section>
 
+    <section class="panel">
+      <div class="row">
+        <h2>Print options</h2>
+        <span style="flex:1"></span>
+        {#if !writable}
+          <span class="muted">fixed: this project is no longer a draft</span>
+        {/if}
+      </div>
+      <div class="modes">
+        {#each modes as m (m.mode)}
+          <label
+            class="mode"
+            class:selected={prefix.print_mode === m.mode}
+            class:unavailable={!m.available}
+          >
+            <input
+              type="radio"
+              name="print-mode"
+              value={m.mode}
+              checked={prefix.print_mode === m.mode}
+              disabled={!writable || !m.available || choosing !== null}
+              onchange={() => chooseMode(m.mode)}
+            />
+            <span class="mode-body">
+              <span class="row" style="gap:8px">
+                <strong>{m.label}</strong>
+                {#if m.price}
+                  <span class="muted">{m.price} per card</span>
+                {/if}
+                {#if !m.available}
+                  <span class="badge status-cancelled">out of stock</span>
+                {/if}
+              </span>
+              <span class="muted summary">{m.summary}</span>
+              {#if !m.available}
+                <span class="muted summary">
+                  The ribbon this option prints with is out of stock. It comes back
+                  as soon as we restock — it is not gone for good.
+                </span>
+              {/if}
+            </span>
+          </label>
+        {/each}
+      </div>
+      {#if chosen && !chosen.available}
+        <p class="muted" style="margin-top:12px">
+          This project is set to <strong>{chosen.label}</strong>, whose ribbon is out
+          of stock, so it cannot be paid for right now. Pick another option, or come
+          back once we have restocked.
+        </p>
+      {/if}
+    </section>
+
     {#if (prefix.status === 'draft' || prefix.status === 'payment_pending') && shopView}
       <section class="panel">
         <div class="row">
@@ -213,6 +306,13 @@
           {#if awaitingPayment}
             <span class="muted">
               <span class="spinner"></span> waiting for the payment to be confirmed…
+            </span>
+          {:else if chosen && !chosen.available}
+            <!-- The server refuses this too (409), so the button must not
+                 pretend it would work: an unavailable ribbon cannot print. -->
+            <button class="primary" disabled>Pay now</button>
+            <span class="muted">
+              {chosen.label} needs a ribbon we are out of. Choose an available option above.
             </span>
           {:else}
             <button class="primary" onclick={pay} disabled={paying}>

@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::models::{
     Card, CardPatch, ModePrice, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus,
-    PrintMode, PrintQueue, PrintQueueCard,
+    PrintMode, PrintQueue, PrintQueueCard, Ribbon, RibbonStock,
 };
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -141,8 +141,64 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
     prefix_from_row(&row)
 }
 
-/// Every print mode's price, ordered by mode, for the shop config.
+/// Every ribbon's stock flag, ordered by ribbon, for the shop config.
+pub async fn list_ribbon_stock(pool: &SqlitePool) -> Result<Vec<RibbonStock>, ApiError> {
+    let rows = sqlx::query("SELECT ribbon, in_stock FROM ribbon_stock ORDER BY ribbon")
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| {
+            let ribbon_raw: String = r.get("ribbon");
+            let ribbon = Ribbon::parse(&ribbon_raw).ok_or_else(|| {
+                ApiError::Internal(format!("unknown ribbon '{ribbon_raw}' in ribbon_stock"))
+            })?;
+            Ok(RibbonStock {
+                ribbon,
+                in_stock: r.get::<i64, _>("in_stock") != 0,
+            })
+        })
+        .collect()
+}
+
+/// Whether one ribbon is in stock.
+///
+/// A ribbon with no flag at all counts as *out of stock*, not as in stock: a
+/// half-migrated or hand-edited database must not silently offer a mode that
+/// may not be printable.
+pub async fn ribbon_in_stock(pool: &SqlitePool, ribbon: Ribbon) -> Result<bool, ApiError> {
+    let row = sqlx::query("SELECT in_stock FROM ribbon_stock WHERE ribbon = ?1")
+        .bind(ribbon.as_str())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some_and(|r| r.get::<i64, _>("in_stock") != 0))
+}
+
+/// Set one ribbon's stock flag (operator action). Upserts, so a flag that was
+/// cleared by hand is restored rather than silently ignored.
+pub async fn set_ribbon_stock(
+    pool: &SqlitePool,
+    ribbon: Ribbon,
+    in_stock: bool,
+) -> Result<RibbonStock, ApiError> {
+    sqlx::query(
+        "INSERT INTO ribbon_stock (ribbon, in_stock) VALUES (?1, ?2)
+         ON CONFLICT(ribbon) DO UPDATE SET in_stock = excluded.in_stock",
+    )
+    .bind(ribbon.as_str())
+    .bind(i64::from(in_stock))
+    .execute(pool)
+    .await?;
+    Ok(RibbonStock { ribbon, in_stock })
+}
+
+/// Every print mode's price, ordered by mode, for the shop config — each one
+/// carrying whether it can be ordered right now.
+///
+/// Availability is derived here, from the *ribbon* flags, rather than stored
+/// per mode: single-sided and double-sided colour share YMCKO, so they are
+/// available or unavailable together by construction.
 pub async fn list_mode_prices(pool: &SqlitePool) -> Result<Vec<ModePrice>, ApiError> {
+    let ribbons = list_ribbon_stock(pool).await?;
     let rows = sqlx::query("SELECT print_mode, price_cents FROM mode_prices ORDER BY print_mode")
         .fetch_all(pool)
         .await?;
@@ -155,6 +211,10 @@ pub async fn list_mode_prices(pool: &SqlitePool) -> Result<Vec<ModePrice>, ApiEr
             Ok(ModePrice {
                 print_mode,
                 price_cents: r.get("price_cents"),
+                available: ribbons
+                    .iter()
+                    .find(|s| s.ribbon == print_mode.ribbon())
+                    .is_some_and(|s| s.in_stock),
             })
         })
         .collect()
@@ -894,6 +954,83 @@ mod tests {
         assert!(modes.contains(&PrintMode::SingleSided));
         assert!(modes.contains(&PrintMode::DoubleSidedColor));
         assert!(modes.contains(&PrintMode::ColorFrontBlackBack));
+    }
+
+    #[test]
+    fn print_mode_maps_onto_a_ribbon() {
+        // Single-sided and double-sided colour share YMCKO, which is the whole
+        // reason availability is a ribbon flag and not a mode flag.
+        assert_eq!(PrintMode::SingleSided.ribbon(), Ribbon::Ymcko);
+        assert_eq!(PrintMode::DoubleSidedColor.ribbon(), Ribbon::Ymcko);
+        assert_eq!(PrintMode::ColorFrontBlackBack.ribbon(), Ribbon::Ymckoko);
+    }
+
+    #[test]
+    fn ribbon_parse_round_trips_both_ribbons() {
+        for (text, ribbon) in [("ymcko", Ribbon::Ymcko), ("ymckoko", Ribbon::Ymckoko)] {
+            assert_eq!(Ribbon::parse(text), Some(ribbon));
+            assert_eq!(ribbon.as_str(), text);
+        }
+        assert_eq!(Ribbon::parse("ymckokok"), None);
+    }
+
+    #[tokio::test]
+    async fn ribbon_stock_flags_are_seeded_in_stock() {
+        let pool = test_pool().await;
+        let stock = list_ribbon_stock(&pool).await.expect("stock");
+        assert_eq!(stock.len(), 2);
+        assert!(stock.iter().all(|s| s.in_stock));
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_ribbon_flag_takes_its_modes_out_together() {
+        let pool = test_pool().await;
+        set_ribbon_stock(&pool, Ribbon::Ymcko, false)
+            .await
+            .expect("clear ymcko");
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
+
+        let prices = list_mode_prices(&pool).await.expect("list");
+        let available = |mode: PrintMode| {
+            prices
+                .iter()
+                .find(|p| p.print_mode == mode)
+                .expect("mode in the list")
+                .available
+        };
+        // One flag, two modes: this is the pair that goes out together.
+        assert!(!available(PrintMode::SingleSided));
+        assert!(!available(PrintMode::DoubleSidedColor));
+        // The black-back mode runs on the other ribbon and is untouched.
+        assert!(available(PrintMode::ColorFrontBlackBack));
+
+        // Setting it back restores both.
+        set_ribbon_stock(&pool, Ribbon::Ymcko, true)
+            .await
+            .expect("restock");
+        let prices = list_mode_prices(&pool).await.expect("list");
+        assert!(prices.iter().all(|p| p.available));
+    }
+
+    #[tokio::test]
+    async fn a_ribbon_with_no_flag_counts_as_out_of_stock() {
+        let pool = test_pool().await;
+        sqlx::query("DELETE FROM ribbon_stock WHERE ribbon = 'ymckoko'")
+            .execute(&pool)
+            .await
+            .expect("delete flag");
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+        // ...and the mode it gates is not offered, rather than silently so.
+        let prices = list_mode_prices(&pool).await.expect("list");
+        assert!(
+            !prices
+                .iter()
+                .find(|p| p.print_mode == PrintMode::ColorFrontBlackBack)
+                .expect("mode")
+                .available
+        );
     }
 
     #[tokio::test]

@@ -215,13 +215,19 @@ What has to change:
     has to be frozen for the customer exactly when the cards are (see "The
     customer's write window"), and the spooler must read the mode that was *paid
     for*, not the current one.
-  - **Availability, per ribbon, visible rather than hidden.** Two stock flags
-    (YMCKO, YMCKOKO); a mode is offered while its ribbon is in stock, so
-    single-sided and double-sided colour disappear together. Render the unavailable
-    option disabled, not absent — the customer should see that double-sided exists
-    and is out. Decide what happens to a prefix already priced for a mode whose
-    ribbon ran out: the checkout should refuse it, not sell a card that cannot be
-    printed.
+  - **Availability, per ribbon, visible rather than hidden.** **Done.** Two stock
+    flags in `ribbon_stock` (YMCKO, YMCKOKO, both seeded in stock), flipped with
+    the operator token via `PUT /api/shop/ribbons/{ribbon}`. The shop config
+    serves both flags and each mode's derived `available`, so single-sided and
+    double-sided colour disappear together while black-back is independent. The
+    customer UI keeps the unavailable option in the list and renders it disabled,
+    so double-sided is visibly *out* rather than gone. The checkout refuses an
+    out-of-stock mode with 409 — the same rule at the layer that takes the money,
+    because a flag that only greys out a radio button still sells a card that
+    cannot be printed. A prefix already priced for a mode whose ribbon has since
+    run out is deliberately **not** reconciled: no reprice, no refund, no notice,
+    it just cannot open a new session until the ribbon is back — by-hand work if
+    it ever happens.
   - **Rendering.** One Svelte component per mode, and the inputs differ per mode:
     no back field at all for single-sided, an upload instead of text for a colour
     back. The black-back preview has to show honestly what black-only does to the

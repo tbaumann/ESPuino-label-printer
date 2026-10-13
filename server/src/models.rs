@@ -136,6 +136,54 @@ impl PrintMode {
     pub fn allows_back_image(self) -> bool {
         matches!(self, Self::DoubleSidedColor)
     }
+
+    /// The ribbon this mode is printed with, and therefore what has to be in
+    /// stock for it to be offered.
+    ///
+    /// Single-sided and double-sided colour both run on YMCKO. Double-sided
+    /// colour consumes two panel sets per card and so drains the stock twice as
+    /// fast, but it is the same ribbon: the two disappear together, which is
+    /// exactly why availability cannot be a per-mode flag.
+    pub fn ribbon(self) -> Ribbon {
+        match self {
+            Self::SingleSided | Self::DoubleSidedColor => Ribbon::Ymcko,
+            Self::ColorFrontBlackBack => Ribbon::Ymckoko,
+        }
+    }
+}
+
+/// A ribbon the shop prints with. Availability is a property of the ribbon, not
+/// of the print mode — see [`PrintMode::ribbon`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Ribbon {
+    /// Full colour, plus a black panel and overlay.
+    Ymcko,
+    /// YMCKO plus a second black panel for the back side.
+    Ymckoko,
+}
+
+impl Ribbon {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ymcko => "ymcko",
+            Self::Ymckoko => "ymckoko",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "ymcko" => Self::Ymcko,
+            "ymckoko" => Self::Ymckoko,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for Ribbon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl std::fmt::Display for PrintMode {
@@ -294,12 +342,30 @@ pub struct AdminSession {
     pub authenticated: bool,
 }
 
-/// One print mode's price, as the shop config serves it.
+/// One print mode as the shop offers it: its price, and whether it can be
+/// ordered right now.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModePrice {
     pub print_mode: PrintMode,
     /// Price of one card in this mode, in the currency's minor unit (cents).
     pub price_cents: i64,
+    /// Whether the mode's ribbon is in stock. An unavailable mode is still
+    /// served, and rendered disabled rather than dropped, so the customer can
+    /// see that the option exists and is out.
+    pub available: bool,
+}
+
+/// One ribbon's stock flag, as the shop config serves it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct RibbonStock {
+    pub ribbon: Ribbon,
+    pub in_stock: bool,
+}
+
+/// Operator input for flipping a ribbon's stock flag.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+pub struct RibbonStockPatch {
+    pub in_stock: bool,
 }
 
 /// Public shop configuration, so the customer UI can show a price and a Pay
@@ -312,8 +378,14 @@ pub struct ShopConfig {
     pub enabled: bool,
     /// ISO 4217 code, lower case as Stripe wants it.
     pub currency: String,
-    /// Price of one card per print mode, in the currency's minor unit (cents).
+    /// Price of one card per print mode, in the currency's minor unit (cents),
+    /// each carrying whether that mode can be ordered right now.
     pub prices: Vec<ModePrice>,
+    /// The two stock flags behind those `available` answers. Availability is a
+    /// property of the ribbon — single-sided and double-sided colour share
+    /// YMCKO — so the flags are served as they are stored, and a mode's
+    /// `available` is the derived consequence.
+    pub ribbons: Vec<RibbonStock>,
     /// Flat shipping charge in cents; 0 means shipping is free and no shipping
     /// line is added to the checkout.
     pub shipping_cents: i64,
