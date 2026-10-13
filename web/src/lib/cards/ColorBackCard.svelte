@@ -63,57 +63,54 @@
 </script>
 
 <article class="card" class:preview-only={readonly}>
-  <div>
-    <div class="preview">
-      <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
-    </div>
-    <div class="caption muted">front · full colour</div>
+  <CardFields {prefix} {card} {writable} {readonly} {onDeleted} />
 
-    <div class="preview back color-back" style="margin-top:10px">
-      {#if hasBack}
-        <img
-          class="backart"
-          src={api.cardBackImageUrl(prefix, card.id, version)}
-          alt={`colour back of ${card.name}`}
-        />
-      {:else}
-        <span class="no-back-image">no back image yet</span>
-      {/if}
+  <div class="image-row">
+    <div class="side">
+      <div class="preview">
+        <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
+      </div>
+      <div class="caption muted">front · full colour</div>
     </div>
-    <div class="caption muted">back · full colour</div>
-  </div>
 
-  <CardFields {prefix} {card} {writable} {readonly} {onDeleted}>
-    {#snippet backField()}
-      {#if readonly}
-        <div>
-          <div class="field-label">Back image</div>
-          <div class="value">{hasBack ? 'uploaded' : 'none'}</div>
-        </div>
-      {:else}
-        <div>
-          <label for={`back-image-${card.id}`}>Back image</label>
-          <input
-            id={`back-image-${card.id}`}
-            type="file"
-            accept="image/*"
-            onchange={choose}
-            disabled={!writable || busy}
+    <div class="side">
+      <div class="preview back color-back">
+        {#if hasBack}
+          <img
+            class="backart"
+            src={api.cardBackImageUrl(prefix, card.id, version)}
+            alt={`colour back of ${card.name}`}
           />
-          <div class="row" style="margin-top:6px">
-            {#if busy}
-              <span class="save-state"><span class="spinner"></span> uploading…</span>
-            {/if}
-            {#if errMsg}
-              <span class="save-state" style="color:var(--danger)">{errMsg}</span>
-            {/if}
-          </div>
-          <div class="hint muted">
-            Printed on the back in full colour. Every card needs one before the
-            project can be paid for.
-          </div>
+        {:else}
+          <span class="no-back-image">no back image yet</span>
+        {/if}
+      </div>
+      <div class="caption muted">back · full colour</div>
+    </div>
+
+    {#if !readonly}
+      <div class="side editor">
+        <label for={`back-image-${card.id}`}>Back image</label>
+        <input
+          id={`back-image-${card.id}`}
+          type="file"
+          accept="image/*"
+          onchange={choose}
+          disabled={!writable || busy}
+        />
+        <div class="row" style="margin-top:6px">
+          {#if busy}
+            <span class="save-state"><span class="spinner"></span> uploading…</span>
+          {/if}
+          {#if errMsg}
+            <span class="save-state" style="color:var(--danger)">{errMsg}</span>
+          {/if}
         </div>
-      {/if}
-    {/snippet}
-  </CardFields>
+        <div class="hint muted">
+          Printed on the back in full colour. Every card needs one before the
+          project can be paid for.
+        </div>
+      </div>
+    {/if}
+  </div>
 </article>

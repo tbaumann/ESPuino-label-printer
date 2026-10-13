@@ -65,54 +65,51 @@
 </script>
 
 <article class="card" class:preview-only={readonly}>
-  <div>
-    <div class="preview">
-      <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
-    </div>
-    <div class="caption muted">front · full colour</div>
+  <CardFields {prefix} {card} {writable} {readonly} {onDeleted} />
 
-    <div class="preview back black-only" style="margin-top:10px">
-      <div class="panel">{@html backHtml || '—'}</div>
+  <div class="image-row">
+    <div class="side">
+      <div class="preview">
+        <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
+      </div>
+      <div class="caption muted">front · full colour</div>
     </div>
-    <div class="caption muted">back · black only (1 bit)</div>
-  </div>
 
-  <CardFields {prefix} {card} {writable} {readonly} {onDeleted}>
-    {#snippet backField()}
-      {#if readonly}
-        <div>
-          <div class="field-label">Back text</div>
-          <pre class="value backtext">{back || '—'}</pre>
+    <div class="side">
+      <div class="preview back black-only">
+        <div class="panel">{@html backHtml || '—'}</div>
+      </div>
+      <div class="caption muted">back · black only (1 bit)</div>
+    </div>
+
+    {#if !readonly}
+      <div class="side editor">
+        <label for={`back-${card.id}`}>Back text (markdown)</label>
+        <textarea
+          id={`back-${card.id}`}
+          rows="5"
+          bind:value={back}
+          oninput={schedule}
+          disabled={!writable}
+          placeholder="song list"
+        ></textarea>
+        <div class="hint muted">
+          Printed on the back in black only: headings, bold, italic and lists.
+          No colour, no images, no greys.
         </div>
-      {:else}
-        <div>
-          <label for={`back-${card.id}`}>Back text (markdown)</label>
-          <textarea
-            id={`back-${card.id}`}
-            rows="5"
-            bind:value={back}
-            oninput={schedule}
-            disabled={!writable}
-            placeholder="song list"
-          ></textarea>
-          <div class="hint muted">
-            Printed on the back in black only: headings, bold, italic and lists.
-            No colour, no images, no greys.
+        {#if imageRefused}
+          <div class="hint warn">
+            This text contains image markup, which the black-only back cannot
+            print — the whole <code>![…]</code> construct is dropped, alt text
+            included. Use the double-sided colour option for a picture.
           </div>
-          {#if imageRefused}
-            <div class="hint warn">
-              This text contains image markup, which the black-only back cannot
-              print — the whole <code>![…]</code> construct is dropped, alt text
-              included. Use the double-sided colour option for a picture.
-            </div>
-          {/if}
-          {#if saveState === 'saving'}
-            <span class="save-state"><span class="spinner"></span> saving…</span>
-          {:else if saveState === 'error'}
-            <span class="save-state" style="color:var(--danger)">{errMsg}</span>
-          {/if}
-        </div>
-      {/if}
-    {/snippet}
-  </CardFields>
+        {/if}
+        {#if saveState === 'saving'}
+          <span class="save-state"><span class="spinner"></span> saving…</span>
+        {:else if saveState === 'error'}
+          <span class="save-state" style="color:var(--danger)">{errMsg}</span>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </article>

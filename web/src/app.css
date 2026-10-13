@@ -327,10 +327,9 @@ section.panel {
 }
 
 .card {
-  display: grid;
-  grid-template-columns: 190px minmax(260px, 1fr) 90px;
-  gap: 16px;
-  align-items: start;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
   padding: 16px;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -338,9 +337,56 @@ section.panel {
   box-shadow: var(--shadow);
 }
 
+/* The top row: number, name, serial, save state, delete. */
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.card-head .head-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 160px;
+}
+
+.card-head .head-field input {
+  min-width: 0;
+}
+
+/* The image row: front side, back side, and (when editable) the back editor,
+   side by side. Wraps onto its own lines on narrow screens. */
+.image-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.image-row .side {
+  flex: 1 1 200px;
+  min-width: 180px;
+  max-width: 320px;
+}
+
+.image-row .side.editor {
+  flex: 1 1 240px;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.image-row .side.editor textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
 @media (max-width: 860px) {
-  .card {
-    grid-template-columns: 1fr;
+  .image-row .side {
+    max-width: none;
   }
 }
 
@@ -494,13 +540,6 @@ input[type='file']:disabled::file-selector-button {
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-
-.card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
 }
 
 .card-id {

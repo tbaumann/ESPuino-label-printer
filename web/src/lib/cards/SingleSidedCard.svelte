@@ -24,16 +24,18 @@
 </script>
 
 <article class="card" class:preview-only={readonly}>
-  <div>
-    <div class="preview">
-      <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
-    </div>
-    <div class="caption muted">front · full colour</div>
+  <CardFields {prefix} {card} {writable} {readonly} {onDeleted} />
 
-    <div class="no-back-side muted" style="margin-top:10px">
+  <div class="image-row">
+    <div class="side">
+      <div class="preview">
+        <img src={api.cardImageUrl(prefix, card.id)} alt={`front of ${card.name}`} />
+      </div>
+      <div class="caption muted">front · full colour</div>
+    </div>
+
+    <div class="side no-back-side muted">
       Front only — this option has no back side.
     </div>
   </div>
-
-  <CardFields {prefix} {card} {writable} {readonly} {onDeleted} />
 </article>

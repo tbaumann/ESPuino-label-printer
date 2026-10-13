@@ -10,7 +10,7 @@
   // which inputs it offers: `single_sided` has no back at all, `double_sided_color`
   // takes a colour back image, `color_front_black_back` takes markdown for a
   // black-only back. Each of those is one component next door, and this one only
-  // picks between them — the shared front preview, name, serial and delete live
+  // picks between them — the shared front preview, name and delete live
   // in `cards/CardFields.svelte`, which all three use.
   let {
     prefix,
