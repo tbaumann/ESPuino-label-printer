@@ -1,15 +1,27 @@
 <script lang="ts">
-  import { api } from './api'
+  import { api, type PrintMode } from './api'
 
   let {
     prefix,
+    mode,
     onUploaded,
     disabled = false,
   }: {
     prefix: string
+    /** The prefix's print mode, which decides what a dropped image still needs. */
+    mode?: PrintMode
     onUploaded: () => void | Promise<void>
     disabled?: boolean
   } = $props()
+
+  // This uploads *fronts* — one file, one card. In the colour mode that is not
+  // a finished card, so the hint says where the other side comes from rather
+  // than letting the customer find out at the checkout.
+  const hint = $derived(
+    mode === 'double_sided_color'
+      ? 'uploads each image as a card; the name defaults to the file name. Each card still needs its colour back image — add those on the cards below.'
+      : 'uploads each image as a card; the name defaults to the file name',
+  )
 
   let over = $state(false)
   let busy = $state(false)
@@ -138,7 +150,7 @@
   ondrop={onDrop}
 >
   <div style="font-weight:600">Drag images or a folder here</div>
-  <div class="hint">uploads each image as a card; the name defaults to the file name</div>
+  <div class="hint">{hint}</div>
   <div class="row" style="justify-content:center;margin-top:12px">
     <button
       onclick={(e) => {

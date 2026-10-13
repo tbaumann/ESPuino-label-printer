@@ -440,6 +440,54 @@ pub async fn upsert_card(
     get_card(pool, prefix, id).await
 }
 
+/// Point a card's colour back image at a freshly written blob, leaving its
+/// front image and its text fields alone.
+///
+/// The card has to exist: a back image belongs to a card, and the caller has
+/// already checked that the prefix's mode has a colour back at all.
+pub async fn set_card_back_image(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    id: i64,
+    path: &str,
+    content_type: &str,
+) -> Result<Card, ApiError> {
+    let done = sqlx::query(
+        "UPDATE cards
+            SET back_image_path = ?3,
+                back_image_content_type = ?4,
+                updated_at = datetime('now')
+          WHERE prefix_uuid = ?1 AND id = ?2",
+    )
+    .bind(prefix.to_string())
+    .bind(id)
+    .bind(path)
+    .bind(content_type)
+    .execute(pool)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(ApiError::NotFound(format!(
+            "card {id} in prefix {prefix}"
+        )));
+    }
+    get_card(pool, prefix, id).await
+}
+
+/// How many of a prefix's cards have no colour back image yet.
+///
+/// Zero for a mode that has no colour back at all, and for an empty prefix —
+/// this answers "is anything missing", not "is there anything here".
+pub async fn cards_missing_back_image(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiError> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS missing FROM cards
+          WHERE prefix_uuid = ?1 AND back_image_content_type IS NULL",
+    )
+    .bind(prefix.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("missing"))
+}
+
 /// Update a card's metadata without touching its image.
 pub async fn update_card_meta(
     pool: &SqlitePool,
@@ -956,6 +1004,97 @@ mod tests {
         .await
         .expect("upsert");
         assert!(card.back_image_content_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_colour_card_can_be_created_front_only_and_completed_later() {
+        // The front-image upload is bulk; the colour back is per card. A card
+        // therefore starts without one, and the count of incomplete cards is
+        // what the checkout gate reads.
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .expect("create");
+        let card = upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "front only",
+            None,
+            None,
+            "blobs/1.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        assert!(card.back_image_content_type.is_none());
+        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 1);
+
+        let completed = set_card_back_image(&pool, p.uuid, 1, "blobs/1-back.png", "image/png")
+            .await
+            .expect("attach the back");
+        assert_eq!(
+            completed.back_image_content_type.as_deref(),
+            Some("image/png")
+        );
+        // The front and the metadata are untouched by the back write.
+        assert_eq!(completed.image_content_type, "image/png");
+        assert_eq!(completed.name, "front only");
+        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_back_images_are_counted_per_card_and_only_when_absent() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .expect("create");
+        // An empty prefix is not "incomplete" — there is nothing to print.
+        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 0);
+
+        for id in 1..=3 {
+            let back = if id == 2 {
+                Some("blobs/2-back.png")
+            } else {
+                None
+            };
+            upsert_card(
+                &pool,
+                p.uuid,
+                id,
+                "c",
+                None,
+                None,
+                "blobs/f.png",
+                "image/png",
+                back,
+                back.map(|_| "image/png"),
+            )
+            .await
+            .expect("upsert");
+        }
+        // Two of the three are still missing their back; the count is per card.
+        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 2);
+
+        // Replacing an existing back with another keeps the card complete.
+        set_card_back_image(&pool, p.uuid, 2, "blobs/2-back.jpg", "image/jpeg")
+            .await
+            .expect("replace");
+        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn back_image_for_an_unknown_card_is_a_404() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .expect("create");
+        let err = set_card_back_image(&pool, p.uuid, 7, "blobs/7-back.png", "image/png")
+            .await
+            .expect_err("no such card");
+        assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
     }
 
     #[tokio::test]

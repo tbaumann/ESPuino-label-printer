@@ -253,10 +253,26 @@ What has to change:
     run out is deliberately **not** reconciled: no reprice, no refund, no notice,
     it just cannot open a new session until the ribbon is back — by-hand work if
     it ever happens.
-  - **Rendering.** One Svelte component per mode, and the inputs differ per mode:
-    no back field at all for single-sided, an upload instead of text for a colour
-    back. The black-back preview has to show honestly what black-only does to the
-    artwork, since that is the entire difference between it and the colour mode.
+  - **Rendering.** **Done.** One component per mode in `web/src/lib/cards/`
+    (`SingleSidedCard`, `ColorBackCard`, `BlackBackCard`), picked by `CardRow`,
+    with the shared front preview, name, serial, delete and debounced save in
+    `cards/CardFields.svelte`. The inputs follow the mode: no back field at all
+    for single-sided, a file input for a colour back, the markdown textarea for a
+    black back. The black-back pane is 1-bit honest — paper white, pure black,
+    no greys, no theme colours — and since the renderer refuses images outright,
+    the editor *says* an image will not be printed instead of leaving a gap where
+    the artwork was. Smoke scenario I asserts all three, and that the colour row
+    uploads through its own input.
+
+    That needed one API change the uploads forced: `back_image` is no longer
+    **required** at card creation. The dropzone uploads fronts one file at a
+    time, so requiring both sides in one request would have made the colour mode
+    impossible to upload into. A card is instead *incomplete* without its back
+    image, which is tracked as one property (`back_image_content_type IS NULL`)
+    and refused where it matters: `PUT .../cards/{id}/back-image` sets the back
+    alone, the row and the project page show how many cards are still missing
+    one, and the checkout answers `409` — the same layer that refuses a mode
+    whose ribbon is out of stock, and for the same reason.
 
 Rasters: **size to the driver's own internal bitmap**, not to a figure derived from
 the card dimensions and dpi. Overscan is deliberate and wanted — printing past the

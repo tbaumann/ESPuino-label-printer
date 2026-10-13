@@ -94,6 +94,13 @@ enum CardCmd {
     Get { prefix: String, id: i64 },
     /// Delete a card and its image.
     Delete { prefix: String, id: i64 },
+    /// Upload or replace a card's colour back image (double_sided_color only).
+    BackImage {
+        prefix: String,
+        id: i64,
+        /// Colour image to print on the back.
+        file: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -111,7 +118,9 @@ struct UploadArgs {
     /// Optional serial number.
     #[arg(long)]
     serial_number: Option<String>,
-    /// Optional black & white back-panel text (song list, etc.).
+    /// Optional black-only back text (song list, etc.). Only valid in a
+    /// color_front_black_back prefix; a double_sided_color one takes its back
+    /// as an image (`card back-image`).
     #[arg(long)]
     back_text: Option<String>,
 }
@@ -179,6 +188,12 @@ async fn main() -> Result<()> {
                     println!("deleted card {id} from {prefix}");
                 }
                 Ok(())
+            }
+            CardCmd::BackImage { prefix, id, file } => {
+                if !file.is_file() {
+                    bail!("not a file: {}", file.display());
+                }
+                emit(client.upload_back_image(&prefix, id, &file).await?, quiet)
             }
         },
         Command::Upload(a) => {

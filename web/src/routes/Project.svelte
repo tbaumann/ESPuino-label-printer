@@ -3,6 +3,7 @@
   import {
     api,
     formatMoney,
+    needsBackImage,
     PRINT_MODES,
     rememberProject,
     type Card,
@@ -77,6 +78,15 @@
   // The mode the prefix is actually set to, so the panel can mark it and warn
   // when its ribbon is the one that ran out.
   const chosen = $derived(modes.find((m) => m.mode === prefix?.print_mode) ?? null)
+
+  // In `double_sided_color` every card is printed on both sides, so a card still
+  // without its uploaded colour back is an order that cannot be made. The server
+  // refuses such a checkout with 409 (it is the layer that takes the money, so
+  // it is the layer where this has to hold); the button must not pretend
+  // otherwise.
+  const missingBacks = $derived(
+    prefix?.print_mode === 'double_sided_color' ? cards.filter(needsBackImage).length : 0,
+  )
 
   let choosing = $state<PrintMode | null>(null)
 
@@ -174,6 +184,13 @@
     } catch (e) {
       error = (e as Error).message
     }
+  }
+
+  // A colour back image was uploaded from a card row. Only that row knows, and
+  // only the page keeps the list, so it is spliced in here — which is also what
+  // moves `missingBacks` on and opens the Pay button.
+  function onCardUpdated(updated: Card) {
+    cards = cards.map((c) => (c.id === updated.id ? updated : c))
   }
 
   async function onDeleted(id: number) {
@@ -314,6 +331,15 @@
             <span class="muted">
               {chosen.label} needs a ribbon we are out of. Choose an available option above.
             </span>
+          {:else if missingBacks > 0}
+            <!-- Same rule at both layers: the checkout answers 409 while a card
+                 in a double-sided colour order has no back image uploaded. -->
+            <button class="primary" disabled>Pay now</button>
+            <span class="muted">
+              {missingBacks} card{missingBacks === 1 ? '' : 's'} still need
+              {missingBacks === 1 ? 'a' : 'their'} back image. Every card in
+              {chosen ? chosen.label : 'this option'} is printed on both sides.
+            </span>
           {:else}
             <button class="primary" onclick={pay} disabled={paying}>
               {paying ? 'Opening checkout…' : 'Pay now'}
@@ -328,7 +354,7 @@
 
     <section class="panel">
       {#if writable}
-        <Uploader prefix={uuid} onUploaded={onUploaded} />
+        <Uploader prefix={uuid} mode={prefix.print_mode} onUploaded={onUploaded} />
       {:else}
         <p class="muted">
           This project is <strong>{prefix.status}</strong> and can no longer be changed.
@@ -337,13 +363,30 @@
     </section>
 
     <section>
-      <h2 style="margin-bottom:12px">Cards</h2>
+      <div class="row" style="margin-bottom:12px">
+        <h2>Cards</h2>
+        <span style="flex:1"></span>
+        {#if missingBacks > 0}
+          <!-- Shown whether or not this deployment takes money: a card without
+               its back is not printable either way. -->
+          <span class="badge status-cancelled">
+            {missingBacks} without a back image
+          </span>
+        {/if}
+      </div>
       {#if cards.length === 0}
         <div class="empty">No cards yet — drop some images above.</div>
       {:else}
         <div class="cards">
           {#each cards as card (card.id)}
-            <CardRow prefix={uuid} {card} {writable} onDeleted={onDeleted} />
+            <CardRow
+              prefix={uuid}
+              {card}
+              mode={prefix.print_mode}
+              {writable}
+              onDeleted={onDeleted}
+              onCardUpdated={onCardUpdated}
+            />
           {/each}
         </div>
       {/if}

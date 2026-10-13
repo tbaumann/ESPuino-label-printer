@@ -245,7 +245,9 @@ console.log('\nB. project page renders a card')
     await api(`/api/prefixes/${mdPrefix}/cards`, { method: 'POST', body: fd })
 
     const w = await mount(`/p/${mdPrefix}`, { bust: 'b2' })
-    const half = w.document.querySelector('.preview.back .halfpanel')
+    // The black-back mode's own component renders the 1-bit pane; its inner
+    // panel is what carries the sanitised markdown.
+    const half = w.document.querySelector('.preview.back.black-only .panel')
     const html = half?.innerHTML ?? ''
     check('renders a heading', /<h1>Title<\/h1>/.test(html), html)
     check('renders bold', /<strong>bold<\/strong>/.test(html))
@@ -566,5 +568,137 @@ console.log('\nH. ribbon availability: disabled, not absent')
     after2.map((i) => i.disabled).join(','))
 }
 
-console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
+// ---- scenario I: one component per print mode ------------------------------
+// The mode decides what a card *is*, so it decides what the row shows and which
+// inputs it offers: no back at all for single-sided, an upload for a colour
+// back, markdown for the black back. Each mode has its own component, and the
+// black-back pane has to be honest about what 1-bit black does to the artwork —
+// that difference from the colour mode is the whole point of the split.
+console.log('\nI. one card component per print mode')
+{
+  cookieJar = ''
+
+  const makePrefix = async (print_mode) =>
+    (
+      await api('/api/prefixes', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(print_mode ? { print_mode } : {}),
+      })
+    ).uuid
+
+  /** Upload a card. Only the front image; a back is per mode. */
+  const addCard = async (prefix, { name = 'Mode Card', back_text } = {}) => {
+    const fd = new NodeFormData()
+    fd.append('name', name)
+    if (back_text) fd.append('back_text', back_text)
+    fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'front.png')
+    return api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+  }
+
+  // --- single-sided: no back side, rather than an empty one ----------------
+  {
+    const prefix = await makePrefix('single_sided')
+    await addCard(prefix)
+    const w = await mount(`/p/${prefix}`, { bust: 'i1' })
+    const t = w.document.body.textContent ?? ''
+    check('single-sided renders the card', !!w.document.querySelector('.card'))
+    check('single-sided has no back pane', !w.document.querySelector('.preview.back'))
+    check(
+      'single-sided has no back field at all',
+      !w.document.querySelector('textarea#back-1') &&
+        !w.document.querySelector('input#back-image-1'),
+    )
+    check('single-sided offers no image upload', !w.document.querySelector('.card input[type=file]'))
+    check('single-sided says the option has no back', /no back side/i.test(t))
+  }
+
+  // --- double-sided colour: the back is an uploaded image ------------------
+  {
+    const prefix = await makePrefix('double_sided_color')
+    // A front-only card is the dropzone flow — one file, one card. The server
+    // takes it, which is what makes the per-card back upload possible at all.
+    const card = await addCard(prefix)
+    check(
+      'a colour card can be created from its front alone',
+      card.id === 1 && !card.back_image_content_type,
+      JSON.stringify(card.back_image_content_type),
+    )
+
+    const w = await mount(`/p/${prefix}`, { bust: 'i2' })
+    await settle(200)
+    const t = w.document.body.textContent ?? ''
+    check('colour mode has a colour back pane', !!w.document.querySelector('.preview.back.color-back'))
+    check('the pane says there is no artwork yet', /no back image yet/i.test(t))
+    check('no back image is loaded yet', !w.document.querySelector('img[src*="/back-image"]'))
+    check(
+      'there is no back-text field in this mode',
+      !w.document.querySelector('textarea#back-1') && !w.document.querySelector('input#back-1'),
+    )
+    check('the row offers a back-image upload', !!w.document.querySelector('input#back-image-1[type=file]'))
+    check('the page reports the card as incomplete', /without a back image/.test(t))
+
+    // Refused on both layers while a card is incomplete: the button here, and a
+    // 409 from the server. Both need payment configured.
+    const shop = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
+    if (!shop.enabled) {
+      console.log('  skip pay refusal: no payment configured (STRIPE_SECRET_KEY unset)')
+    } else {
+      const payButton = [...w.document.querySelectorAll('button')].find((b) =>
+        /Pay now/.test(b.textContent),
+      )
+      check('the Pay button is disabled while a back is missing', payButton?.disabled === true)
+      const refused = await realFetch(`${BASE}/api/prefixes/${prefix}/checkout`, { method: 'POST' })
+      check('the server refuses the checkout with 409', refused.status === 409, String(refused.status))
+    }
+
+    // Upload the back through the row's own input, the way a customer would:
+    // the bundle builds a real multipart request, so this is the upload
+    // endpoint exercised end to end rather than a mocked call.
+    const input = w.document.querySelector('input#back-image-1')
+    const back = new File([PNG], 'back.png', { type: 'image/png' })
+    Object.defineProperty(input, 'files', { value: [back], configurable: true })
+    input.dispatchEvent(new w.Event('change', { bubbles: true }))
+    await settle(1200)
+
+    check(
+      'the uploaded back is previewed',
+      !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/back-image"]`),
+    )
+    const stored = await api(`/api/prefixes/${prefix}/cards/1`)
+    check('the server stored the colour back', !!stored.back_image_content_type)
+    const t2 = w.document.body.textContent ?? ''
+    check('the card is no longer reported as incomplete', !/without a back image/.test(t2))
+  }
+
+  // --- colour front, black back: text, printed by the black panel alone ----
+  {
+    const prefix = await makePrefix('color_front_black_back')
+    await addCard(prefix, {
+      back_text: '## Songs\n\n- one\n- two\n\n![art](https://example.com/a.png)\n',
+    })
+    const w = await mount(`/p/${prefix}`, { bust: 'i3' })
+    const t = w.document.body.textContent ?? ''
+    const pane = w.document.querySelector('.preview.back.black-only')
+    const inner = pane?.innerHTML ?? ''
+    check('the black back renders its own pane', !!pane)
+    check('the pane is labelled black only', /black only \(1 bit\)/i.test(t))
+    check('the markdown is rendered into the pane', /<h2>Songs<\/h2>/.test(inner), inner)
+    check('no image is rendered on the black back', !/<img\b/.test(inner), inner)
+    check('the black back loads no back image', !w.document.querySelector('img[src*="/back-image"]'))
+    // The medium refuses a picture, so the editor says so instead of leaving a
+    // gap where the customer's artwork would have been.
+    check(
+      'the editor says image markup is not printed',
+      /image markup/i.test(t) && /cannot\s+print/i.test(t),
+    )
+    check(
+      'the back is edited as text, not uploaded',
+      !!w.document.querySelector('textarea#back-1') && !w.document.querySelector('.card input[type=file]'),
+    )
+    check('a black back is complete without any upload', !/without a back image/.test(t))
+  }
+}
+
+console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1)
