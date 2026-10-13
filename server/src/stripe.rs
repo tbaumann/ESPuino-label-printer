@@ -380,11 +380,60 @@ pub struct SessionObject {
     pub payment_status: Option<String>,
     pub amount_total: Option<i64>,
     pub currency: Option<String>,
+    /// Present on a Checkout Session that collected an address, which is where
+    /// the customer's email actually is. This is what the order confirmation is
+    /// addressed to.
+    #[serde(default)]
+    pub customer_details: Option<CustomerDetails>,
+    /// The email Stripe was *prefilled* with, if any. Often absent, and only a
+    /// fallback: `customer_details.email` is the one the customer confirmed.
+    #[serde(default)]
+    pub customer_email: Option<String>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Who paid. Checkout collects the email, so this is how the shop learns where
+/// to send an order confirmation — there are no accounts here.
+#[derive(Debug, Deserialize)]
+pub struct CustomerDetails {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 impl SessionObject {
+    /// Where to send the customer's confirmation.
+    ///
+    /// `customer_details.email` is the address the customer entered at Stripe;
+    /// `customer_email` is only the prefilled one, so it is a fallback rather
+    /// than an equal. Blank values are treated as absent, so an empty
+    /// `customer_details.email` still lets the fallback through.
+    pub fn payer_email(&self) -> Option<&str> {
+        self.customer_details
+            .as_ref()
+            .and_then(|d| d.email.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.customer_email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    /// The name on the payment, for the operator's copy. Never part of an
+    /// address — it is customer-written text.
+    pub fn payer_name(&self) -> Option<&str> {
+        self.customer_details
+            .as_ref()
+            .and_then(|d| d.name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// Which prefix this session was paid for.
     ///
     /// `client_reference_id` is the documented field and wins, but a *blank*
@@ -706,6 +755,8 @@ mod tests {
             payment_status: Some("paid".into()),
             amount_total: None,
             currency: None,
+            customer_details: None,
+            customer_email: None,
             metadata: None,
         };
         assert_eq!(with_ref.prefix_uuid().as_deref(), Some("abc"));
@@ -719,5 +770,53 @@ mod tests {
 
         from_meta.metadata = Some(serde_json::json!({"other": "x"}));
         assert_eq!(from_meta.prefix_uuid(), None);
+    }
+
+    #[test]
+    fn the_payer_email_comes_from_the_details_block() {
+        // Exactly the shape Stripe sends: the email the customer confirmed at
+        // Checkout lives in customer_details.
+        let event: Event = serde_json::from_str(
+            r#"{
+                "id": "evt_1",
+                "type": "checkout.session.completed",
+                "data": { "object": {
+                    "id": "cs_1",
+                    "payment_status": "paid",
+                    "client_reference_id": "00000000-0000-0000-0000-000000000000",
+                    "customer_details": { "email": "ada@example.com", "name": "Ada Lovelace" },
+                    "customer_email": "prefilled@example.com"
+                }}
+            }"#,
+        )
+        .expect("a plausible Stripe event");
+        let session = &event.data.object;
+        assert_eq!(session.payer_email(), Some("ada@example.com"));
+        assert_eq!(session.payer_name(), Some("Ada Lovelace"));
+    }
+
+    #[test]
+    fn the_payer_email_falls_back_to_the_prefilled_one_and_never_to_blank() {
+        let mut session = SessionObject {
+            id: "cs_1".into(),
+            client_reference_id: None,
+            payment_status: Some("paid".into()),
+            amount_total: None,
+            currency: None,
+            customer_details: Some(CustomerDetails {
+                email: Some("   ".into()),
+                name: None,
+            }),
+            customer_email: Some("prefilled@example.com".into()),
+            metadata: None,
+        };
+        // A blank details email must not shadow a usable prefilled one.
+        assert_eq!(session.payer_email(), Some("prefilled@example.com"));
+
+        session.customer_email = None;
+        assert_eq!(session.payer_email(), None);
+        session.customer_details = None;
+        assert_eq!(session.payer_email(), None);
+        assert_eq!(session.payer_name(), None);
     }
 }

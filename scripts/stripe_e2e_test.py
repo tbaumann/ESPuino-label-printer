@@ -8,11 +8,22 @@ are computed here the same way Stripe computes them, so the webhook path is
 exercised for real rather than stubbed.
 
     python3 scripts/mock_stripe.py 12111 &
+    python3 scripts/mock_resend.py 12112 &
     STRIPE_SECRET_KEY=sk_test_x STRIPE_WEBHOOK_SECRET=whsec_test_secret \
       STRIPE_API_BASE=http://127.0.0.1:12111 \
       PUBLIC_BASE_URL=http://127.0.0.1:8080 \
+      STRIPE_SHIPPING_CENTS=250 \
+      RESEND_API_KEY=re_test_x RESEND_API_BASE=http://127.0.0.1:12112 \
+      EMAIL_FROM='ESPuino <orders@example.test>' OPERATOR_EMAIL=shop@example.test \
       ./target/debug/espuino-label-printer &
     python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
+
+The order-email section (5b) runs only when `RESEND_API_KEY` and `EMAIL_FROM`
+are set for both the server and this test; otherwise it is skipped with a note,
+the same way the smoke test skips its Pay scenario. Its assertions are the two
+that really matter for that feature: the customer's confirmation is addressed to
+the address on the Stripe session and links back to their project, and a
+*replayed* webhook delivery sends no second email.
 
 The exit code is the number of failed checks.
 """
@@ -33,7 +44,16 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_test_secret")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "sk_test_x")
 MOCK_OUT = os.environ.get("MOCK_STRIPE_OUT", "/tmp/mock_stripe_forms.jsonl")
+MOCK_RESEND_OUT = os.environ.get("MOCK_RESEND_OUT", "/tmp/mock_resend_emails.jsonl")
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", BASE)
+# The customer's address comes from the Stripe session, which this test builds
+# itself, so the expectation is a constant rather than the server's environment.
+CUSTOMER_EMAIL = "ada@example.test"
+# The order emails are only sent when the server was given both a key and a
+# from-address; without them the checks are skipped with a note, the same way
+# the smoke test skips its Pay scenario when payment is not configured.
+EMAILS_ON = bool(os.environ.get("RESEND_API_KEY")) and bool(os.environ.get("EMAIL_FROM"))
+OPERATOR_EMAIL = os.environ.get("OPERATOR_EMAIL")
 CARD_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-card.png")
 
 checks = 0
@@ -113,6 +133,9 @@ def payment_event(
     session: str = "cs_test_mock_1",
     payment_status: str = "paid",
     use_metadata: bool = False,
+    customer_email: Any = CUSTOMER_EMAIL,
+    amount_total: int = 2 * 500 + 250,
+    currency: str = "eur",
 ) -> dict:
     obj: dict = {"id": session, "object": "checkout.session", "payment_status": payment_status}
     if prefix is not None:
@@ -120,6 +143,13 @@ def payment_event(
             obj["metadata"] = {"prefix": prefix}
         else:
             obj["client_reference_id"] = prefix
+    # Two cards plus shipping, as section 3's session is priced; Stripe always
+    # reports both, and the order confirmation states the amount.
+    obj["amount_total"] = amount_total
+    obj["currency"] = currency
+    if customer_email is not None:
+        # What Checkout collects and the order confirmation is addressed to.
+        obj["customer_details"] = {"email": customer_email, "name": "Ada Lovelace"}
     return {
         "id": "evt_" + uuid.uuid4().hex[:16],
         "object": "event",
@@ -167,6 +197,22 @@ def recorded_forms() -> list[dict]:
         return []
     with open(MOCK_OUT, encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def recorded_emails() -> list[dict]:
+    if not os.path.exists(MOCK_RESEND_OUT):
+        return []
+    with open(MOCK_RESEND_OUT, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def email_to(recipient: str) -> dict:
+    """The single recorded message addressed to `recipient`, or {}."""
+    for record in recorded_emails():
+        message = record.get("message") or {}
+        if (message.get("to") or [None])[0] == recipient:
+            return message
+    return {}
 
 
 print(f"testing {BASE}   (mock Stripe recorder: {MOCK_OUT})")
@@ -372,6 +418,11 @@ check("still not paid after all that", prefix_state(prefix) == "payment_pending"
 
 # --- 5. the payment lands ---------------------------------------------------
 print("\n5. recording the payment")
+# Start the email recorder from empty, so the count below is this order's mail
+# and not something an earlier section left behind.
+if EMAILS_ON and os.path.exists(MOCK_RESEND_OUT):
+    os.truncate(MOCK_RESEND_OUT, 0)
+
 status, _ = deliver(payment_event(prefix=prefix))
 check("a correctly signed completed event is accepted (200)", status == 200, str(status))
 check("the prefix is now paid", prefix_state(prefix) == "paid", str(prefix_state(prefix)))
@@ -381,10 +432,81 @@ check(
     str(prefix_order_ref(prefix)),
 )
 
+# --- 5b. the order emails ---------------------------------------------------
+# Runs only when the server was started with RESEND_API_KEY and EMAIL_FROM, and
+# pointed at the mock via RESEND_API_BASE.
+print("\n5b. order emails")
+if not EMAILS_ON:
+    print("  note no RESEND_API_KEY/EMAIL_FROM set, so the email checks are skipped")
+    print(
+        "       (start the server with RESEND_API_KEY=re_test_x "
+        "EMAIL_FROM='ESPuino <orders@example.test>' "
+        "RESEND_API_BASE=http://127.0.0.1:12112 to cover them)"
+    )
+else:
+    emails = recorded_emails()
+    expected = 2 if OPERATOR_EMAIL else 1
+    check(
+        f"a paid order sends {expected} email(s), one per recipient",
+        len(emails) == expected,
+        f"recorded {len(emails)} in {MOCK_RESEND_OUT}",
+    )
+    if not emails:
+        # Without this, a mismatch between the mock and this test would make
+        # every check below trivially pass on empty dicts.
+        check(
+            "the email checks could run (server and test must share MOCK_RESEND_OUT)",
+            False,
+            f"nothing recorded in {MOCK_RESEND_OUT}",
+        )
+    else:
+        customer = email_to(CUSTOMER_EMAIL)
+        check(
+            "the customer's confirmation is addressed to the address on the Stripe session",
+            bool(customer),
+            f"recipients: {[r['message']['to'] for r in emails if r.get('message')]}",
+        )
+        check(
+            "it is sent from the configured from-address",
+            customer.get("from") == os.environ.get("EMAIL_FROM"),
+            str(customer.get("from")),
+        )
+        check(
+            "it carries a link back to the customer's project",
+            f"{PUBLIC_BASE}/p/{prefix}" in (customer.get("text") or ""),
+            str(customer.get("subject")),
+        )
+        check(
+            "it has both a text and an html part",
+            bool(customer.get("text")) and bool(customer.get("html")),
+            f"text={bool(customer.get('text'))} html={bool(customer.get('html'))}",
+        )
+        check(
+            "it states the amount that was paid",
+            "12.50 EUR" in (customer.get("text") or ""),
+            str(customer.get("text"))[:200],
+        )
+        if OPERATOR_EMAIL:
+            operator = email_to(OPERATOR_EMAIL)
+            check(
+                "the operator gets a copy, linking to the admin view",
+                f"{PUBLIC_BASE}/admin/p/{prefix}" in (operator.get("text") or ""),
+                str(operator.get("subject")),
+            )
+
 status, _ = deliver(payment_event(prefix=prefix))
 check("a replayed event is accepted (200)", status == 200, str(status))
 check("the replay changed nothing", prefix_state(prefix) == "paid", str(prefix_state(prefix)))
 check("the order reference survived the replay", prefix_order_ref(prefix) == "cs_test_mock_1")
+if EMAILS_ON:
+    # The trap this whole feature is designed around: Stripe retries until it
+    # gets a 2xx, so a second delivery must not mail the customer again.
+    expected = 2 if OPERATOR_EMAIL else 1
+    check(
+        f"the replay sent no second email (still {expected})",
+        len(recorded_emails()) == expected,
+        f"recorded {len(recorded_emails())} in {MOCK_RESEND_OUT}",
+    )
 
 # --- 6. events that must be handled or ignored safely -----------------------
 print("\n6. events we ignore")

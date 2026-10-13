@@ -2,6 +2,7 @@ mod auth;
 mod db;
 mod error;
 mod models;
+mod notify;
 mod rate_limit;
 mod routes;
 mod stripe;
@@ -40,6 +41,9 @@ pub struct AppState {
     pub cookie_secure: Option<bool>,
     /// Payment integration. `None` disables checkout and the webhook (503).
     pub stripe: Option<Arc<stripe::Stripe>>,
+    /// Transactional email (Resend) for the paid-order messages. `None`
+    /// disables sending entirely — the shop works and nobody is mailed.
+    pub notifier: Option<Arc<notify::Notifier>>,
     /// Throttles checkout-session creation, keyed by prefix. Persisted per
     /// deployment, not part of the admin/session machinery.
     pub checkout_limiter: rate_limit::RateLimiter,
@@ -189,16 +193,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("STRIPE_SECRET_KEY is not set: the shop endpoints will answer 503");
     }
 
+    // Email. Unset RESEND_API_KEY (or no EMAIL_FROM) switches sending off, with
+    // a warning from `from_env` saying which. An email that cannot be sent must
+    // never fail the payment webhook, so this is deliberately fire-and-forget
+    // from the caller's point of view.
+    let notifier = notify::Notifier::from_env().map(Arc::new);
+
     let state = AppState {
-            pool: pool.clone(),
-            data_dir: Arc::new(data_dir),
-            admin_token,
-            sessions: auth::Sessions::new(pool),
-            login_limiter: auth::LoginLimiter::default(),
-            cookie_secure,
-            stripe,
-            checkout_limiter: rate_limit::RateLimiter::new(CHECKOUT_LIMIT_PER_PREFIX, CHECKOUT_WINDOW),
-        };
+        pool: pool.clone(),
+        data_dir: Arc::new(data_dir),
+        admin_token,
+        sessions: auth::Sessions::new(pool),
+        login_limiter: auth::LoginLimiter::default(),
+        cookie_secure,
+        stripe,
+        notifier,
+        checkout_limiter: rate_limit::RateLimiter::new(CHECKOUT_LIMIT_PER_PREFIX, CHECKOUT_WINDOW),
+    };
 
     // Static SPA (Svelte build). Served from disk so the frontend can be
     // rebuilt without recompiling the server. Unknown paths fall back to

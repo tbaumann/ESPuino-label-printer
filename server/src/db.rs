@@ -58,13 +58,13 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let print_mode = PrintMode::parse(&mode_raw)
         .ok_or_else(|| ApiError::Internal(format!("unknown prefix print_mode '{mode_raw}'")))?;
     let paid_raw: Option<String> = row.get("paid_print_mode");
-    let paid_print_mode = match paid_raw.as_deref() {
-        None => None,
-        Some(s) => Some(
-            PrintMode::parse(s)
-                .ok_or_else(|| ApiError::Internal(format!("unknown prefix paid_print_mode '{s}'")))?,
-        ),
-    };
+    let paid_print_mode =
+        match paid_raw.as_deref() {
+            None => None,
+            Some(s) => Some(PrintMode::parse(s).ok_or_else(|| {
+                ApiError::Internal(format!("unknown prefix paid_print_mode '{s}'"))
+            })?),
+        };
     Ok(Prefix {
         uuid: Uuid::parse_str(row.get::<String, _>("uuid").as_str())
             .map_err(|e| ApiError::Internal(e.to_string()))?,
@@ -169,9 +169,7 @@ pub async fn mode_price(pool: &SqlitePool, mode: PrintMode) -> Result<i64, ApiEr
         .bind(mode.as_str())
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| {
-            ApiError::Internal(format!("no price configured for print mode {mode}"))
-        })?;
+        .ok_or_else(|| ApiError::Internal(format!("no price configured for print mode {mode}")))?;
     Ok(row.get("price_cents"))
 }
 
@@ -623,6 +621,96 @@ pub async fn abandoned_payment_pending(
     rows.iter().map(prefix_from_row).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Email notifications — the claim that makes each one exactly-once
+// ---------------------------------------------------------------------------
+
+/// Claim the right to send one notification, keyed on the event that caused it
+/// (`<kind>:<stripe session id>` for the paid confirmation).
+///
+/// Returns `true` when this caller won the claim and should send, `false` when
+/// the row was already there — a retried or concurrent webhook delivery, or a
+/// replayed event. The insert is the check and the write in one statement, so
+/// two deliveries racing cannot both win it, and the claim survives a restart
+/// in the middle of Stripe's retries because it is a database key.
+pub async fn claim_notification(
+    pool: &SqlitePool,
+    dedupe_key: &str,
+    kind: &str,
+    prefix: Uuid,
+    recipient: &str,
+    session_id: Option<&str>,
+) -> Result<bool, ApiError> {
+    let res = sqlx::query(
+        "INSERT INTO email_notifications (dedupe_key, kind, prefix, recipient, session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (dedupe_key) DO NOTHING",
+    )
+    .bind(dedupe_key)
+    .bind(kind)
+    .bind(prefix.to_string())
+    .bind(recipient)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Record how a claimed notification ended: sent (with the provider's id) or
+/// failed (with the reason).
+///
+/// The claim row is never deleted. It is the record that this transition has
+/// been mailed and what came of it, and a *failed* row keeps its claim on
+/// purpose: a resend is an operator decision, not something an automatic retry
+/// should risk doubling.
+pub async fn finish_notification(
+    pool: &SqlitePool,
+    dedupe_key: &str,
+    sent: bool,
+    provider_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE email_notifications
+            SET status = ?2,
+                provider_id = COALESCE(?3, provider_id),
+                error = ?4,
+                sent_at = CASE WHEN ?2 = 'sent' THEN datetime('now') ELSE sent_at END
+          WHERE dedupe_key = ?1",
+    )
+    .bind(dedupe_key)
+    .bind(if sent { "sent" } else { "failed" })
+    .bind(provider_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Test-only: the dedupe keys recorded as sent, so a test can prove a replayed
+/// transition produced no second message.
+#[cfg(test)]
+pub async fn sent_notification_keys(pool: &SqlitePool) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query("SELECT dedupe_key FROM email_notifications WHERE status = 'sent'")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(|r| r.get("dedupe_key")).collect())
+}
+
+/// Test-only: `(recipient, error)` of every notification whose send failed.
+#[cfg(test)]
+pub async fn failed_notifications(pool: &SqlitePool) -> Result<Vec<(String, String)>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT recipient, error FROM email_notifications WHERE status = 'failed' ORDER BY rowid",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("recipient"), r.get("error")))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,13 +775,11 @@ mod tests {
         let pool = test_pool().await;
         let uuid = Uuid::new_v4();
         upsert_prefix(&pool, uuid).await.expect("first create");
-        let err = create_prefix(&pool, Some(uuid), None).await.expect_err(
-            "a bare POST create must still 409 on a duplicate uuid",
-        );
+        let err = create_prefix(&pool, Some(uuid), None)
+            .await
+            .expect_err("a bare POST create must still 409 on a duplicate uuid");
         assert!(matches!(err, ApiError::Conflict(_)));
     }
-
-
 
     #[test]
     fn print_mode_parse_round_trips_all_modes() {
@@ -764,7 +850,7 @@ mod tests {
             1,
             "front",
             None,
-            None,               // back_text is meaningless in colour mode
+            None, // back_text is meaningless in colour mode
             "blobs/1.png",
             "image/png",
             Some("blobs/1-back.png"),
@@ -813,11 +899,13 @@ mod tests {
             .expect("pending");
 
         // Backdate the old one's status beyond the 24h abbandoned window.
-        sqlx::query("UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1")
-            .bind(old.uuid.to_string())
-            .execute(&pool)
-            .await
-            .expect("backdate");
+        sqlx::query(
+            "UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1",
+        )
+        .bind(old.uuid.to_string())
+        .execute(&pool)
+        .await
+        .expect("backdate");
 
         let stuck = abandoned_payment_pending(&pool, 24 * 3600)
             .await
@@ -842,11 +930,13 @@ mod tests {
         set_status(&pool, paid.uuid, PrefixStatus::Paid, Some("cs_1"), false)
             .await
             .expect("paid");
-        sqlx::query("UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1")
-            .bind(paid.uuid.to_string())
-            .execute(&pool)
-            .await
-            .expect("backdate");
+        sqlx::query(
+            "UPDATE prefixes SET status_changed_at = datetime('now', '-25 hours') WHERE uuid = ?1",
+        )
+        .bind(paid.uuid.to_string())
+        .execute(&pool)
+        .await
+        .expect("backdate");
 
         let stuck = abandoned_payment_pending(&pool, 24 * 3600)
             .await
@@ -888,7 +978,11 @@ mod tests {
         // The migration seeds every mode at the historical default of 500.
         assert_eq!(prices.len(), 3);
         for p in &prices {
-            assert_eq!(p.price_cents, 500, "mode {:?} should default to 500", p.print_mode);
+            assert_eq!(
+                p.price_cents, 500,
+                "mode {:?} should default to 500",
+                p.print_mode
+            );
         }
         let modes: Vec<_> = prices.iter().map(|p| p.print_mode).collect();
         assert!(modes.contains(&PrintMode::SingleSided));
@@ -900,11 +994,15 @@ mod tests {
     async fn mode_price_lookup_returns_the_configured_price() {
         let pool = test_pool().await;
         assert_eq!(
-            mode_price(&pool, PrintMode::ColorFrontBlackBack).await.expect("price"),
+            mode_price(&pool, PrintMode::ColorFrontBlackBack)
+                .await
+                .expect("price"),
             500
         );
         assert_eq!(
-            mode_price(&pool, PrintMode::SingleSided).await.expect("price"),
+            mode_price(&pool, PrintMode::SingleSided)
+                .await
+                .expect("price"),
             500
         );
     }
@@ -934,5 +1032,96 @@ mod tests {
             .expect("operator changes mode");
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
+    }
+
+    #[tokio::test]
+    async fn a_notification_claim_is_won_once() {
+        let pool = test_pool().await;
+        let prefix = Uuid::new_v4();
+        let key = "customer_order_paid:cs_1";
+
+        assert!(claim_notification(
+            &pool,
+            key,
+            "customer_order_paid",
+            prefix,
+            "ada@example.test",
+            Some("cs_1"),
+        )
+        .await
+        .expect("first claim"));
+        // The same key again — a retried delivery — must not be claimable.
+        assert!(!claim_notification(
+            &pool,
+            key,
+            "customer_order_paid",
+            prefix,
+            "ada@example.test",
+            Some("cs_1"),
+        )
+        .await
+        .expect("second claim"));
+
+        // A different kind or a different session is a different message.
+        assert!(claim_notification(
+            &pool,
+            "operator_order_paid:cs_1",
+            "operator_order_paid",
+            prefix,
+            "shop@example.test",
+            Some("cs_1"),
+        )
+        .await
+        .expect("operator claim"));
+
+        finish_notification(&pool, key, true, Some("re_1"), None)
+            .await
+            .expect("finish");
+        assert_eq!(
+            sent_notification_keys(&pool).await.unwrap(),
+            vec![key.to_string()]
+        );
+        assert!(failed_notifications(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_notification_keeps_its_claim_and_records_why() {
+        let pool = test_pool().await;
+        let key = "customer_order_paid:cs_2";
+        claim_notification(
+            &pool,
+            key,
+            "customer_order_paid",
+            Uuid::new_v4(),
+            "ada@example.test",
+            Some("cs_2"),
+        )
+        .await
+        .expect("claim");
+        finish_notification(
+            &pool,
+            key,
+            false,
+            None,
+            Some("Resend refused the message (422)"),
+        )
+        .await
+        .expect("finish");
+
+        let failed = failed_notifications(&pool).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "ada@example.test");
+        assert_eq!(failed[0].1, "Resend refused the message (422)");
+        // A failed send does not free the claim: resending is a human's call.
+        assert!(!claim_notification(
+            &pool,
+            key,
+            "customer_order_paid",
+            Uuid::new_v4(),
+            "ada@example.test",
+            Some("cs_2"),
+        )
+        .await
+        .expect("reclaim"));
     }
 }

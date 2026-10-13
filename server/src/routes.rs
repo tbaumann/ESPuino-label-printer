@@ -17,6 +17,7 @@ use crate::models::{
     Prefix, PrefixInput, PrefixModePatch, PrefixStatus, PrintMode, PrintQueue, ShopConfig,
     StatusInput,
 };
+use crate::notify;
 use crate::stripe;
 use crate::AppState;
 
@@ -56,7 +57,12 @@ fn content_type_for(ext: &str) -> &'static str {
 /// the same filename (e.g. a re-upload as jpg over a stored png). `filename`
 /// is the full file name, e.g. `"3.png"` (front) or `"3-back.png"` (back).
 /// Returns the blob's path relative to the data dir, as stored in the DB.
-fn write_blob(data_dir: &PathBuf, prefix: Uuid, filename: &str, bytes: &[u8]) -> Result<String, ApiError> {
+fn write_blob(
+    data_dir: &PathBuf,
+    prefix: Uuid,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<String, ApiError> {
     let rel = format!("blobs/{prefix}/{filename}");
     let abs = data_dir.join(&rel);
     if let Some(parent) = abs.parent() {
@@ -92,7 +98,18 @@ async fn store_card_form(
     prefix: Uuid,
     id: i64,
     mode: PrintMode,
-) -> Result<(String, Option<String>, Option<String>, String, String, Option<String>, Option<String>), ApiError> {
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ),
+    ApiError,
+> {
     let mut name: Option<String> = None;
     let mut serial: Option<String> = None;
     let mut back: Option<String> = None;
@@ -186,7 +203,12 @@ async fn store_card_form(
         )));
     }
 
-    let image_rel = write_blob(data_dir, prefix, &format!("{id}.{}", extension_for(&ct)), &bytes)?;
+    let image_rel = write_blob(
+        data_dir,
+        prefix,
+        &format!("{id}.{}", extension_for(&ct)),
+        &bytes,
+    )?;
     let (back_rel, back_ct) = match back_image {
         Some((bbytes, bct)) => {
             let rel = write_blob(
@@ -1015,7 +1037,17 @@ pub async fn stripe_webhook(
 
     match event.kind.as_str() {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
-            record_payment(&st.pool, &event).await?;
+            // The email notifications are sent from inside `record_payment`,
+            // after the status write and outside its error path: a mail that
+            // cannot be delivered must never turn into a webhook Stripe retries
+            // for days, or into a paid order that never gets recorded.
+            record_payment(
+                &st.pool,
+                st.notifier.as_deref(),
+                &public_base_url(&st, &headers),
+                &event,
+            )
+            .await?;
         }
         "checkout.session.expired" => {
             revert_expired_checkout(&st.pool, &event.data.object).await?;
@@ -1032,7 +1064,17 @@ pub async fn stripe_webhook(
 /// Idempotent on purpose: Stripe retries, and a customer refreshing the success
 /// URL does not produce a second event, but a duplicated delivery is normal
 /// enough that it must be harmless.
-async fn record_payment(pool: &SqlitePool, event: &stripe::Event) -> Result<(), ApiError> {
+///
+/// `notifier` is `None` when email is not configured, in which case nothing is
+/// sent and nothing changes. When it is set, the paid confirmation goes out from
+/// the transition branch below — after the status write, and with every failure
+/// swallowed there, so the webhook's own health never depends on Resend.
+async fn record_payment(
+    pool: &SqlitePool,
+    notifier: Option<&notify::Notifier>,
+    base_url: &str,
+    event: &stripe::Event,
+) -> Result<(), ApiError> {
     let session = &event.data.object;
 
     // Klarna and SEPA report `completed` before the money actually moves; the
@@ -1086,16 +1128,38 @@ async fn record_payment(pool: &SqlitePool, event: &stripe::Event) -> Result<(), 
 
     match current.status {
         PrefixStatus::PaymentPending => {
-            let updated = db::set_status(
-                pool,
-                prefix,
-                PrefixStatus::Paid,
-                Some(&session.id),
-                false,
-            )
-            .await?;
+            let updated =
+                db::set_status(pool, prefix, PrefixStatus::Paid, Some(&session.id), false).await?;
             tracing::info!(%prefix, session = %session.id, amount = ?session.amount_total,
                 currency = ?session.currency, "payment recorded, prefix is now {}", updated.status);
+
+            // Tell the customer, and the operator, that this order is real.
+            //
+            // Deliberately here and not earlier: the status write above has
+            // already happened, so the order is recorded whatever becomes of the
+            // mail, and `order_paid` never fails its caller. Both messages are
+            // claimed under the Stripe session id, so Stripe retrying this very
+            // delivery cannot produce a second confirmation.
+            if let Some(notifier) = notifier {
+                notify::order_paid(
+                    pool,
+                    notifier,
+                    &notify::PaidOrder {
+                        prefix,
+                        base_url: base_url.to_string(),
+                        session_id: session.id.clone(),
+                        card_count: updated.card_count,
+                        amount_cents: session.amount_total,
+                        currency: session.currency.clone(),
+                        // The mode that was charged, which is what the spooler
+                        // will print.
+                        print_mode: updated.paid_print_mode.or(Some(updated.print_mode)),
+                        customer_email: session.payer_email().map(str::to_string),
+                        customer_name: session.payer_name().map(str::to_string),
+                    },
+                )
+                .await;
+            }
         }
         // Already handled — the normal case for a retried delivery of a prefix
         // still in flight (paid or queued). Nothing to do.
@@ -1334,9 +1398,9 @@ pub fn router(state: AppState) -> Router {
 mod tests {
     use super::*;
     use crate::rate_limit;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::sync::Arc;
     use std::time::Duration;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     /// A fresh in-memory database with all migrations applied.
     async fn test_pool() -> SqlitePool {
@@ -1363,6 +1427,8 @@ mod tests {
             payment_status: None,
             amount_total: None,
             currency: None,
+            customer_details: None,
+            customer_email: None,
             metadata: None,
         }
     }
@@ -1381,11 +1447,19 @@ mod tests {
                     payment_status: Some("paid".into()),
                     amount_total: Some(1750),
                     currency: Some("eur".into()),
+                    customer_details: Some(stripe::CustomerDetails {
+                        email: Some("ada@example.test".into()),
+                        name: Some("Ada Lovelace".into()),
+                    }),
+                    customer_email: None,
                     metadata: None,
                 },
             },
         }
     }
+
+    /// The public origin the tests hand to the notification path.
+    const TEST_BASE: &str = "https://cards.example.test";
 
     async fn status_of(pool: &SqlitePool, uuid: Uuid) -> PrefixStatus {
         db::get_prefix(pool, uuid).await.unwrap().status
@@ -1472,9 +1546,14 @@ mod tests {
             .await
             .unwrap();
 
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
         assert!(anomaly_kinds(&pool).await.is_empty());
     }
@@ -1492,9 +1571,14 @@ mod tests {
 
         // A retried delivery of the same settled event finds the prefix already
         // paid (or queued) — harmless, and not a dead end.
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
         assert!(anomaly_kinds(&pool).await.is_empty());
     }
@@ -1510,9 +1594,14 @@ mod tests {
             .await
             .unwrap();
 
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         // The order stays cancelled; the money is flagged, not spent.
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Cancelled);
         assert_eq!(
@@ -1526,9 +1615,14 @@ mod tests {
         let pool = test_pool().await;
         let p = db::create_prefix(&pool, None, None).await.unwrap(); // draft
 
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Draft);
         assert_eq!(
             anomaly_kinds(&pool).await,
@@ -1542,9 +1636,14 @@ mod tests {
         let p = db::create_prefix(&pool, None, None).await.unwrap();
         db::delete_prefix(&pool, p.uuid).await.unwrap();
 
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         // The prefix row is gone, but the anomaly survives with its uuid — this
         // is exactly the case the table exists for.
         assert_eq!(
@@ -1562,9 +1661,14 @@ mod tests {
             .await
             .unwrap();
 
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Printing);
         assert_eq!(
             anomaly_kinds(&pool).await,
@@ -1587,9 +1691,14 @@ mod tests {
             .unwrap();
 
         // Still in flight — a retried delivery is the normal case here.
-        record_payment(&pool, &payment_event(Some(&p.uuid.to_string())))
-            .await
-            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
         assert!(anomaly_kinds(&pool).await.is_empty());
     }
 
@@ -1601,6 +1710,7 @@ mod tests {
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
             stripe: None,
+            notifier: None,
             login_limiter: crate::auth::LoginLimiter::default(),
             checkout_limiter: limiter,
         }
@@ -1628,6 +1738,110 @@ mod tests {
         assert!(
             matches!(second, Err(ApiError::TooManyRequests(_))),
             "second use inside the window should be throttled, got {second:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Email notifications on a paid order
+    // -----------------------------------------------------------------------
+
+    use crate::notify::tests::{spawn_mock_resend, test_notifier};
+
+    /// A pending prefix, ready for a settled payment.
+    async fn pending_prefix(pool: &SqlitePool) -> Prefix {
+        let p = db::create_prefix(pool, None, None).await.unwrap();
+        db::set_status(pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn a_paid_order_mails_the_customer_and_the_operator_once() {
+        let pool = test_pool().await;
+        let mock = spawn_mock_resend().await;
+        let notifier = test_notifier(&mock.base_url, Some("shop@example.test"));
+        let p = pending_prefix(&pool).await;
+        let event = payment_event(Some(&p.uuid.to_string()));
+
+        // The same event three times, as Stripe redelivers it when a response is
+        // slow or lost. The confirmation must still go out once.
+        for _ in 0..3 {
+            record_payment(&pool, Some(&notifier), TEST_BASE, &event)
+                .await
+                .expect("the webhook path");
+        }
+
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+        assert_eq!(
+            mock.len(),
+            2,
+            "one customer confirmation, one operator note"
+        );
+
+        let customer = mock.to("ada@example.test").expect("customer email");
+        let text = customer["text"].as_str().expect("a text part");
+        assert!(
+            text.contains(&format!("{TEST_BASE}/p/{}", p.uuid)),
+            "the customer needs a way back to their project: {text}"
+        );
+        assert!(text.contains("17.50 EUR"), "{text}");
+
+        let operator = mock.to("shop@example.test").expect("operator note");
+        assert!(
+            operator["text"]
+                .as_str()
+                .expect("a text part")
+                .contains(&format!("{TEST_BASE}/admin/p/{}", p.uuid)),
+            "the operator note should link to the admin view"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_resend_never_fails_the_webhook() {
+        let pool = test_pool().await;
+        // Nothing listens on port 1, so connecting is refused immediately — a
+        // Resend outage, in effect.
+        let notifier = test_notifier("http://127.0.0.1:1", Some("shop@example.test"));
+        let p = pending_prefix(&pool).await;
+
+        // `Ok` is the assertion that matters: a mail failure must not become a
+        // webhook error, because Stripe would then retry for days, and the order
+        // must still be recorded.
+        record_payment(
+            &pool,
+            Some(&notifier),
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .expect("an email failure must never fail the webhook");
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+    }
+
+    #[tokio::test]
+    async fn a_dead_end_payment_mails_nobody() {
+        let pool = test_pool().await;
+        let mock = spawn_mock_resend().await;
+        let notifier = test_notifier(&mock.base_url, Some("shop@example.test"));
+        // A draft prefix: a settled payment with nothing awaiting it. That is a
+        // dead end for the "needs attention" list, not an order confirmation —
+        // there is no order to confirm.
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+
+        record_payment(
+            &pool,
+            Some(&notifier),
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .expect("the webhook path");
+
+        assert_eq!(mock.len(), 0, "no email for a payment that cannot attach");
+        assert_eq!(
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentForDraft]
         );
     }
 }

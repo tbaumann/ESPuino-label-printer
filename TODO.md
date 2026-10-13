@@ -123,7 +123,21 @@ unpaid. Without this, the first declined card becomes a support ticket.
   to do (refund, honour, rebuild by hand).
 - **Email notifications, via Resend.** Decided, and the account exists. There is no
   `RESEND_API_KEY` anywhere in the codebase yet; it goes in as an environment
-  variable like the Stripe secrets — never in the repo, never logged. Resend also
+  variable like the Stripe secrets — never in the repo, never logged.
+
+  **Done** — `server/src/notify.rs` (Resend over plain HTTP, like the Stripe
+  client) plus migration `0009_email_notifications.sql`. The customer's
+  confirmation and the operator note both go out on the `payment_pending` →
+  `paid` transition. Configuration is `RESEND_API_KEY`, `EMAIL_FROM` (a verified
+  Resend domain), `OPERATOR_EMAIL` (the operator copy; unset = customer only),
+  and `RESEND_API_BASE` for the mock. Both traps are handled: each message is
+  claimed in `email_notifications` under `<kind>:<stripe session id>` before it
+  is sent, so a retried or concurrent delivery of the same payment cannot send a
+  second email; and sending happens after the status write with every failure
+  swallowed and logged, so a Resend outage, a bounce or a mistyped key neither
+  fails the webhook nor loses the paid order. A failed send keeps its claim with
+  the reason recorded, so resending stays an operator decision rather than an
+  automatic retry that could double-send. Resend also
   requires a verified sending domain, so the from-address is a setup step under the
   owner's control, not a code detail.
 
