@@ -109,6 +109,7 @@ impl utoipa::Modify for SecurityAddon {
         routes::post_card,
         routes::get_card,
         routes::get_card_image,
+        routes::put_card_back_image,
                 routes::patch_card,
                 routes::delete_card,
                 routes::get_print_queue,

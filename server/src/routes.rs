@@ -92,6 +92,14 @@ fn write_blob(
 /// Pull `name`, `serial_number`, `back_text`, an `image` file and an optional
 /// `back_image` file out of a multipart form, validating the back fields
 /// against the prefix's `print_mode` *before* writing anything to disk.
+///
+/// The `back_image` is **optional even in `double_sided_color`**: a card exists
+/// from its front image, and the colour back is added per card afterwards
+/// (`put_card_back_image`, or this same form). Requiring it here would mean the
+/// front-image upload — a bulk, folder-at-a-time flow — could create nothing at
+/// all in that mode. What has to hold is that no *order* is sold with a back
+/// missing, and that is checked where the money is (`ensure_order_printable`),
+/// not here.
 async fn store_card_form(
     mut mp: Multipart,
     data_dir: &PathBuf,
@@ -188,19 +196,15 @@ async fn store_card_form(
             "back_text is only valid in a colour_front_black_back prefix, not {mode}"
         )));
     }
-    if mode.allows_back_image() {
-        let Some((_, bct)) = &back_image else {
-            return Err(ApiError::BadRequest(
-                "a double_sided_color prefix requires a back_image on every card".into(),
-            ));
-        };
-        if bct.is_empty() {
-            return Err(ApiError::BadRequest("back_image is empty".into()));
-        }
-    } else if back_image.is_some() {
+    if back_image.is_some() && !mode.allows_back_image() {
         return Err(ApiError::BadRequest(format!(
             "a back_image is only valid in a double_sided_color prefix, not {mode}"
         )));
+    }
+    if let Some((bbytes, _)) = &back_image {
+        if bbytes.is_empty() {
+            return Err(ApiError::BadRequest("back_image is empty".into()));
+        }
     }
 
     let image_rel = write_blob(
@@ -460,6 +464,99 @@ pub async fn get_card_back_image(
         bytes,
     )
         .into_response())
+}
+
+/// Pull a single named file part out of a multipart body.
+///
+/// Used by the back-image upload, which takes exactly one file and no text
+/// fields — the card's front, name and serial are already stored.
+async fn read_file_part(mut mp: Multipart, part: &str) -> Result<(Vec<u8>, String), ApiError> {
+    let mut found: Option<(Vec<u8>, String)> = None;
+    while let Some(field) = mp
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("malformed multipart: {e}")))?
+    {
+        if field.name() == Some(part) {
+            let ct = field
+                .content_type()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            found = Some((bytes.to_vec(), ct));
+        }
+    }
+    let (bytes, ct) =
+        found.ok_or_else(|| ApiError::BadRequest(format!("file field '{part}' is required")))?;
+    if bytes.is_empty() {
+        return Err(ApiError::BadRequest(format!("{part} is empty")));
+    }
+    Ok((bytes, ct))
+}
+
+/// Reject a colour back-image write that this prefix or card cannot take.
+///
+/// Split out from the handler so the two refusals that are not multipart
+/// plumbing — the mode has no colour back at all, and the card does not exist —
+/// are testable without building a multipart body.
+async fn ensure_back_image_writable(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    id: i64,
+    admin: bool,
+) -> Result<(), ApiError> {
+    let mode = db::ensure_writable(pool, prefix, admin).await?.print_mode;
+    if !mode.allows_back_image() {
+        return Err(ApiError::BadRequest(format!(
+            "a back_image is only valid in a double_sided_color prefix, not {mode}"
+        )));
+    }
+    db::get_card(pool, prefix, id).await?; // 404 for an unknown card
+    Ok(())
+}
+
+/// Upload or replace one card's colour back image, leaving the front alone.
+///
+/// This is what a `double_sided_color` card's back side is set through: cards
+/// are created from their front image (the dropzone uploads a folder at a
+/// time), and the back is then added per card. Only that mode has a back image
+/// at all, so the other two refuse the upload rather than storing a blob
+/// nothing will ever print.
+///
+/// Re-uploading replaces the stored blob, whatever format the old one was in —
+/// `write_blob` cleans the earlier file up, so there are no orphans.
+#[utoipa::path(put, path = "/api/prefixes/{prefix}/cards/{id}/back-image", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    request_body(content = String, content_type = "multipart/form-data",
+        description = "Multipart form carrying exactly one file part, `back_image`."),
+    responses(
+        (status = 200, body = Card),
+        (status = 400, description = "the mode has no colour back, or the file part is missing or empty", body = crate::error::ErrorBody),
+        (status = 404, description = "unknown prefix or card", body = crate::error::ErrorBody),
+        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+    ))]
+pub async fn put_card_back_image(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((prefix, id)): Path<(String, i64)>,
+    mp: Multipart,
+) -> Result<Json<Card>, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let caller = auth::resolve(&st, &headers).await?;
+    ensure_back_image_writable(&st.pool, prefix, id, caller.is_admin()).await?;
+    let (bytes, ct) = read_file_part(mp, "back_image").await?;
+    let rel = write_blob(
+        &st.data_dir,
+        prefix,
+        &format!("{id}-back.{}", extension_for(&ct)),
+        &bytes,
+    )?;
+    Ok(Json(
+        db::set_card_back_image(&st.pool, prefix, id, &rel, &ct).await?,
+    ))
 }
 
 /// Change a prefix's print mode while it is still writable.
@@ -956,6 +1053,36 @@ async fn ensure_mode_orderable(pool: &SqlitePool, mode: PrintMode) -> Result<(),
     Ok(())
 }
 
+/// Refuse an order that is missing part of a card, so nothing is sold that
+/// cannot be printed.
+///
+/// The one case today is `double_sided_color`, whose colour back is uploaded
+/// per card: a prefix can hold cards whose back is still missing, and nothing
+/// downstream would notice until the spooler went looking for the file. Same
+/// place and same reasoning as the ribbon stock check — the layer that takes the
+/// money is where "can this actually be made" has to hold.
+///
+/// Like `ensure_mode_orderable`, it reconciles nothing: a prefix already priced
+/// is not repriced or refunded, it just cannot open a *new* session until the
+/// missing back is uploaded.
+async fn ensure_order_printable(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    mode: PrintMode,
+) -> Result<(), ApiError> {
+    if !mode.allows_back_image() {
+        return Ok(());
+    }
+    let missing = db::cards_missing_back_image(pool, prefix).await?;
+    if missing > 0 {
+        return Err(ApiError::Conflict(format!(
+            "prefix {prefix} is {mode} and {missing} of its cards have no back image yet; \
+             every card needs one before the order can be printed"
+        )));
+    }
+    Ok(())
+}
+
 /// Start a Stripe Checkout session for a prefix and return where to send the
 /// browser.
 ///
@@ -976,7 +1103,7 @@ async fn ensure_mode_orderable(pool: &SqlitePool, mode: PrintMode) -> Result<(),
         (status = 200, body = stripe::CheckoutSession),
         (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
-        (status = 409, description = "the prefix has no cards, is already past payment, or its print mode's ribbon is out of stock", body = crate::error::ErrorBody),
+        (status = 409, description = "the prefix has no cards, is already past payment, its print mode's ribbon is out of stock, or a card is missing its back side", body = crate::error::ErrorBody),
         (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
         (status = 502, description = "Stripe refused or could not be reached", body = crate::error::ErrorBody)
     ))]
@@ -1017,6 +1144,10 @@ pub async fn create_checkout(
     }
 
     ensure_mode_orderable(&st.pool, p.print_mode).await?;
+    // A card is only complete once its back side is: in `double_sided_color`
+    // that is an uploaded image, and a card without one would reach the spooler
+    // as a front with a hole where its back should be.
+    ensure_order_printable(&st.pool, prefix, p.print_mode).await?;
 
     // The price is the mode's, looked up from the database — not a single
     // environment-wide per-card figure. A mode with no configured price is a
@@ -1420,7 +1551,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/back-image",
-            axum::routing::get(get_card_back_image),
+            axum::routing::get(get_card_back_image).put(put_card_back_image),
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/printed",
@@ -1529,6 +1660,25 @@ mod tests {
 
     async fn status_of(pool: &SqlitePool, uuid: Uuid) -> PrefixStatus {
         db::get_prefix(pool, uuid).await.unwrap().status
+    }
+
+    /// A minimal card: a front image, plus a colour back image if `back` is
+    /// given. The blob paths are never read by these tests, only the metadata.
+    async fn insert_card(pool: &SqlitePool, prefix: Uuid, id: i64, back: Option<&str>) {
+        db::upsert_card(
+            pool,
+            prefix,
+            id,
+            "c",
+            None,
+            None,
+            "blobs/f.png",
+            "image/png",
+            back,
+            back.map(|_| "image/png"),
+        )
+        .await
+        .expect("upsert card");
     }
 
     #[tokio::test]
@@ -1809,6 +1959,104 @@ mod tests {
         ensure_mode_orderable(&pool, PrintMode::DoubleSidedColor)
             .await
             .expect("restocked");
+    }
+
+    #[tokio::test]
+    async fn a_colour_back_image_needs_the_colour_mode_and_a_real_card() {
+        let pool = test_pool().await;
+
+        // A mode with no colour back at all: the upload is refused rather than
+        // stored as a blob nothing will ever print.
+        let single = db::create_prefix(&pool, None, Some(PrintMode::SingleSided))
+            .await
+            .unwrap();
+        insert_card(&pool, single.uuid, 1, None).await;
+        let err = ensure_back_image_writable(&pool, single.uuid, 1, false)
+            .await
+            .expect_err("single_sided has no colour back");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        assert!(err.to_string().contains("double_sided_color"), "{err}");
+
+        // The colour mode, but no such card to attach the back to.
+        let colour = db::create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .unwrap();
+        let err = ensure_back_image_writable(&pool, colour.uuid, 1, false)
+            .await
+            .expect_err("no such card");
+        assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
+
+        // With the card there it goes through...
+        insert_card(&pool, colour.uuid, 1, None).await;
+        ensure_back_image_writable(&pool, colour.uuid, 1, false)
+            .await
+            .expect("a colour back on a colour-mode card");
+
+        // ...until the prefix is sealed for the customer. The operator keeps the
+        // write while the order is in flight, which is what lets a missing back
+        // be filled in after the customer has paid.
+        db::set_status(&pool, colour.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        let err = ensure_back_image_writable(&pool, colour.uuid, 1, false)
+            .await
+            .expect_err("sealed for the customer");
+        assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
+        ensure_back_image_writable(&pool, colour.uuid, 1, true)
+            .await
+            .expect("the operator may still edit a pending order");
+
+        // Printing freezes the write for everybody, operator included. (The
+        // *status* stays movable, which is what makes a stuck job recoverable;
+        // the card's sides are fixed by then.)
+        db::set_status(&pool, colour.uuid, PrefixStatus::Printing, None, true)
+            .await
+            .unwrap();
+        let err = ensure_back_image_writable(&pool, colour.uuid, 1, true)
+            .await
+            .expect_err("printing is frozen");
+        assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_order_with_a_card_missing_its_colour_back_is_not_sellable() {
+        let pool = test_pool().await;
+
+        // The colour mode: one of two cards still has no back image, so the
+        // order cannot be printed and must not be sold.
+        let colour = db::create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+            .await
+            .unwrap();
+        insert_card(&pool, colour.uuid, 1, Some("blobs/1-back.png")).await;
+        insert_card(&pool, colour.uuid, 2, None).await;
+        let err = ensure_order_printable(&pool, colour.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect_err("a card is missing its back");
+        assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
+        assert!(err.to_string().contains("back image"), "{err}");
+
+        // Uploading the missing back opens the sale, with nothing to reset.
+        db::set_card_back_image(&pool, colour.uuid, 2, "blobs/2-back.png", "image/png")
+            .await
+            .unwrap();
+        ensure_order_printable(&pool, colour.uuid, PrintMode::DoubleSidedColor)
+            .await
+            .expect("every card is complete");
+
+        // The other two modes have no colour back to be missing: their cards
+        // carry no back image at all and that is the whole card.
+        let single = db::create_prefix(&pool, None, Some(PrintMode::SingleSided))
+            .await
+            .unwrap();
+        insert_card(&pool, single.uuid, 1, None).await;
+        ensure_order_printable(&pool, single.uuid, PrintMode::SingleSided)
+            .await
+            .expect("single-sided has no back side");
+        let black = db::create_prefix(&pool, None, None).await.unwrap();
+        insert_card(&pool, black.uuid, 1, None).await;
+        ensure_order_printable(&pool, black.uuid, PrintMode::ColorFrontBlackBack)
+            .await
+            .expect("the black back is text, not an image");
     }
 
     #[tokio::test]

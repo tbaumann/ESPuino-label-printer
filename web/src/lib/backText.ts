@@ -71,3 +71,17 @@ export function renderBackText(markdown: string): string {
   const html = marked.parse(markdown, { async: false })
   return DOMPurify.sanitize(html, { ALLOWED_TAGS, ALLOWED_ATTR: [] })
 }
+
+/**
+ * Whether the markdown asks for an image, which the black-only back refuses
+ * outright (the whole construct is dropped, alt text included).
+ *
+ * This is a courtesy for the editor, not part of the two-renderer contract: it
+ * only decides whether to *say* that an image was dropped, so a customer aiming
+ * for artwork on a 1-bit back is told instead of shown a gap. Deliberately a
+ * loose match — a false positive costs one sentence, a false negative costs the
+ * customer their picture without a word.
+ */
+export function hasImageSyntax(markdown: string): boolean {
+  return /!\[[^\]]*\]\(/.test(markdown)
+}

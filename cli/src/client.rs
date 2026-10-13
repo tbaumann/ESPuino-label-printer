@@ -204,4 +204,31 @@ impl Client {
         };
         self.send(req.multipart(form)).await
     }
+
+    /// Upload (or replace) one card's colour back image, leaving its front
+    /// alone. Only a `double_sided_color` prefix accepts this; the server
+    /// answers 400 in the other two modes.
+    pub async fn upload_back_image(&self, prefix: &str, id: i64, file: &Path) -> Result<Value> {
+        let bytes = tokio::fs::read(file)
+            .await
+            .with_context(|| format!("reading {}", file.display()))?;
+        let filename = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("back")
+            .to_string();
+        let part = Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(mime_for(file))?;
+        let form = Form::new().part("back_image", part);
+        self.send(
+            self.http
+                .put(format!(
+                    "{}/api/prefixes/{prefix}/cards/{id}/back-image",
+                    self.base
+                ))
+                .multipart(form),
+        )
+        .await
+    }
 }

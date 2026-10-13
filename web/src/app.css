@@ -360,22 +360,51 @@ section.panel {
   display: block;
 }
 
-/* Back side: black & white, half-panel — rendered client-side as a preview. */
+/* Back side. The two two-sided modes render it differently: the black-back mode
+   from markdown, client-side; the colour mode from the uploaded image. */
 .preview.back {
   background: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  overflow: auto;
+}
+
+/* The colour back is the uploaded artwork, shown as it will be printed: in
+   colour, on a full panel. */
+.preview.back .backart {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.preview.back .no-back-image {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The black-only back. Paper white and pure black ink — never the theme's
+   colours, and never a grey: the medium is 1 bit per pixel, so what the pane
+   shows is what the black panel can produce. The panel is the full back, not
+   half of it (half-panel ribbons can only do the inverse of what these modes
+   need — see TODO.md). */
+.preview.back.black-only {
   color: #000;
   font-family: var(--mono);
   font-size: 10px;
   line-height: 1.25;
-  padding: 6px 8px;
   white-space: pre-wrap;
-  overflow: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  -webkit-font-smoothing: none;
+  font-smooth: never;
 }
 
-.preview.back .halfpanel {
+.preview.back .panel {
   border: 1px dashed #bbb;
   border-radius: 4px;
   padding: 4px 5px;
@@ -387,26 +416,71 @@ section.panel {
    bold, italic, lists) and the medium is 1-bit black, so keep it flat: no
    margins between blocks, tight lists, and the same mono face as the rest of
    the back. */
-.preview.back .halfpanel h1,
-.preview.back .halfpanel h2,
-.preview.back .halfpanel h3,
-.preview.back .halfpanel h4,
-.preview.back .halfpanel h5,
-.preview.back .halfpanel h6 {
+.preview.back .panel h1,
+.preview.back .panel h2,
+.preview.back .panel h3,
+.preview.back .panel h4,
+.preview.back .panel h5,
+.preview.back .panel h6 {
   font-size: inherit;
   font-weight: 700;
   margin: 0;
 }
-.preview.back .halfpanel p {
+.preview.back .panel p {
   margin: 0;
 }
-.preview.back .halfpanel ul,
-.preview.back .halfpanel ol {
+.preview.back .panel ul,
+.preview.back .panel ol {
   margin: 0;
   padding-left: 14px;
 }
-.preview.back .halfpanel li {
+.preview.back .panel li {
   margin: 0;
+}
+
+/* Fields a mode adds to the shared ones. */
+.hint {
+  font-size: 12px;
+  line-height: 1.35;
+  margin-top: 4px;
+}
+
+/* A note about something the chosen medium cannot print (an image on a 1-bit
+   black back). Amber, not red: it is not an error, it is the option's limit. */
+.hint.warn {
+  color: #b07000;
+}
+
+.hint code {
+  font-family: var(--mono);
+}
+
+input[type='file'] {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  max-width: 100%;
+}
+
+input[type='file']::file-selector-button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin-right: 8px;
+  cursor: pointer;
+}
+
+input[type='file']:disabled::file-selector-button {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.no-back-side {
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .preview .caption {

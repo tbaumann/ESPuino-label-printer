@@ -76,6 +76,7 @@ Commands (every API field is a flag):
 | `prefix set-status <P> <STATUS> [--order-ref R]` | set a prefix's status (any transition) |
 | `card list <P>` | index of cards in a prefix |
 | `card get <P> <ID>` / `card delete <P> <ID>` | card metadata / delete |
+| `card back-image <P> <ID> <FILE>` | upload/replace a card's colour back image (`double_sided_color` only) |
 | `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back-text T]` | upload one card |
 | `batch <P> <DIR> [--recursive] [--start-id N] [--name-template T] [--serial-prefix P] [--serial-width W] [--back-text T] [--dry-run]` | upload a folder |
 
@@ -131,12 +132,39 @@ Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
 projects are remembered in `localStorage`. A project page holds the print-option
 chooser (one radio per print mode, with its price; a mode whose ribbon is out of
 stock is shown greyed out and disabled, never removed), the drop zone (drag
-images, or a whole folder) and one row per card: front and back preview panes,
-name, serial number, back text, and delete.
+images, or a whole folder) and one row per card.
 
-Front and back previews are rendered **client-side** — the front is the stored
-image, the back is `back_text` laid out in a CR80-aspect panel. The server
-stores no rendered back image.
+### One card component per print mode
+
+The mode decides what a card *is*, so it decides what a row shows and which
+inputs it offers. There is one component per mode under `web/src/lib/cards/`,
+picked by `CardRow.svelte`; the parts all three share (front preview, name,
+serial, delete, and the debounced save) live in `cards/CardFields.svelte`.
+
+| Mode | Back side | The row offers |
+|------|-----------|----------------|
+| `single_sided` | none at all | no back field and no back pane — it says the option has none |
+| `double_sided_color` | an uploaded colour image | a file input per card, and the uploaded back as the preview |
+| `color_front_black_back` | markdown, black only | the back-text textarea, and a 1-bit black preview |
+
+The drop zone uploads **fronts** — one file, one card — so in colour mode a card
+starts without its back image and the row asks for it. The pane and the page
+badge say how many cards are still incomplete, and the Pay button stays disabled
+while any are: the checkout refuses such an order with `409` as well, because a
+card with one side missing cannot be printed. Completing it needs no new state —
+the badge and the button follow the upload.
+
+The black-back preview is deliberately honest about the medium: paper white,
+pure black ink, no greys and no theme colours, because that is what a 1-bit
+black panel can produce. The renderer drops images whole (see "Markdown in the
+back text" in TODO.md), so the editor *says* that image markup will not be
+printed rather than showing a gap where the artwork was. Everything the preview
+shows, the print queue prints: the server renders `back_text` through the same
+subset (`server/src/backtext.rs`) and carries it as `PrintQueueCard.back_html`.
+
+Previews are rendered **client-side** — the front is the stored image, the
+colour back is the stored back image, the black back is `back_text` laid out in
+a CR80-aspect, black-on-white panel. The server stores no rendered back.
 
 ### Admin UI (`/admin`)
 
@@ -374,9 +402,12 @@ data/
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
   `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
   the back side carries depends on the prefix's `print_mode`: black-back mode
-  uses `back_text` (markdown); double-sided colour requires a `back_image` file;
-  single-sided has neither. A back field that does not fit the mode is rejected
-  by the API, never silently stored.
+  uses `back_text` (markdown); double-sided colour takes an uploaded
+  `back_image`; single-sided has neither. A back field that does not fit the
+  mode is rejected by the API, never silently stored. In colour mode the back
+  image is uploaded per card **after** the front (the dropzone is a bulk flow),
+  so a card can exist while its back is still missing — it is just not
+  *complete*, and an order holding one is refused at the checkout (`409`).
 
 ## Prefix lifecycle
 
@@ -496,6 +527,7 @@ an admin session.
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | colour back image bytes (double_sided_color only) |
+| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the colour back image (double_sided_color only) |
 | GET    | `/api/shop/config`                     | price, currency, ribbon availability, and whether payment is on |
 | PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
@@ -505,11 +537,19 @@ an admin session.
 | DELETE | `/api/admin/session`                   | log out                       |
 
 Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
-`name`, `serial_number`, `back_text` and a file part `image`; a
-`double_sided_color` prefix additionally requires a `back_image` file part.
-`back_text` is only accepted in `color_front_black_back` mode, and `back_image`
-only in `double_sided_color` — a back field that does not fit the prefix's mode
-is rejected with `400`, never silently stored.
+`name`, `serial_number`, `back_text` and a file part `image`, plus an optional
+`back_image` file part. `back_text` is only accepted in
+`color_front_black_back` mode, and `back_image` only in `double_sided_color` — a
+back field that does not fit the prefix's mode is rejected with `400`, never
+silently stored.
+
+`back_image` is optional even in `double_sided_color`, because cards are created
+by the front-image dropzone, one file at a time. A card without one is simply not
+complete: its own row offers the upload (`PUT
+.../cards/{id}/back-image`, which leaves the front alone), and an order
+containing an incomplete card is refused at the checkout with `409` rather than
+sold. `requires a back_image on every card` at creation time would have made the
+colour mode impossible to upload into at all.
 
 `PUT` is full-replace and **requires** the image; use `PATCH` to edit
 name/serial/back text without re-uploading it. Re-uploading an image in a

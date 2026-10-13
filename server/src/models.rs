@@ -227,12 +227,17 @@ pub struct Card {
     pub id: i64,
     pub name: String,
     pub serial_number: Option<String>,
-    /// Black & white only back-side text (half panel, saves ribbon).
+    /// Markdown for the black-only back (`color_front_black_back` only — the
+    /// other modes refuse it). `None` in those modes, and for a black-back card
+    /// whose text has been cleared.
     pub back_text: Option<String>,
     pub image_content_type: String,
     /// Non-None only when this card has an uploaded colour back image
-    /// (`double_sided_color` mode). Never serialized from the path; this holds
-    /// the stored content-type purely as the signal that a back image exists.
+    /// (`double_sided_color` mode), and only once one has been uploaded: a card
+    /// exists from its front image alone, and the colour back is added per card
+    /// afterwards. Never serialized from the path; this holds the stored
+    /// content-type purely as the signal that a back image exists — which is
+    /// also what the checkout reads to decide whether the card is complete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub back_image_content_type: Option<String>,
     pub created_at: String,
@@ -294,9 +299,14 @@ pub struct CardIndex {
 /// OpenAPI; the handler parses the fields directly.
 ///
 /// `back_text` is only valid in `color_front_black_back` mode; a `back_image`
-/// file part is only valid (and, there, required) in `double_sided_color` mode.
-/// The handler rejects a back field that does not fit the prefix's mode rather
-/// than silently storing it.
+/// file part is only valid in `double_sided_color` mode. The handler rejects a
+/// back field that does not fit the prefix's mode rather than silently storing
+/// it.
+///
+/// `back_image` is optional even in the colour mode: the colour back is added
+/// per card through `PUT .../cards/{id}/back-image`, because cards are created
+/// by the folder-at-a-time front-image upload. A card without one is simply not
+/// complete, and an order containing one is refused at the checkout.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct CardInput {

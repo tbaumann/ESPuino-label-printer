@@ -24,10 +24,30 @@ export interface Card {
   id: number
   name: string
   serial_number: string | null
+  /** Markdown for the black-only back. Only `color_front_black_back` has one. */
   back_text: string | null
   image_content_type: string
+  /**
+   * Present only once a colour back image has been uploaded
+   * (`double_sided_color`). The content type is the signal that a back image
+   * exists — the stored path is never serialized. Omitted by the server when
+   * there is none, so a card without a colour back reads as `undefined`.
+   */
+  back_image_content_type?: string | null
   created_at: string
   updated_at: string
+}
+
+/**
+ * Whether this card is still missing a side it needs to be printed.
+ *
+ * Only `double_sided_color` has a back image, and a card exists from its front
+ * alone, so this is what the card row offers an upload for and what the project
+ * page counts before it offers to pay — the server refuses such an order too
+ * (409), because that is where it must hold.
+ */
+export function needsBackImage(card: Card): boolean {
+  return !card.back_image_content_type
 }
 
 export interface CardIndex {
@@ -215,6 +235,27 @@ export const api = {
 
   cardImageUrl: (p: string, id: number): string =>
     `/api/prefixes/${p}/cards/${id}/image`,
+
+  /**
+   * The card's colour back image (`double_sided_color` only).
+   *
+   * The URL is stable across a re-upload, so pass something that changes —
+   * the card's `updated_at` is the honest answer — or the browser will keep
+   * showing the back the customer just replaced.
+   */
+  cardBackImageUrl: (p: string, id: number, version?: string): string =>
+    `/api/prefixes/${p}/cards/${id}/back-image${version ? `?v=${encodeURIComponent(version)}` : ''}`,
+
+  /**
+   * Attach or replace one card's colour back image, leaving the front alone.
+   * Only a `double_sided_color` prefix accepts this; the server answers 400 in
+   * the other two modes.
+   */
+  uploadBackImage: (p: string, id: number, file: File): Promise<Card> => {
+    const fd = new FormData()
+    fd.append('back_image', file, file.name)
+    return req<Card>(`/api/prefixes/${p}/cards/${id}/back-image`, { method: 'PUT', body: fd })
+  },
 
   /** Price and currency, so the UI can show a total before sending anyone to Stripe. */
   shopConfig: (): Promise<ShopConfig> => req<ShopConfig>('/api/shop/config'),
