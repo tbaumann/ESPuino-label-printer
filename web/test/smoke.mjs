@@ -229,6 +229,14 @@ console.log('\nB. project page renders a card')
       '![img](https://example.com/x.png)',
       '',
       '<script>alert(1)</script>',
+      '',
+      // GFM and raw HTML: not in the subset. Both renderers have to treat them
+      // the same way or the preview promises a card the print does not deliver:
+      // `~~x~~` stays literal (no strikethrough is parsed) and an HTML block is
+      // dropped with its text (no DOMPurify-only "keep the content").
+      '~~struck~~',
+      '',
+      '<div>blocked</div>',
     ].join('\n')
     const fd = new NodeFormData()
     fd.append('name', 'MD Card')
@@ -246,6 +254,13 @@ console.log('\nB. project page renders a card')
     check('link is plain text, no <a>', !/<a\b/.test(html) && /link/.test(html))
     check('image is refused', !/<img\b/.test(html))
     check('raw HTML is stripped', !/<script\b/.test(html) && !/alert\(1\)/.test(html))
+    // Neither side parses GFM...
+    check('gfm strikethrough stays literal',
+      html.includes('~~struck~~') && !/<del\b/.test(html), html)
+    // ...and raw HTML goes whole, text included, not tag-only as DOMPurify
+    // alone would do it.
+    check('an HTML block is dropped with its text',
+      !/<div\b/.test(html) && !html.includes('blocked'), html)
 
     // Two renderers have to agree: the preview above, and the server-side render
     // the print queue carries (server/src/backtext.rs). Same markdown, same card

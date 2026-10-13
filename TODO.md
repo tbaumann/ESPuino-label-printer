@@ -33,7 +33,14 @@ plus `DOMPurify` (`web/src/lib/backText.ts`), no hand-rolled parser.
     (print queue, pulldown-cmark + our own writer); the smoke test renders the
     same markdown through both and asserts the print queue's rendering is the one
     previewed. `PrintQueueCard.back_html` is that render — the spooler prints it
-    instead of re-rendering the markdown itself.
+    instead of re-rendering the markdown itself. Both sides parse **CommonMark
+    only** (`gfm: false` in the SPA, `Options::empty()` on the server) and drop
+    raw HTML **whole, tag and text**. Those were the two divergences left after
+    the first cut — `~~x~~` previewed as "x" and printed as "~~x~~", and an HTML
+    block showed text in the preview that the print dropped. Found by rendering
+    the same 46-input set (tight/loose lists, hard and soft breaks, inline code,
+    quotes, rules, raw HTML, GFM constructs) through both pipelines and comparing
+    the canonical DOM, rather than only the agreed-subset cases.
   - The medium is 1-bit black: no colour, no greys. Images in the markdown are
     **refused outright** (the whole construct is dropped, alt text included).
     The supported subset is small: headings, bold, italic and lists. Links are

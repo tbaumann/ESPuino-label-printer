@@ -20,10 +20,19 @@ import DOMPurify from 'dompurify'
 //     card, so no <a> is ever emitted (and a `javascript:` href is inert);
 //   - images are REFUSED outright: the whole construct is dropped, no alt
 //     text, no placeholder;
-//   - raw HTML is stripped, never passed through.
+//   - raw HTML is dropped whole — tag and text — never passed through, so
+//     nothing in the markdown is ever treated as markup.
+//
+// Parsing is CommonMark only (`gfm: false`), the same options the server
+// renderer uses: tables, `~~strikethrough~~` and bare-URL autolinks are GFM,
+// they are not in the subset, and a preview that renders them would be
+// promising a card the printer cannot produce.
 //
 // The output is sanitised with DOMPurify against an allowlist of exactly the
 // subset tags, so `{@html}` in the component is safe to use on it.
+//
+// The agreement is asserted, not assumed: the same inputs are rendered through
+// both pipelines in the smoke test (`web/test/smoke.mjs`, scenario B2).
 
 const ALLOWED_TAGS = [
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -33,6 +42,11 @@ const ALLOWED_TAGS = [
 const marked = new Marked({
   // Sync only: the renderer is pure string-in/string-out, no async extensions.
   async: false,
+  // CommonMark only, matching the server renderer's `Options::empty()`. GFM
+  // would parse tables, `~~strikethrough~~` and bare-URL autolinks here that
+  // the print side does not implement, so `~~x~~` would preview as "x" and
+  // print as "~~x~~". Neither side parses them; both print the literal text.
+  gfm: false,
   renderer: {
     // Refuse images outright: drop the whole construct, alt text included.
     image() {
@@ -42,6 +56,12 @@ const marked = new Marked({
     // link stays bold) but never emit an <a>.
     link(token) {
       return this.parser.parseInline(token.tokens ?? [])
+    },
+    // Raw HTML is dropped whole, text included — the server renderer never
+    // passes a tag through either. DOMPurify on its own would strip the tag but
+    // keep its text, which the print side would then not have.
+    html() {
+      return ''
     },
   },
 })

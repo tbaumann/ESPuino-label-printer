@@ -20,10 +20,16 @@
 //!     card, so no `<a>` is ever emitted (and a `javascript:` href is inert);
 //!   - images are REFUSED outright: the whole construct is dropped, alt text
 //!     included, leaving at most an empty `<p>`;
-//!   - raw HTML is dropped outright, never passed through. (The SPA's DOMPurify
-//!     keeps the *text* of a stripped element; here the markup is dropped whole.
-//!     Both are safe — nothing from the markdown is ever treated as markup — and
-//!     a card back has no business containing raw HTML.)
+//!   - raw HTML is dropped outright, never passed through — the SPA drops it
+//!     the same way (`renderer.html`), tag text included, so nothing in the
+//!     markdown is ever treated as markup on either side. DOMPurify alone would
+//!     strip the tag but keep its text, which is why the SPA does not rely on it
+//!     for this.
+//!
+//! Parsing is CommonMark only (`Options::empty()`), matching the SPA's `marked`
+//! (`gfm: false`): tables, `~~strikethrough~~` and bare-URL autolinks are GFM,
+//! they are not in the subset, and a preview that rendered them would promise a
+//! card the spooler cannot produce. Both print the literal text instead.
 //!
 //! The output is built tag by tag from an allowlist, so it is safe to treat as
 //! HTML: no attribute, no tag and no text outside the subset is ever emitted,
@@ -183,11 +189,25 @@ mod tests {
     }
 
     #[test]
-    fn raw_html_is_never_passed_through() {
+    fn raw_html_is_dropped_whole() {
         let html = render_back_text("<script>alert(1)</script>\n");
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("alert(1)"), "{html}");
         assert_eq!(html, "");
+        // An HTML block goes with its text — the SPA's `renderer.html` returns
+        // nothing either, so the preview cannot show a word the print drops.
+        assert_eq!(render_back_text("<div>block</div>\n"), "");
+        // Inline tags are dropped where they stand; the text around them is
+        // ordinary text and survives on both sides.
+        assert_eq!(render_back_text("a <b>bold</b> c\n"), "<p>a bold c</p>\n");
+        assert_eq!(
+            render_back_text("x <div>block</div> y\n"),
+            "<p>x block y</p>\n"
+        );
+        assert_eq!(
+            render_back_text("text with <br> in it\n"),
+            "<p>text with  in it</p>\n"
+        );
         // Text is escaped, so a stray '<' cannot open a tag.
         assert_eq!(
             render_back_text("a < b & c > d\n"),
@@ -197,12 +217,29 @@ mod tests {
 
     #[test]
     fn constructs_outside_the_subset_degrade_to_their_text() {
-        // DOMPurify strips the wrapper tags on the SPA side and keeps the text;
-        // do the same here.
+        // The sanitiser strips the wrapper tags on the SPA side and keeps the
+        // text; do the same here.
         assert_eq!(render_back_text("> quoted\n"), "<p>quoted</p>\n");
         assert_eq!(render_back_text("a `code` b\n"), "<p>a code b</p>\n");
         assert_eq!(render_back_text("```\nfn x() {}\n```\n"), "fn x() {}\n");
         assert_eq!(render_back_text("a\n\n---\n\nb\n"), "<p>a</p>\n<p>b</p>\n");
+    }
+
+    #[test]
+    fn gfm_constructs_stay_literal() {
+        // Parsing is CommonMark only on both sides (`Options::empty()` here,
+        // `gfm: false` in the SPA), so what GFM would have consumed is printed
+        // as the text the customer typed. A preview that rendered `~~x~~` as
+        // "x" would be promising a card this renderer cannot produce.
+        assert_eq!(render_back_text("~~struck~~\n"), "<p>~~struck~~</p>\n");
+        assert_eq!(
+            render_back_text("| a | b |\n| - | - |\n| 1 | 2 |\n"),
+            "<p>| a | b |\n| - | - |\n| 1 | 2 |</p>\n"
+        );
+        assert_eq!(
+            render_back_text("https://auto.example\n"),
+            "<p>https://auto.example</p>\n"
+        );
     }
 
     #[test]
