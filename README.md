@@ -168,7 +168,8 @@ money arrived.
 4. the webhook is the only thing that marks an order paid. It verifies the
    `Stripe-Signature` header, reads the prefix uuid out of `client_reference_id`,
    moves `payment_pending → paid`, and stores the Stripe session id as
-   `order_ref`.
+   `order_ref`. That transition is also what sends the order emails — see
+   "Email notifications (Resend)" below.
 
 **The redirect is not proof of payment.** It is a separate event from the webhook
 and can arrive first — or be typed in by hand. So the project page never trusts
@@ -254,13 +255,59 @@ Stripe signs them:
 
 ```sh
 python3 scripts/mock_stripe.py 12111 &
+python3 scripts/mock_resend.py 12112 &
 DATA_DIR=/tmp/esplp-stripe STRIPE_SECRET_KEY=sk_test_x \
   STRIPE_WEBHOOK_SECRET=whsec_test_secret STRIPE_API_BASE=http://127.0.0.1:12111 \
   PUBLIC_BASE_URL=http://127.0.0.1:8080 \
   STRIPE_SHIPPING_CENTS=250 \
+  RESEND_API_KEY=re_test_x RESEND_API_BASE=http://127.0.0.1:12112 \
+  EMAIL_FROM='ESPuino <orders@example.test>' OPERATOR_EMAIL=shop@example.test \
   ./target/debug/espuino-label-printer &
 python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 ```
+
+## Email notifications (Resend)
+
+A paid order sends two emails: the **customer's order confirmation**, and a
+**note to the operator** so an order can be queued without watching the UI.
+Those are the only two so far — `printed`/`shipped` are the obvious next ones,
+and `server/src/notify.rs` is where they would join.
+
+Both are triggered by the Stripe webhook, which shapes the design in two ways:
+
+  - **exactly once per transition.** Stripe retries a delivery until it is
+    answered 2xx, so a naive send mails the customer three times for one
+    payment. Each message is *claimed* in `email_notifications` under
+    `<kind>:<stripe session id>` before it is sent, and a duplicate or
+    concurrent delivery loses the claim and sends nothing — so a replayed event
+    is free;
+  - **never the webhook's failure.** Sending happens after the `paid` status
+    write and every failure is swallowed and logged: a Resend outage, a bounce
+    or a mistyped key cannot make Stripe retry for days, and cannot leave a paid
+    order unrecorded. A failed message keeps its claim, with the reason
+    recorded — resending is an operator decision, not an automatic retry.
+
+`RESEND_API_KEY` unset, or no `EMAIL_FROM`, switches sending off, with a warning
+saying which: an unmailable shop is the failure mode hardest to notice. The
+confirmation goes to the address on the Stripe session (`customer_details.email`,
+which is what Checkout collects) and links back to `{PUBLIC_BASE_URL}/p/<uuid>`
+— the thing Stripe's own receipt does not provide. The operator note carries the
+card count, the print mode, the amount and the customer's contact details.
+
+### Setting it up
+
+1. verify a sending domain in Resend — it refuses any other from-address;
+2. put the API key in `RESEND_API_KEY`: environment only, never in the repo;
+3. set `EMAIL_FROM` to an address on that domain, e.g.
+   `ESPuino <orders@example.com>`;
+4. set `OPERATOR_EMAIL` for the operator copy; leave it unset and only the
+   customer is mailed;
+5. make sure `PUBLIC_BASE_URL` is right, or the link in the email goes nowhere.
+
+`RESEND_API_BASE` points the client at a mock: `scripts/mock_resend.py` stands in
+for `api.resend.com` and records every message it is asked to send.
+`scripts/stripe_e2e_test.py` covers the whole path (its section 5b), including
+that a *replayed* webhook delivery sends no second email.
 
 ## Configuration (server environment)
 
@@ -282,6 +329,10 @@ python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 | `STRIPE_COUNTRIES` | `DE,AT,CH`                 | allowed shipping-address countries |
 | `STRIPE_EXCLUDED_PAYMENT_METHODS` | *(none)*       | methods to never offer in a session |
 | `STRIPE_PAYMENT_METHOD_CONFIGURATION` | *(unset)*  | pin sessions to a Dashboard `pmc_…` configuration |
+| `RESEND_API_KEY` | *(unset)*                   | Resend API key; unset (or no `EMAIL_FROM`) switches order emails off |
+| `EMAIL_FROM`   | *(unset)*                      | sending address, on a domain verified in Resend, e.g. `ESPuino <orders@example.com>` |
+| `OPERATOR_EMAIL` | *(unset)*                    | where the operator's copy of a paid order goes; unset = the customer only |
+| `RESEND_API_BASE` | `https://api.resend.com`    | API base; override to point at a mock |
 
 Layout on disk:
 
