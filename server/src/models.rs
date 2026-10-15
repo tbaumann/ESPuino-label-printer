@@ -90,76 +90,85 @@ impl std::fmt::Display for PrefixStatus {
     }
 }
 
-/// The ribbon-pass scheme a prefix is printed with, and therefore what a card
-/// is allowed to carry on its back side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// What a card has on its back side.
+///
+/// This is the card-level choice, and the only one a *card* makes: [`Self::None`]
+/// is a single-sided card, every other value is a double-sided one. There is
+/// deliberately no separate "single or double sided" flag beside it — a flag
+/// could disagree with this enum, and the two would then have to be reconciled
+/// on every write.
+///
+/// The prefix-level choice is the ribbon (see [`Ribbon`]), which fixes the
+/// colour depth the back is rendered in. This enum only says what the back is
+/// made *of*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PrintMode {
-    /// YMCKO, one panel set per card. Front image only — a card in this mode
-    /// has no back at all (no back_text, no back image).
-    SingleSided,
-    /// YMCKO, two panel sets per card. Colour front AND colour back; the back
-    /// is an uploaded image, not text.
-    DoubleSidedColor,
-    /// YMCKOKO. Colour front, black-only back rendered from markdown
-    /// (`back_text`). The default, matching every pre-existing row.
-    ColorFrontBlackBack,
+pub enum BackSource {
+    /// No back side at all: a single-sided card, one ribbon panel per card.
+    #[default]
+    None,
+    /// Print the same panel on the back as on the front — the front image a
+    /// second time. No extra upload, but it does cost a second panel.
+    Front,
+    /// A second, uploaded image printed on the back.
+    Image,
+    /// Markdown, rendered to an image and printed on the back. Markdown is just
+    /// another image *source*: the colour depth it is rendered in comes from the
+    /// ribbon, not from here.
+    Markdown,
 }
 
-impl PrintMode {
+impl BackSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SingleSided => "single_sided",
-            Self::DoubleSidedColor => "double_sided_color",
-            Self::ColorFrontBlackBack => "color_front_black_back",
+            Self::None => "none",
+            Self::Front => "front",
+            Self::Image => "image",
+            Self::Markdown => "markdown",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
-            "single_sided" => Self::SingleSided,
-            "double_sided_color" => Self::DoubleSidedColor,
-            "color_front_black_back" => Self::ColorFrontBlackBack,
+            "none" => Self::None,
+            "front" => Self::Front,
+            "image" => Self::Image,
+            "markdown" => Self::Markdown,
             _ => return None,
         })
     }
 
-    /// Whether the black-only `back_text` (markdown) is a valid field for this
-    /// mode. Only the black-back mode renders it; everywhere else it would be
-    /// silently meaningless, so the API rejects it.
-    pub fn allows_back_text(self) -> bool {
-        matches!(self, Self::ColorFrontBlackBack)
-    }
-
-    /// Whether an uploaded colour back image is a valid (and, in double-sided
-    /// colour, required) field for this mode.
-    pub fn allows_back_image(self) -> bool {
-        matches!(self, Self::DoubleSidedColor)
-    }
-
-    /// The ribbon this mode is printed with, and therefore what has to be in
-    /// stock for it to be offered.
-    ///
-    /// Single-sided and double-sided colour both run on YMCKO. Double-sided
-    /// colour consumes two panel sets per card and so drains the stock twice as
-    /// fast, but it is the same ribbon: the two disappear together, which is
-    /// exactly why availability cannot be a per-mode flag.
-    pub fn ribbon(self) -> Ribbon {
-        match self {
-            Self::SingleSided | Self::DoubleSidedColor => Ribbon::Ymcko,
-            Self::ColorFrontBlackBack => Ribbon::Ymckoko,
-        }
+    /// Whether this card is printed on both sides — i.e. whether a second ribbon
+    /// panel is spent on it.
+    pub fn is_double_sided(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
-/// A ribbon the shop prints with. Availability is a property of the ribbon, not
-/// of the print mode — see [`PrintMode::ribbon`].
+impl std::fmt::Display for BackSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The ribbon-pass scheme a job is printed with.
+///
+/// This is the one choice a user makes per *job*, and the only thing that cannot
+/// be mixed in one batch: a YMCKO job and a YMCKOKO job are different ribbon
+/// loads, so they are different orders. Everything else about a card (single or
+/// double sided, and what the back is made of) is a per-card choice, carried by
+/// [`BackSource`].
+///
+/// Availability is a property of the ribbon, not of any card: it is the ribbon
+/// that is in or out of stock, so the shop gates on the flag stored per ribbon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Ribbon {
-    /// Full colour, plus a black panel and overlay.
+    /// Full colour front, plus a black panel and overlay. The back of a
+    /// double-sided card gets a panel set of its own — in full colour.
     Ymcko,
-    /// YMCKO plus a second black panel for the back side.
+    /// YMCKO plus a second black panel for the back side. The back is 1-bit
+    /// black whatever it is made of.
     Ymckoko,
 }
 
@@ -178,6 +187,42 @@ impl Ribbon {
             _ => return None,
         })
     }
+
+    /// Whether this ribbon can print a card whose back is `back`.
+    ///
+    /// YMCKO gives the back its own YMC panel set, so any source works there.
+    /// YMCKOKO's back is the second *black* panel: text can be printed on it,
+    /// but a colour image — or a copy of the colour front — cannot, so those
+    /// combinations are refused rather than silently printed as something else.
+    pub fn allows_back(self, back: BackSource) -> bool {
+        match self {
+            Self::Ymcko => true,
+            Self::Ymckoko => matches!(back, BackSource::None | BackSource::Markdown),
+        }
+    }
+
+    /// The colour depth a back side is rendered in. A consequence of the ribbon,
+    /// never a separate choice — the same markdown back is a 24-bit raster on
+    /// YMCKO and a 1-bit one on YMCKOKO.
+    pub fn back_depth(self) -> BackDepth {
+        match self {
+            Self::Ymcko => BackDepth::Color,
+            Self::Ymckoko => BackDepth::Black,
+        }
+    }
+
+    /// How many ribbon panels one card on this ribbon is billed for.
+    ///
+    /// YMCKO bills per printed side: a single-sided card is one panel set, a
+    /// double-sided one is two. YMCKOKO always bills a full double-sided card,
+    /// because the second black panel is consumed either way — a blank back
+    /// saves nothing, so there is nothing to charge differently for.
+    pub fn billed_sides(self, back: BackSource) -> i64 {
+        match self {
+            Self::Ymcko => 1 + i64::from(back.is_double_sided()),
+            Self::Ymckoko => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for Ribbon {
@@ -186,10 +231,14 @@ impl std::fmt::Display for Ribbon {
     }
 }
 
-impl std::fmt::Display for PrintMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+/// The colour depth a back side is rendered in. Derived from the ribbon
+/// ([`Ribbon::back_depth`]); it is a rendering decision, not a stored one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackDepth {
+    /// 24-bit colour — YMCKO's back panel set.
+    Color,
+    /// 1-bit black — YMCKOKO's second K panel.
+    Black,
 }
 
 /// A prefix groups one customer's set of cards (one order / label batch).
@@ -200,15 +249,16 @@ pub struct Prefix {
     pub status: PrefixStatus,
     /// When the status last changed.
     pub status_changed_at: Option<String>,
-    /// The ribbon-pass scheme this order is printed with; governs what a card
-    /// may carry on its back. Defaults to `color_front_black_back`.
-    pub print_mode: PrintMode,
-    /// The mode that was actually charged, snapshotted when the checkout
-    /// session was created. The spooler prints this, not `print_mode`, so an
-    /// operator changing the mode after payment cannot change what gets
+    /// The ribbon this order is printed with — the one choice that has to be
+    /// made per job, because a batch cannot mix ribbon loads. Defaults to
+    /// `ymckoko`.
+    pub ribbon: Ribbon,
+    /// The ribbon that was actually charged, snapshotted when the checkout
+    /// session was created. The spooler prints this, not `ribbon`, so an
+    /// operator changing the ribbon after payment cannot change what gets
     /// printed. `None` for prefixes never priced through checkout.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub paid_print_mode: Option<PrintMode>,
+    pub paid_ribbon: Option<Ribbon>,
     /// External shop/order reference, typically set when the order is paid.
     pub order_ref: Option<String>,
     /// Number of cards currently stored under this prefix.
@@ -221,51 +271,107 @@ pub struct Prefix {
     pub unprinted_count: Option<i64>,
 }
 
+/// Availability state of a server-side derived artifact (display image or print
+/// raster). Same value set the card JSON and the print endpoints report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderStatus {
+    /// Not produced yet (just uploaded / invalidated).
+    Pending,
+    /// Bytes are stored and served.
+    Ready,
+    /// Generation errored — evidence for an admin, not silently retried.
+    Failed,
+}
+
+impl RenderStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => Self::Pending,
+            "ready" => Self::Ready,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+/// What (if anything) a card has on its back side, as the print spooler needs
+/// to know before it fetches rasters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BackAvailability {
+    /// No back side at all: a single-sided card, or a double-sided one still
+    /// missing the material its back is made of.
+    None,
+    /// A 24-bit colour back will be printed — the ribbon's back is a colour
+    /// panel set, and its source has no upload to wait for.
+    Color,
+    /// A 1-bit black back will be printed — the ribbon's back is a black panel.
+    Black,
+}
+
 /// One printable card. `id` is an index within its prefix, not global.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Card {
     pub id: i64,
     pub name: String,
     pub serial_number: Option<String>,
-    /// Markdown for the black-only back (`color_front_black_back` only — the
-    /// other modes refuse it). `None` in those modes, and for a black-back card
-    /// whose text has been cleared.
+    /// What this card has on its back: the per-card single/double-sided choice.
+    /// [`BackSource::None`] is a single-sided card.
+    pub back: BackSource,
+    /// Markdown source for a [`BackSource::Markdown`] back — the text the
+    /// server renders, at the ribbon's colour depth, into the back image.
+    /// `None` for every other source, and for a markdown card whose text has
+    /// been cleared.
     pub back_text: Option<String>,
     pub image_content_type: String,
-    /// Non-None only when this card has an uploaded colour back image
-    /// (`double_sided_color` mode), and only once one has been uploaded: a card
-    /// exists from its front image alone, and the colour back is added per card
-    /// afterwards. Never serialized from the path; this holds the stored
-    /// content-type purely as the signal that a back image exists — which is
-    /// also what the checkout reads to decide whether the card is complete.
+    /// Non-None only when this card's back is [`BackSource::Image`] and one has
+    /// actually been uploaded: a card exists from its front image alone, and
+    /// the back image is added per card afterwards. Never serialized from the
+    /// path; this holds the stored content-type purely as the signal that a
+    /// back image exists — which is also what the checkout reads to decide
+    /// whether the card is complete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub back_image_content_type: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    /// When the printer confirmed this card was ejected. Operator-only state
-    /// for the print spooler; deliberately not serialized into the public Card
-    /// JSON, so neither the customer view nor the admin print preview sees it.
-    #[serde(skip)]
-    pub printed_at: Option<String>,
+    /// Server-side render availability. The front is always present; the back
+    /// sides are `None` (absent) when this card has no back to render. The
+    /// frontend uses these to show the processed image or a placeholder.
+    pub display_front: RenderStatus,
+    pub display_back: Option<RenderStatus>,
+    pub print_front: RenderStatus,
+    pub print_back: Option<RenderStatus>,
 }
 
 /// One card as the print spooler sees it: the operator-only `printed_at` is
-/// included here, unlike in the public `Card`.
+/// included here, unlike in the public `Card`. The spooler prints the raster, so
+/// this carries no rendering of the back text — only what its `print-raster`
+/// endpoints answer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PrintQueueCard {
     pub id: i64,
     pub name: String,
     pub printed_at: Option<String>,
-    /// The black-only back, rendered server-side from the card's markdown
-    /// `back_text` into the sanitised subset the SPA preview shows
-    /// ([`crate::backtext::render_back_text`]). The spooler prints *this*, so
-    /// the back that comes out is the one the customer approved.
-    ///
-    /// Only `color_front_black_back` has a black back at all, so this is `None`
-    /// in the other modes (where `back_text` is refused by the API and cannot be
-    /// set anyway) and for a black-back card whose `back_text` is empty.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub back_html: Option<String>,
+    /// Actual back availability for this card: `none` (single-sided, or a
+    /// double-sided card still missing the material its back is made of),
+    /// `color`, or `black` — whichever the ribbon's colour depth makes it. The
+    /// spooler fetches `print-raster/back` exactly when this is not `none`.
+    pub back: BackAvailability,
+    /// Ribbon panels this card is billed for, so the spooler's accounting
+    /// matches the checkout's without re-deriving the rule.
+    pub billed_sides: i64,
+    /// Whether every raster this card needs to print is `ready`. The spooler
+    /// prints only `printable` cards; a card with a `pending` or `failed`
+    /// raster is reported here rather than silently printed from the original.
+    pub printable: bool,
 }
 
 /// The print queue for one prefix: its cards ordered explicitly by id, with
@@ -278,12 +384,15 @@ pub struct PrintQueueCard {
 pub struct PrintQueue {
     pub prefix: Uuid,
     pub status: PrefixStatus,
-    /// The mode the spooler must print with: the one that was paid for
-    /// (`paid_print_mode`), falling back to the prefix's current mode for
+    /// The ribbon the spooler must print with: the one that was paid for
+    /// (`paid_ribbon`), falling back to the prefix's current ribbon for
     /// prefixes never priced through checkout.
-    pub print_mode: PrintMode,
+    pub ribbon: Ribbon,
     pub cards: Vec<PrintQueueCard>,
     pub unprinted_count: i64,
+    /// Total ribbon panels the whole queue is billed for — the sum of the
+    /// cards' `billed_sides`.
+    pub billed_sides: i64,
     pub resume: bool,
 }
 
@@ -298,20 +407,24 @@ pub struct CardIndex {
 /// as a multipart file part named "image"). Documents the multipart form for
 /// OpenAPI; the handler parses the fields directly.
 ///
-/// `back_text` is only valid in `color_front_black_back` mode; a `back_image`
-/// file part is only valid in `double_sided_color` mode. The handler rejects a
-/// back field that does not fit the prefix's mode rather than silently storing
-/// it.
+/// `back` is the per-card single/double-sided choice. `back_text` is only
+/// meaningful for a `markdown` back and is refused otherwise; a `back_image`
+/// file part is only valid when the prefix's ribbon can print a colour back.
+/// The handler rejects a back field that does not fit rather than silently
+/// storing it.
 ///
-/// `back_image` is optional even in the colour mode: the colour back is added
-/// per card through `PUT .../cards/{id}/back-image`, because cards are created
-/// by the folder-at-a-time front-image upload. A card without one is simply not
-/// complete, and an order containing one is refused at the checkout.
+/// `back_image` is optional even for an `image` back: cards are created by the
+/// folder-at-a-time front-image upload, and the per-card back is filled in
+/// afterwards. A card without one is simply not complete, and an order
+/// containing one is refused at the checkout.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct CardInput {
     pub name: String,
     pub serial_number: Option<String>,
+    /// The card's back side. Omitted means single-sided ([`BackSource::None`]),
+    /// unless a `back_image` part is sent, which implies [`BackSource::Image`].
+    pub back: Option<BackSource>,
     pub back_text: Option<String>,
     pub back_image: Option<String>,
 }
@@ -320,15 +433,15 @@ pub struct CardInput {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PrefixInput {
     pub uuid: Option<Uuid>,
-    /// Ribbon-pass scheme. Omitted (or null) means the default
-    /// `color_front_black_back`.
-    pub print_mode: Option<PrintMode>,
+    /// The ribbon this job is printed with. Omitted (or null) means the default
+    /// `ymckoko`.
+    pub ribbon: Option<Ribbon>,
 }
 
-/// Body for changing a prefix's print mode while it is still writable.
+/// Body for changing a prefix's ribbon while it is still writable.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct PrefixModePatch {
-    pub print_mode: PrintMode,
+pub struct PrefixRibbonPatch {
+    pub ribbon: Ribbon,
 }
 
 /// Metadata-only card update (no image re-upload). Omitted fields are left
@@ -337,6 +450,9 @@ pub struct PrefixModePatch {
 pub struct CardPatch {
     pub name: Option<String>,
     pub serial_number: Option<String>,
+    /// The card's back side. Changing this is how a card becomes (or stops
+    /// being) double-sided, and how its back material is chosen.
+    pub back: Option<BackSource>,
     pub back_text: Option<String>,
 }
 
@@ -362,16 +478,18 @@ pub struct AdminSession {
     pub authenticated: bool,
 }
 
-/// One print mode as the shop offers it: its price, and whether it can be
-/// ordered right now.
+/// One ribbon as the shop offers it: the price of one printed side on it, and
+/// whether it can be ordered right now.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ModePrice {
-    pub print_mode: PrintMode,
-    /// Price of one card in this mode, in the currency's minor unit (cents).
+pub struct RibbonPrice {
+    pub ribbon: Ribbon,
+    /// Price of one printed *side* on this ribbon, in the currency's minor unit
+    /// (cents). A card is billed [`Ribbon::billed_sides`] of these: one or two
+    /// on YMCKO, always two on YMCKOKO.
     pub price_cents: i64,
-    /// Whether the mode's ribbon is in stock. An unavailable mode is still
-    /// served, and rendered disabled rather than dropped, so the customer can
-    /// see that the option exists and is out.
+    /// Whether the ribbon is in stock. An unavailable ribbon is still served,
+    /// and rendered disabled rather than dropped, so the customer can see that
+    /// the option exists and is out.
     pub available: bool,
 }
 
@@ -398,13 +516,11 @@ pub struct ShopConfig {
     pub enabled: bool,
     /// ISO 4217 code, lower case as Stripe wants it.
     pub currency: String,
-    /// Price of one card per print mode, in the currency's minor unit (cents),
-    /// each carrying whether that mode can be ordered right now.
-    pub prices: Vec<ModePrice>,
-    /// The two stock flags behind those `available` answers. Availability is a
-    /// property of the ribbon — single-sided and double-sided colour share
-    /// YMCKO — so the flags are served as they are stored, and a mode's
-    /// `available` is the derived consequence.
+    /// The price of one printed side per ribbon, in the currency's minor unit
+    /// (cents), each carrying whether that ribbon can be ordered right now.
+    pub prices: Vec<RibbonPrice>,
+    /// The same two stock flags, served as they are stored, so the UI can show
+    /// ribbon availability without deriving it from a price.
     pub ribbons: Vec<RibbonStock>,
     /// Flat shipping charge in cents; 0 means shipping is free and no shipping
     /// line is added to the checkout.

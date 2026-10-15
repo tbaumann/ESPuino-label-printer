@@ -71,14 +71,14 @@ Commands (every API field is a flag):
 
 | Command | Purpose |
 |---------|---------|
-| `prefix create [--uuid U]` | create a prefix (server assigns uuid if omitted) |
+| `prefix create [--uuid U] [--ribbon R]` | create a prefix (server assigns uuid if omitted) |
 | `prefix list [--status S]` / `prefix get <P>` | list prefixes (optionally filtered by status) / show one + card count |
 | `prefix set-status <P> <STATUS> [--order-ref R]` | set a prefix's status (any transition) |
 | `card list <P>` | index of cards in a prefix |
 | `card get <P> <ID>` / `card delete <P> <ID>` | card metadata / delete |
-| `card back-image <P> <ID> <FILE>` | upload/replace a card's colour back image (`double_sided_color` only) |
-| `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back-text T]` | upload one card |
-| `batch <P> <DIR> [--recursive] [--start-id N] [--name-template T] [--serial-prefix P] [--serial-width W] [--back-text T] [--dry-run]` | upload a folder |
+| `card back-image <P> <ID> <FILE>` | upload/replace a card's back image, making that image its back (YMCKO only) |
+| `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back B] [--back-text T]` | upload one card |
+| `batch <P> <DIR> [--recursive] [--start-id N] [--name-template T] [--serial-prefix P] [--serial-width W] [--back B] [--back-text T] [--dry-run]` | upload a folder |
 
 Notes:
 
@@ -119,9 +119,15 @@ server, so it needs a build in `server/static` plus a server on `:8099` started
 with an `ADMIN_TOKEN` — the same token must be in the test's environment:
 
 ```sh
-DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 ./target/debug/espuino-label-printer &
+DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 \
+  PRINT_RASTER_WIDTH=508 PRINT_RASTER_HEIGHT=324 ./target/debug/espuino-label-printer &
 ADMIN_TOKEN=secret npm --prefix web test
 ```
+
+A *debug* server re-renders the print rasters synchronously on every card write,
+and an unoptimised Lanczos resize to the 2032x1296 default takes seconds — hence
+the small raster size above. It is server config either way, and a release build
+does not need it.
 
 Its last scenario (the Pay button) needs payment configured on that server and is
 skipped with a note when it is not; `scripts/stripe_e2e_test.py` is the test that
@@ -129,42 +135,62 @@ covers payment properly.
 
 Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
 *is* the prefix. Use "Open" to return to an existing project code; recent
-projects are remembered in `localStorage`. A project page holds the print-option
-chooser (one radio per print mode, with its price; a mode whose ribbon is out of
-stock is shown greyed out and disabled, never removed), the drop zone (drag
-images, or a whole folder) and one row per card.
+projects are remembered in `localStorage`. A project page holds the ribbon
+chooser (one radio per ribbon, with the price of one printed side; a ribbon that
+is out of stock is shown greyed out and disabled, never removed), the drop zone
+(drag images, or a whole folder) and one row per card.
 
-### One card component per print mode
+### One card panel, and the per-card back choice
 
-The mode decides what a card *is*, so it decides what a row shows and which
-inputs it offers. There is one component per mode under `web/src/lib/cards/`,
-picked by `CardRow.svelte`; the parts all three share (front preview, name,
-serial, delete, and the debounced save) live in `cards/CardFields.svelte`.
+The ribbon fixes what a back *may* be; the card chooses what its back *is*.
+`CardRow.svelte` renders each card — the front, the back the chosen source
+produces, and the editor beside them — and puts the two controls in two places on
+purpose: which back the card *has* is chosen in the editor (one button per source
+the ribbon allows, with what that source needs under it), while the **file chooser
+for an `image` back sits in the back pane**, because that pane is the picture it
+chooses. `cards/CardFields.svelte` holds the shared header (name, delete and the
+debounced save).
 
-| Mode | Back side | The row offers |
-|------|-----------|----------------|
-| `single_sided` | none at all | no back field and no back pane — it says the option has none |
-| `double_sided_color` | an uploaded colour image | a file input per card, and the uploaded back as the preview |
-| `color_front_black_back` | markdown, black only | the back-text textarea, and a 1-bit black preview |
+| `back` | Printed on the back | The pane shows | The editor offers |
+|--------|---------------------|----------------|-------------------|
+| `none` | nothing — a single-sided card | no back pane at all | nothing to supply |
+| `front` | the front image again | the front picture | nothing to supply |
+| `image` | a second uploaded picture | the uploaded picture, or the drop prompt | the file chooser, in the pane |
+| `markdown` | text, rendered to an image | the rendered markdown | the back-text textarea |
 
-The drop zone uploads **fronts** — one file, one card — so in colour mode a card
-starts without its back image and the row asks for it. The pane and the page
-badge say how many cards are still incomplete, and the Pay button stays disabled
-while any are: the checkout refuses such an order with `409` as well, because a
-card with one side missing cannot be printed. Completing it needs no new state —
-the badge and the button follow the upload.
+While an `image` pane holds no picture yet, the **whole pane is a file drop
+area**: a picture dropped anywhere on it becomes that card's back, and clicking
+the empty area opens the picker. A pane already showing artwork still takes a drop
+— a deliberate replace — but no longer opens a file dialog on a click, since the
+chooser inside it is right there. On YMCKOKO `image` is not on offer at all, so
+there is no drop area to be had.
 
-The black-back preview is deliberately honest about the medium: paper white,
-pure black ink, no greys and no theme colours, because that is what a 1-bit
-black panel can produce. The renderer drops images whole (see "Markdown in the
-back text" in TODO.md), so the editor *says* that image markup will not be
-printed rather than showing a gap where the artwork was. Everything the preview
-shows, the print queue prints: the server renders `back_text` through the same
-subset (`server/src/backtext.rs`) and carries it as `PrintQueueCard.back_html`.
+Everything but `none` makes the card double-sided. Which of the four are on
+offer is the ribbon's rule, not a per-card one: YMCKO's back is a colour panel
+set of its own, so it offers all four; YMCKOKO's back is the second black panel,
+so it offers `none` and `markdown` only. The API holds the same rule and refuses
+the rest with `400`.
 
-Previews are rendered **client-side** — the front is the stored image, the
-colour back is the stored back image, the black back is `back_text` laid out in
-a CR80-aspect, black-on-white panel. The server stores no rendered back.
+The drop zone uploads **fronts** — one file, one card — so a new card is
+single-sided, and one with an `image` back starts without its picture. The page
+badge says how many cards are still missing their back material, and the Pay
+button stays disabled while any are: the checkout refuses such an order with
+`409` as well, because a card with one side missing cannot be printed.
+Completing it needs no new state — the badge and the button follow the write.
+
+The markdown preview is deliberately honest about the medium: paper white, pure
+black ink, no greys and no theme colours, because that is what a 1-bit black
+panel can produce. The renderer drops images whole (see "Markdown in the back
+text" in TODO.md), so the editor *says* that image markup will not be printed
+rather than showing a gap where the artwork was. The pane is the editing view
+only: the print queue carries no HTML, and the spooler prints the server's
+raster.
+
+The panes load the **server-derived display images** (`display-image`,
+`display-back`), so the aspect and any normalization are the server's. The one
+exception is a markdown back's pane, which lays `back_text` out client-side for
+editing; what the spooler prints is the server's raster either way, so no
+preview is the source of truth for print.
 
 ### Admin UI (`/admin`)
 
@@ -254,9 +280,10 @@ line.
    and copy its signing secret into `STRIPE_WEBHOOK_SECRET`;
 4. set `PUBLIC_BASE_URL` to the public origin, e.g. `https://cards.example.com`
    — that is where Stripe sends the customer back;
-5. set the price: per-mode card prices live in the database (`mode_prices`,
-   seeded at 500 cents each), plus `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`.
-   Taking a ribbon out of stock is the same kind of database state
+5. set the prices: `ribbon_prices` holds the price of one printed *side* per
+   ribbon (seeded at 500 cents each), alongside `STRIPE_SHIPPING_CENTS` and
+   `STRIPE_CURRENCY`. A card costs one or two of them, and YMCKOKO always
+   charges two. Taking a ribbon out of stock is the same kind of database state
    (`ribbon_stock`, both ribbons seeded in stock), flipped through
    `PUT /api/shop/ribbons/{ribbon}` with the operator token;
 6. only then switch to live keys.
@@ -320,7 +347,7 @@ saying which: an unmailable shop is the failure mode hardest to notice. The
 confirmation goes to the address on the Stripe session (`customer_details.email`,
 which is what Checkout collects) and links back to `{PUBLIC_BASE_URL}/p/<uuid>`
 — the thing Stripe's own receipt does not provide. The operator note carries the
-card count, the print mode, the amount and the customer's contact details.
+card count, the ribbon, the amount and the customer's contact details.
 
 ### Setting it up
 
@@ -368,7 +395,7 @@ Layout on disk:
 data/
   cards.db                   # prefix + card metadata (the single index)
   blobs/<prefix>/<id>.<ext>       # card front images
-  blobs/<prefix>/<id>-back.<ext>  # colour back images (double_sided_color only)
+  blobs/<prefix>/<id>-back.<ext>  # back images (an `image` back only)
 ```
 
 ## Data model
@@ -376,38 +403,38 @@ data/
 - **Prefix** — a UUID that groups one customer's cards (one order/batch). The
   customer picks a UUID or the server assigns one. `card_count` is derived.
   Carries a `status` (see lifecycle below), `status_changed_at`, an optional
-  `order_ref` (external shop id), and a `print_mode` that fixes the ribbon-pass
-  scheme and therefore what a card's back side may be.
-- **Print modes** — `single_sided` (YMCKO, front only, no back at all),
-  `double_sided_color` (YMCKO, colour front **and** colour back image),
-  `color_front_black_back` (YMCKOKO, colour front + black-only text back; the
-  **default**, so existing rows keep their meaning). Set at prefix creation or
-  via `PATCH /api/prefixes/{prefix}` while the prefix is still writable.
-- **Pricing** — per-mode card prices live in the database (`mode_prices`,
-  seeded at 500 cents each), not the environment. The shop config serves them
-  and the checkout prices each card by its prefix's mode. When a checkout
-  opens, the mode is snapshotted onto the prefix (`paid_print_mode`), so the
-  spooler prints the mode the customer paid for even if the operator later
-  changes the prefix's mode.
+  `order_ref` (external shop id), and a `ribbon` that fixes the ribbon load and
+  therefore what a card's back side may be.
+- **Ribbons** — `ymcko` (colour front, and a back that may be a picture, a
+  copy of the front, or text — in colour) and `ymckoko` (colour front, black-only
+  back; the **default**). The one choice per *job*, because a batch cannot mix
+  ribbon loads. Set at prefix creation or via `PATCH /api/prefixes/{prefix}`
+  while the prefix is still writable — refused with `409` if a card's back
+  could not be printed on the new ribbon.
+- **Pricing** — one price per ribbon, for one printed *side*, in the database
+  (`ribbon_prices`, seeded at 500 cents each), not the environment. YMCKO bills
+  per printed side (one for a single-sided card, two for a double-sided one);
+  YMCKOKO always bills two, because its second black panel is spent either way.
+  When a checkout opens, the ribbon is snapshotted onto the prefix
+  (`paid_ribbon`), so the spooler prints what the customer paid for even if the
+  operator later changes it.
 - **Ribbon availability** — two stock flags in the database (`ribbon_stock`,
-  `ymcko` and `ymckoko`, both seeded in stock), because availability is a
-  property of the *ribbon*, not of the mode: single-sided and double-sided
-  colour both run on YMCKO, so they go out of stock together, while the
-  black-back mode (YMCKOKO) is independent. The shop config serves both flags
-  and, for each mode, the derived `available`; the customer UI renders an
-  unavailable mode **disabled rather than absent**, and the checkout refuses it
-  with `409` — a stock flag that only greys out a radio button would still sell
-  a card that cannot be printed. Nothing is reconciled for a prefix that was
-  already priced for a mode whose ribbon has since run out.
+  `ymcko` and `ymckoko`, both seeded in stock), flipped through
+  `PUT /api/shop/ribbons/{ribbon}`. The shop config serves both flags and, per
+  ribbon, the derived `available`; the customer UI renders an unavailable ribbon
+  **disabled rather than absent**, and the checkout refuses it with `409` — a
+  stock flag that only greys out a radio button would still sell a card that
+  cannot be printed. Nothing is reconciled for a prefix already priced for a
+  ribbon that has since run out.
 - **Card** — `id` (1-based index *within its prefix*), `name`, optional
-  `serial_number`, and a front image (ISO/IEC 7810 / CR80, scaled to fit). What
-  the back side carries depends on the prefix's `print_mode`: black-back mode
-  uses `back_text` (markdown); double-sided colour takes an uploaded
-  `back_image`; single-sided has neither. A back field that does not fit the
-  mode is rejected by the API, never silently stored. In colour mode the back
-  image is uploaded per card **after** the front (the dropzone is a bulk flow),
-  so a card can exist while its back is still missing — it is just not
-  *complete*, and an order holding one is refused at the checkout (`409`).
+  `serial_number`, a front image (ISO/IEC 7810 / CR80, scaled to fit), and a
+  `back`: `none` (a single-sided card), `front` (the front image again), `image`
+  (an uploaded picture) or `markdown` (rendered from `back_text`). Anything but
+  `none` is a double-sided card, and the choices are bounded by the prefix's
+  ribbon — a back it cannot print is rejected by the API, never silently stored.
+  The back image is uploaded per card **after** the front (the dropzone is a
+  bulk flow), so a card can exist while its back is still missing — it is just
+  not *complete*, and an order holding one is refused at the checkout (`409`).
 
 ## Prefix lifecycle
 
@@ -514,20 +541,20 @@ an admin session.
 | PUT    | `/api/prefixes/{prefix}`               | create prefix at path uuid, idempotent |
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
 | GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
-| PATCH  | `/api/prefixes/{prefix}`               | set the print mode (while writable) |
+| PATCH  | `/api/prefixes/{prefix}`               | set the ribbon (while writable; `409` if a card's back cannot be printed on it) |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
 | POST   | `/api/prefixes/{prefix}/submit`        | **removed** — answers `410`, use checkout |
 | PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
 | GET    | `/api/prefixes/{prefix}/cards`         | index of cards in the prefix  |
-| POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id  |
+| POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id (optional `back`) |
 | DELETE | `/api/prefixes/{prefix}/cards`         | delete every card in the prefix |
 | GET    | `/api/prefixes/{prefix}/cards/{id}`    | card metadata                 |
 | PUT    | `/api/prefixes/{prefix}/cards/{id}`    | create/replace card at id (image required) |
-| PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back text only |
+| PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
-| GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | colour back image bytes (double_sided_color only) |
-| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the colour back image (double_sided_color only) |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | back image bytes (an `image` back only) |
+| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the back image, making that image the card's back (YMCKO only) |
 | GET    | `/api/shop/config`                     | price, currency, ribbon availability, and whether payment is on |
 | PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
@@ -537,24 +564,27 @@ an admin session.
 | DELETE | `/api/admin/session`                   | log out                       |
 
 Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
-`name`, `serial_number`, `back_text` and a file part `image`, plus an optional
-`back_image` file part. `back_text` is only accepted in
-`color_front_black_back` mode, and `back_image` only in `double_sided_color` — a
-back field that does not fit the prefix's mode is rejected with `400`, never
-silently stored.
+`name`, `serial_number`, `back`, `back_text` and a file part `image`, plus an
+optional `back_image` file part. `back` is one of `none`, `front`, `image` or
+`markdown`, and defaults to `none` (a single-sided card); sending a `back_image`
+part implies `back=image`. `back_text` is only accepted for a `markdown` back,
+and `back_image` only when the prefix's ribbon can print a colour back — a field
+that does not fit is rejected with `400`, never silently stored.
 
-`back_image` is optional even in `double_sided_color`, because cards are created
-by the front-image dropzone, one file at a time. A card without one is simply not
-complete: its own row offers the upload (`PUT
-.../cards/{id}/back-image`, which leaves the front alone), and an order
-containing an incomplete card is refused at the checkout with `409` rather than
-sold. `requires a back_image on every card` at creation time would have made the
-colour mode impossible to upload into at all.
+`back_image` is optional even for an `image` back, because cards are created by
+the front-image dropzone, one file at a time. A card without one is simply not
+complete: its own row offers the upload (`PUT .../cards/{id}/back-image`, which
+leaves the front alone and makes the uploaded image the card's back), and an
+order containing an incomplete card is refused at the checkout with `409` rather
+than sold. `requires a back_image on every card` at creation time would have
+made double-sided cards impossible to upload into at all.
 
 `PUT` is full-replace and **requires** the image; use `PATCH` to edit
-name/serial/back text without re-uploading it. Re-uploading an image in a
-different format replaces the old blob (no orphan files). Deleting a card (or
-clearing a prefix) removes the corresponding blobs.
+name/serial/back without re-uploading it. Re-uploading an image in a different
+format replaces the old blob (no orphan files). Deleting a card (or clearing a
+prefix) removes the corresponding blobs. Switching a card's `back` deliberately
+leaves the other material in place — turning a card from `image` to `markdown`
+and back again does not lose the picture or the text.
 
 ## Smoke test
 

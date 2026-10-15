@@ -2,13 +2,14 @@
   import { onMount } from 'svelte'
   import {
     api,
+    backIncomplete,
+    billedSides,
     formatMoney,
-    needsBackImage,
-    PRINT_MODES,
+    RIBBONS,
     rememberProject,
     type Card,
     type Prefix,
-    type PrintMode,
+    type Ribbon,
     type ShopConfig,
   } from '../lib/api'
   import { navigate } from '../lib/router'
@@ -34,21 +35,31 @@
   const writable = $derived(prefix ? WRITABLE.includes(prefix.status) : false)
 
   // Amounts pre-rendered, so the template never re-derives a price and `shop`
-  // never has to be narrowed there. The per-card price is the one for the
-  // prefix's print mode, looked up from the shop config's per-mode prices.
+  // never has to be narrowed there.
+  //
+  // The price is per printed *side*; how many sides the order burns is the sum
+  // over the cards, because a batch may mix single- and double-sided cards. The
+  // one exception is YMCKOKO, where every card is a full double-sided one
+  // whatever its back is (its second black panel is spent either way), which is
+  // `billedSides`' rule.
+  const sides = $derived(
+    prefix ? cards.reduce((n, c) => n + billedSides(prefix!.ribbon, c.back), 0) : 0,
+  )
+
   const shopView = $derived(
     shop && shop.enabled && prefix
       ? (() => {
-          const price = shop.prices.find((p) => p.print_mode === prefix!.print_mode)
+          const price = shop.prices.find((p) => p.ribbon === prefix!.ribbon)
           if (!price) return null
           return {
-            perCard: formatMoney(price.price_cents, shop.currency),
+            perSide: formatMoney(price.price_cents, shop.currency),
+            sides,
             shipping:
               shop.shipping_cents > 0
                 ? formatMoney(shop.shipping_cents, shop.currency)
                 : null,
             total: formatMoney(
-              price.price_cents * (prefix?.card_count ?? 0) + shop.shipping_cents,
+              price.price_cents * sides + shop.shipping_cents,
               shop.currency,
             ),
           }
@@ -56,46 +67,47 @@
       : null,
   )
 
-  // One row per print mode, in the order the shop offers them, each with its
-  // price and whether its ribbon is currently in stock. An out-of-stock mode
-  // stays in this list — the customer should see that it exists and is out —
-  // and is rendered disabled rather than dropped.
+  // One row per ribbon, in the order the shop offers them, each with the price
+  // of one printed side and whether it is currently in stock. An out-of-stock
+  // ribbon stays in this list — the customer should see that it exists and is
+  // out — and is rendered disabled rather than dropped.
   //
   // Without a shop config there is nothing to say about stock, so everything
   // reads as available; the server is the one that actually refuses, and a
   // chooser that greyed itself out on a failed fetch would be a lie.
-  const modes = $derived(
-    PRINT_MODES.map((m) => {
-      const price = shop?.prices.find((p) => p.print_mode === m.mode)
+  const ribbons = $derived(
+    RIBBONS.map((r) => {
+      const price = shop?.prices.find((p) => p.ribbon === r.ribbon)
       return {
-        ...m,
+        ...r,
         available: price ? price.available : true,
-        price: price && shop ? formatMoney(price.price_cents, shop.currency) : null,
+        price: price && shop ? `${formatMoney(price.price_cents, shop.currency)} per side` : null,
       }
     }),
   )
 
-  // The mode the prefix is actually set to, so the panel can mark it and warn
-  // when its ribbon is the one that ran out.
-  const chosen = $derived(modes.find((m) => m.mode === prefix?.print_mode) ?? null)
+  // The ribbon the prefix is actually set to, so the panel can mark it and warn
+  // when it is the one that ran out.
+  const chosen = $derived(ribbons.find((r) => r.ribbon === prefix?.ribbon) ?? null)
 
-  // In `double_sided_color` every card is printed on both sides, so a card still
-  // without its uploaded colour back is an order that cannot be made. The server
-  // refuses such a checkout with 409 (it is the layer that takes the money, so
-  // it is the layer where this has to hold); the button must not pretend
-  // otherwise.
-  const missingBacks = $derived(
-    prefix?.print_mode === 'double_sided_color' ? cards.filter(needsBackImage).length : 0,
-  )
+  // A card whose back side is a picture or text that has not been supplied yet
+  // is an order that cannot be printed. The server refuses such a checkout with
+  // 409 (it is the layer that takes the money, so it is the layer where this has
+  // to hold); the button must not pretend otherwise.
+  const missingBacks = $derived(cards.filter(backIncomplete).length)
 
-  let choosing = $state<PrintMode | null>(null)
+  let choosing = $state<Ribbon | null>(null)
 
-  async function chooseMode(mode: PrintMode) {
-    if (!prefix || mode === prefix.print_mode) return
-    choosing = mode
+  async function chooseRibbon(ribbon: Ribbon) {
+    if (!prefix || ribbon === prefix.ribbon) return
+    choosing = ribbon
     error = null
     try {
-      prefix = await api.setPrintMode(uuid, mode)
+      prefix = await api.setRibbon(uuid, ribbon)
+      // The ribbon decides what a back may be, so a card that chose a picture
+      // back may no longer be printable. The server refuses the change that
+      // would strand one, and this re-read makes sure the rows agree with it.
+      await refresh()
     } catch (e) {
       error = (e as Error).message
     } finally {
@@ -186,9 +198,10 @@
     }
   }
 
-  // A colour back image was uploaded from a card row. Only that row knows, and
-  // only the page keeps the list, so it is spliced in here — which is also what
-  // moves `missingBacks` on and opens the Pay button.
+  // A card was changed by its own row (a back image uploaded, a back side
+  // chosen). Only that row knows, and only the page keeps the list, so it is
+  // spliced in here — which is also what moves `missingBacks` on and opens the
+  // Pay button.
   function onCardUpdated(updated: Card) {
     cards = cards.map((c) => (c.id === updated.id ? updated : c))
   }
@@ -253,42 +266,42 @@
 
     <section class="panel">
       <div class="row">
-        <h2>Print options</h2>
+        <h2>Ribbon</h2>
         <span style="flex:1"></span>
-        {#if !writable}
-          <span class="muted">fixed: this project is no longer a draft</span>
-        {/if}
+        <span class="muted">
+          one ribbon per project — it decides what a card's back can be
+        </span>
       </div>
       <div class="modes">
-        {#each modes as m (m.mode)}
+        {#each ribbons as r (r.ribbon)}
           <label
             class="mode"
-            class:selected={prefix.print_mode === m.mode}
-            class:unavailable={!m.available}
+            class:selected={prefix.ribbon === r.ribbon}
+            class:unavailable={!r.available}
           >
             <input
               type="radio"
-              name="print-mode"
-              value={m.mode}
-              checked={prefix.print_mode === m.mode}
-              disabled={!writable || !m.available || choosing !== null}
-              onchange={() => chooseMode(m.mode)}
+              name="print-ribbon"
+              value={r.ribbon}
+              checked={prefix.ribbon === r.ribbon}
+              disabled={!writable || !r.available || choosing !== null}
+              onchange={() => chooseRibbon(r.ribbon)}
             />
             <span class="mode-body">
               <span class="row" style="gap:8px">
-                <strong>{m.label}</strong>
-                {#if m.price}
-                  <span class="muted">{m.price} per card</span>
+                <strong>{r.label}</strong>
+                {#if r.price}
+                  <span class="muted">{r.price}</span>
                 {/if}
-                {#if !m.available}
+                {#if !r.available}
                   <span class="badge status-cancelled">out of stock</span>
                 {/if}
               </span>
-              <span class="muted summary">{m.summary}</span>
-              {#if !m.available}
+              <span class="muted summary">{r.summary}</span>
+              {#if !r.available}
                 <span class="muted summary">
-                  The ribbon this option prints with is out of stock. It comes back
-                  as soon as we restock — it is not gone for good.
+                  This ribbon is out of stock. It comes back as soon as we restock —
+                  it is not gone for good.
                 </span>
               {/if}
             </span>
@@ -298,7 +311,7 @@
       {#if chosen && !chosen.available}
         <p class="muted" style="margin-top:12px">
           This project is set to <strong>{chosen.label}</strong>, whose ribbon is out
-          of stock, so it cannot be paid for right now. Pick another option, or come
+          of stock, so it cannot be paid for right now. Pick the other one, or come
           back once we have restocked.
         </p>
       {/if}
@@ -311,7 +324,7 @@
           <span style="flex:1"></span>
           {#if !awaitingPayment}
             <span class="muted">
-              {prefix.card_count} card{prefix.card_count === 1 ? '' : 's'} × {shopView.perCard}
+              {shopView.sides} printed side{shopView.sides === 1 ? '' : 's'} × {shopView.perSide}
               {#if shopView.shipping}
                 + {shopView.shipping} shipping
               {/if}
@@ -332,13 +345,13 @@
               {chosen.label} needs a ribbon we are out of. Choose an available option above.
             </span>
           {:else if missingBacks > 0}
-            <!-- Same rule at both layers: the checkout answers 409 while a card
-                 in a double-sided colour order has no back image uploaded. -->
+            <!-- Same rule at both layers: the checkout answers 409 while a
+                 double-sided card has no back image or back text yet. -->
             <button class="primary" disabled>Pay now</button>
             <span class="muted">
               {missingBacks} card{missingBacks === 1 ? '' : 's'} still need
-              {missingBacks === 1 ? 'a' : 'their'} back image. Every card in
-              {chosen ? chosen.label : 'this option'} is printed on both sides.
+              {missingBacks === 1 ? 'its' : 'their'} back finished — the picture or
+              the text the back is printed from.
             </span>
           {:else}
             <button class="primary" onclick={pay} disabled={paying}>
@@ -354,7 +367,7 @@
 
     <section class="panel">
       {#if writable}
-        <Uploader prefix={uuid} mode={prefix.print_mode} onUploaded={onUploaded} />
+        <Uploader prefix={uuid} ribbon={prefix.ribbon} onUploaded={onUploaded} />
       {:else}
         <p class="muted">
           This project is <strong>{prefix.status}</strong> and can no longer be changed.
@@ -370,7 +383,7 @@
           <!-- Shown whether or not this deployment takes money: a card without
                its back is not printable either way. -->
           <span class="badge status-cancelled">
-            {missingBacks} without a back image
+            {missingBacks} without a finished back
           </span>
         {/if}
       </div>
@@ -382,7 +395,7 @@
             <CardRow
               prefix={uuid}
               {card}
-              mode={prefix.print_mode}
+              ribbon={prefix.ribbon}
               {writable}
               onDeleted={onDeleted}
               onCardUpdated={onCardUpdated}

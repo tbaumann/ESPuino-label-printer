@@ -4,6 +4,11 @@
 // The server must be running, started with the same ADMIN_TOKEN, and serving
 // server/static (the vite build output).
 //
+// Note for a *debug* server: every card write re-renders the print rasters
+// synchronously, and an unoptimised Lanczos resize to the 2032x1296 default
+// takes seconds. Run it with a small `PRINT_RASTER_WIDTH`/`PRINT_RASTER_HEIGHT`
+// (the size is server config anyway), or build in release.
+//
 // Why jsdom: the browser tooling refuses private/loopback addresses, and this
 // exercises the real compiled bundle (runes, router, fetch wiring) rather than
 // a source-level mock.
@@ -130,6 +135,37 @@ async function mount(path, { bust }) {
 /** Let promise callbacks and Svelte's microtask flush settle. */
 const settle = (ms = 1200) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Poll until `pred` holds, or give up after `ms`. Returns whether it held.
+ *
+ * A fixed sleep is a guess at how long a round trip takes; the checks that
+ * follow a write are really asking "did the row catch up", so they wait for
+ * that instead of hoping.
+ */
+async function waitFor(pred, ms = 8000) {
+  const deadline = Date.now() + ms
+  for (;;) {
+    try {
+      if (await pred()) return true
+    } catch {
+      /* a fetch that is not there yet: keep waiting */
+    }
+    if (Date.now() > deadline) return false
+    await settle(150)
+  }
+}
+
+/** Wait for `sel` to appear under `root`, and return it (null if it never does). */
+async function waitForEl(root, sel, ms = 8000) {
+  const deadline = Date.now() + ms
+  for (;;) {
+    const el = root.querySelector(sel)
+    if (el) return el
+    if (Date.now() > deadline) return null
+    await settle(150)
+  }
+}
+
 const api = async (path, init) => {
   const res = await fetch(BASE + path, init)
   const text = await res.text()
@@ -164,6 +200,35 @@ async function listPrefixes(token) {
 console.log(`bundle: ${bundleName}\nbase:   ${BASE}\n`)
 
 // ---- scenario A: landing auto-creates a project and redirects --------------
+// What the browser is allowed to keep of the served frontend. Every file in a
+// Nix store path carries the same mtime, so a `Last-Modified`-based answer is a
+// lie: the shell has to be uncacheable and never conditionally answered, the
+// content-hashed assets keepable, and an asset that is not there a 404 — never
+// the shell, which a tab holding an old hash would run as if it were a module.
+console.log('\n0. what the browser may keep of the frontend')
+{
+  const shell = await realFetch(`${BASE}/`)
+  check('the shell is not cacheable', shell.headers.get('cache-control') === 'no-store')
+  check('the shell carries no date to revalidate against', shell.headers.get('last-modified') === null)
+  const html = await shell.text()
+  const asset = html.match(/\/assets\/[\w.-]+\.js/)?.[0]
+  check('the shell points at a bundle', !!asset)
+
+  const cond = await realFetch(`${BASE}/`, {
+    headers: { 'if-modified-since': 'Thu, 01 Jan 1970 00:00:01 GMT' },
+  })
+  check('a visitor with an old copy still gets the shell', cond.status === 200)
+
+  const js = await realFetch(`${BASE}${asset}`)
+  check('the bundle is served immutable', /immutable/.test(js.headers.get('cache-control') ?? ''))
+
+  const stale = await realFetch(`${BASE}/assets/index-DEADBEEF.js`)
+  check(
+    'a missing asset is a 404, not the shell',
+    stale.status === 404 && !/html/.test(stale.headers.get('content-type') ?? ''),
+  )
+}
+
 console.log('A. landing page redirects into a new project')
 {
   const w = await mount('/', { bust: 'a' })
@@ -191,6 +256,8 @@ console.log('\nB. project page renders a card')
   const fd = new NodeFormData()
   fd.append('name', 'Sample Card')
   fd.append('serial_number', 'SN-0001')
+  // The back is chosen explicitly; text only means anything on a markdown back.
+  fd.append('back', 'markdown')
   fd.append('back_text', '01 Song One\n02 Song Two')
   fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'sample.png')
   await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
@@ -199,12 +266,17 @@ console.log('\nB. project page renders a card')
   const text = w.document.body.textContent ?? ''
   // NB: input values are DOM properties, not text content.
   check('name input holds the name', w.document.querySelector('input#name-1')?.value === 'Sample Card')
-  check('serial input holds the serial', w.document.querySelector('input#serial-1')?.value === 'SN-0001')
+  // The serial number is an API-level field: it is not surfaced in the UI at all.
+  check('no serial input in the UI', !w.document.querySelector('input#serial-1'))
   check('back textarea holds the text', w.document.querySelector('textarea#back-1')?.value === '01 Song One\n02 Song Two')
   check('back preview shows the text', text.includes('02 Song Two'))
-  check('front preview points at the image endpoint',
-    w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/image"]`) !== null)
+  // The preview shows the *processed* image the server derived, not the raw
+  // upload — one renderer owns what a card looks like.
+  check('front preview points at the display-image endpoint',
+    w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-image"]`) !== null)
   check('renders a back preview pane', !!w.document.querySelector('.preview.back'))
+  check('the back choice is marked on the card',
+    w.document.querySelector('.back-choice.selected strong')?.textContent?.trim() === 'Text')
   check('renders a delete button', /Delete/.test(text))
   check('shows 1 card', text.includes('1 card'))
   check('name input is editable', !w.document.querySelector('input#name-1')?.disabled)
@@ -240,13 +312,13 @@ console.log('\nB. project page renders a card')
     ].join('\n')
     const fd = new NodeFormData()
     fd.append('name', 'MD Card')
+    fd.append('back', 'markdown')
     fd.append('back_text', md)
     fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'md.png')
     await api(`/api/prefixes/${mdPrefix}/cards`, { method: 'POST', body: fd })
 
     const w = await mount(`/p/${mdPrefix}`, { bust: 'b2' })
-    // The black-back mode's own component renders the 1-bit pane; its inner
-    // panel is what carries the sanitised markdown.
+    // The markdown back's pane; its inner panel carries the sanitised markup.
     const half = w.document.querySelector('.preview.back.black-only .panel')
     const html = half?.innerHTML ?? ''
     check('renders a heading', /<h1>Title<\/h1>/.test(html), html)
@@ -264,17 +336,18 @@ console.log('\nB. project page renders a card')
     check('an HTML block is dropped with its text',
       !/<div\b/.test(html) && !html.includes('blocked'), html)
 
-    // Two renderers have to agree: the preview above, and the server-side render
-    // the print queue carries (server/src/backtext.rs). Same markdown, same card
-    // — assert the print queue's rendering is the one just previewed.
+    // The print queue carries no rendering any more: the spooler prints the
+    // server's raster, and the pane above is only the editing view. What the
+    // queue does carry is what the card's back *is*.
     const queue = await api(`/api/prefixes/${mdPrefix}/print-queue`, {
       headers: { authorization: `Bearer ${TOKEN}` },
     })
-    const printed = queue.cards[0]?.back_html ?? ''
-    check('print queue carries the rendered black back', /<h1>Title<\/h1>/.test(printed), printed)
-    check('server render matches the SPA preview', canonHtml(printed) === canonHtml(html),
-      `queue: ${canonHtml(printed)}`)
-    check('the printed back refuses the image too', !/<img\b/.test(printed))
+    check('the queue reports the black back', queue.cards[0]?.back === 'black',
+      JSON.stringify(queue.cards[0]))
+    check('the queue reports the ribbon to load', queue.ribbon === 'ymckoko',
+      String(queue.ribbon))
+    check('a YMCKOKO card is billed as a full double-sided one',
+      queue.cards[0]?.billed_sides === 2, String(queue.cards[0]?.billed_sides))
   }
 
   // ---- scenario C: the auth boundary, then a frozen project ---------------
@@ -333,6 +406,7 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const fd = new NodeFormData()
   fd.append('name', 'Admin Preview Card')
   fd.append('serial_number', 'ADM-1')
+  fd.append('back', 'markdown')
   fd.append('back_text', '01 Admin Song')
   fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'admin.png')
   await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
@@ -371,8 +445,8 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const t2 = w2.document.body.textContent ?? ''
   check('print preview renders the card', !!w2.document.querySelector('.card.preview-only'))
   check('preview shows the front image',
-    !!w2.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/image"]`))
-  check('preview shows the back half-panel text', t2.includes('01 Admin Song'))
+    !!w2.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-image"]`))
+  check('preview shows the back text', t2.includes('01 Admin Song'))
   check('preview shows the name as text', t2.includes('Admin Preview Card'))
   check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
   check('preview has no upload dropzone', !w2.document.querySelector('.dropzone'))
@@ -441,9 +515,11 @@ console.log('\nG. pay button')
       text.slice(0, 160),
     )
     check('there is no submit button', !/Submit/.test(text), text.slice(0, 200))
-    // 1 card at 500 + 250 shipping = 750 minor units. Match the digits, not the
-    // currency formatting, which depends on the host locale.
-    check('the total is shown', /7[.,]50/.test(text), text.slice(0, 300))
+    // The default ribbon is YMCKOKO, which bills every card as a full
+    // double-sided one: 2 sides at 500 + 250 shipping = 1250 minor units. Match
+    // the digits, not the currency formatting, which depends on the host locale.
+    check('the total is shown', /12[.,]50/.test(text), text.slice(0, 300))
+    check('the total counts printed sides, not cards', /2 printed sides/.test(text), text.slice(0, 300))
 
     const before = seen.length
     const payButton = [...w.document.querySelectorAll('button')].find((b) =>
@@ -465,10 +541,9 @@ console.log('\nG. pay button')
 }
 
 // ---- scenario H: ribbon availability --------------------------------------
-// One stock flag (YMCKO) covers three-of-four modes: single-sided and
-// double-sided colour share the ribbon, so they go out together, and the
-// black-back mode is independent. The unavailable options must stay *visible*
-// and be disabled — never dropped from the chooser.
+// One stock flag per ribbon, and only two ribbons: the ribbon is the one choice
+// made per job, because a batch cannot mix ribbon loads. An unavailable ribbon
+// must stay *visible* and be disabled — never dropped from the chooser.
 console.log('\nH. ribbon availability: disabled, not absent')
 {
   cookieJar = ''
@@ -485,23 +560,24 @@ console.log('\nH. ribbon availability: disabled, not absent')
   check('operator can clear a ribbon flag', (await setRibbon('ymcko', false)) === 200)
 
   const config = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
-  const availability = Object.fromEntries(config.prices.map((p) => [p.print_mode, p.available]))
-  check('both colour modes go out of stock together',
-    availability.single_sided === false && availability.double_sided_color === false,
+  const availability = Object.fromEntries(config.prices.map((p) => [p.ribbon, p.available]))
+  check('the cleared ribbon is out of stock', availability.ymcko === false,
     JSON.stringify(availability))
-  check('the black-back mode is untouched',
-    availability.color_front_black_back === true, JSON.stringify(availability))
+  check('the other ribbon is untouched', availability.ymckoko === true,
+    JSON.stringify(availability))
+  check('one price row per ribbon', config.prices?.length === 2,
+    JSON.stringify(config.prices))
   check('both stock flags are served', config.ribbons?.length === 2,
     JSON.stringify(config.ribbons))
 
-  // A project on the out-of-stock ribbon: single-sided is YMCKO. It needs a
-  // card, or the checkout would refuse it for having nothing to print and the
-  // 409 below would prove the wrong thing.
+  // A project on the out-of-stock ribbon. It needs a card, or the checkout would
+  // refuse it for having nothing to print and the 409 below would prove the
+  // wrong thing.
   const prefix = (
     await api('/api/prefixes', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ print_mode: 'single_sided' }),
+      body: JSON.stringify({ ribbon: 'ymcko' }),
     })
   ).uuid
 
@@ -513,23 +589,21 @@ console.log('\nH. ribbon availability: disabled, not absent')
   const w = await mount(`/p/${prefix}`, { bust: 'h1' })
   await settle(1200)
   const options = [...w.document.querySelectorAll('.mode')]
-  const byMode = (mode) =>
-    options.find((el) => el.querySelector(`input[value="${mode}"]`))
+  const byRibbon = (ribbon) =>
+    options.find((el) => el.querySelector(`input[value="${ribbon}"]`))
 
-  check('every mode is still offered, none removed', options.length === 3,
+  check('every ribbon is still offered, none removed', options.length === 2,
     String(options.length))
-  check('an out-of-stock mode is rendered disabled',
-    byMode('single_sided')?.querySelector('input')?.disabled === true)
-  check('its ribbon-mate is disabled too',
-    byMode('double_sided_color')?.querySelector('input')?.disabled === true)
-  check('the in-stock mode is selectable',
-    byMode('color_front_black_back')?.querySelector('input')?.disabled === false)
+  check('an out-of-stock ribbon is rendered disabled',
+    byRibbon('ymcko')?.querySelector('input')?.disabled === true)
+  check('the in-stock ribbon is selectable',
+    byRibbon('ymckoko')?.querySelector('input')?.disabled === false)
   check('the disabled option says it is out of stock',
-    /out of stock/i.test(byMode('single_sided')?.textContent ?? ''))
+    /out of stock/i.test(byRibbon('ymcko')?.textContent ?? ''))
   check('the unavailable option is marked, not hidden',
-    byMode('single_sided')?.classList.contains('unavailable') === true)
+    byRibbon('ymcko')?.classList.contains('unavailable') === true)
 
-  // Paying for a mode that cannot be printed is refused on both layers: the
+  // Paying for a ribbon that cannot be printed is refused on both layers: the
   // button here, and a 409 from the server. Both need payment configured — an
   // unconfigured deployment answers 503 before it ever looks at the ribbon.
   if (!config.enabled) {
@@ -547,156 +621,236 @@ console.log('\nH. ribbon availability: disabled, not absent')
       String(refused.status))
   }
 
-  // Switching to an available mode goes through the real PATCH route.
-  const pick = byMode('color_front_black_back').querySelector('input')
+  // Switching to an available ribbon goes through the real PATCH route.
+  const pick = byRibbon('ymckoko').querySelector('input')
   pick.checked = true
   pick.dispatchEvent(new w.Event('change', { bubbles: true }))
   await settle(900)
-  check('choosing another mode PATCHes the prefix',
+  check('choosing another ribbon PATCHes the prefix',
     seen.some((r) => r.method === 'PATCH' && r.url.includes(`/api/prefixes/${prefix}`)),
     JSON.stringify(seen.slice(-3)))
   const after = await api(`/api/prefixes/${prefix}`)
-  check('the mode change took effect', after.print_mode === 'color_front_black_back',
-    after.print_mode)
+  check('the ribbon change took effect', after.ribbon === 'ymckoko', after.ribbon)
 
   // Restock: the options come back with no state to reset.
   check('operator can restock', (await setRibbon('ymcko', true)) === 200)
   const w2 = await mount(`/p/${prefix}`, { bust: 'h2' })
   await settle(1200)
   const after2 = [...w2.document.querySelectorAll('.mode input')]
-  check('every mode is selectable again', after2.every((i) => !i.disabled),
+  check('every ribbon is selectable again', after2.every((i) => !i.disabled),
     after2.map((i) => i.disabled).join(','))
 }
 
-// ---- scenario I: one component per print mode ------------------------------
-// The mode decides what a card *is*, so it decides what the row shows and which
-// inputs it offers: no back at all for single-sided, an upload for a colour
-// back, markdown for the black back. Each mode has its own component, and the
-// black-back pane has to be honest about what 1-bit black does to the artwork —
-// that difference from the colour mode is the whole point of the split.
-console.log('\nI. one card component per print mode')
+// ---- scenario I: the per-card back choice ----------------------------------
+// The job fixes the ribbon; the *card* chooses what its back is, and the ribbon
+// bounds the choices: YMCKO's back is a colour panel set (any source), YMCKOKO's
+// is the second black panel (text only). One panel offers those choices and the
+// input each one needs — the colour depth is the ribbon's, never a third choice.
+console.log('\nI. one panel, the back choices the ribbon allows')
 {
   cookieJar = ''
 
-  const makePrefix = async (print_mode) =>
+  const makePrefix = async (ribbon) =>
     (
       await api('/api/prefixes', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(print_mode ? { print_mode } : {}),
+        body: JSON.stringify(ribbon ? { ribbon } : {}),
       })
     ).uuid
 
-  /** Upload a card. Only the front image; a back is per mode. */
-  const addCard = async (prefix, { name = 'Mode Card', back_text } = {}) => {
+  /** Upload a card. Only the front image: a card is created single-sided. */
+  const addCard = async (prefix, name = 'Back Card') => {
     const fd = new NodeFormData()
     fd.append('name', name)
-    if (back_text) fd.append('back_text', back_text)
     fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'front.png')
     return api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
   }
 
-  // --- single-sided: no back side, rather than an empty one ----------------
-  {
-    const prefix = await makePrefix('single_sided')
-    await addCard(prefix)
-    const w = await mount(`/p/${prefix}`, { bust: 'i1' })
-    const t = w.document.body.textContent ?? ''
-    check('single-sided renders the card', !!w.document.querySelector('.card'))
-    check('single-sided has no back pane', !w.document.querySelector('.preview.back'))
-    check(
-      'single-sided has no back field at all',
-      !w.document.querySelector('textarea#back-1') &&
-        !w.document.querySelector('input#back-image-1'),
-    )
-    check('single-sided offers no image upload', !w.document.querySelector('.card input[type=file]'))
-    check('single-sided says the option has no back', /no back side/i.test(t))
+  const choice = (w, source) => w.document.querySelector(`.back-choice input[value="${source}"]`)
+  const pick = (w, source) => {
+    const el = choice(w, source)
+    el.checked = true
+    el.dispatchEvent(new w.Event('change', { bubbles: true }))
   }
 
-  // --- double-sided colour: the back is an uploaded image ------------------
+  // --- a new card is single-sided -----------------------------------------
   {
-    const prefix = await makePrefix('double_sided_color')
-    // A front-only card is the dropzone flow — one file, one card. The server
-    // takes it, which is what makes the per-card back upload possible at all.
+    const prefix = await makePrefix('ymcko')
     const card = await addCard(prefix)
-    check(
-      'a colour card can be created from its front alone',
-      card.id === 1 && !card.back_image_content_type,
-      JSON.stringify(card.back_image_content_type),
-    )
+    check('a card is created single-sided', card.back === 'none', String(card.back))
 
-    const w = await mount(`/p/${prefix}`, { bust: 'i2' })
-    await settle(200)
+    const w = await mount(`/p/${prefix}`, { bust: 'i1' })
     const t = w.document.body.textContent ?? ''
-    check('colour mode has a colour back pane', !!w.document.querySelector('.preview.back.color-back'))
-    check('the pane says there is no artwork yet', /no back image yet/i.test(t))
-    check('no back image is loaded yet', !w.document.querySelector('img[src*="/back-image"]'))
+    check('the panel says the card is single-sided', /single-sided/i.test(t))
+    check('no back pane for a single-sided card', !w.document.querySelector('.preview.back'))
     check(
-      'there is no back-text field in this mode',
-      !w.document.querySelector('textarea#back-1') && !w.document.querySelector('input#back-1'),
+      'no back-image chooser and no text field yet',
+      !w.document.querySelector('input#back-image-1') &&
+        !w.document.querySelector('textarea#back-1'),
     )
-    check('the row offers a back-image upload', !!w.document.querySelector('input#back-image-1[type=file]'))
-    check('the page reports the card as incomplete', /without a back image/.test(t))
+    check(
+      'the source chooser is in the editor, not the pane',
+      !!w.document.querySelector('.side.editor .back-choices input[value="image"]'),
+    )
+    check(
+      'every back the colour ribbon can print is offered',
+      ['none', 'front', 'image', 'markdown'].every((s) => !!choice(w, s)),
+      [...w.document.querySelectorAll('.back-choice input')].map((i) => i.value).join(','),
+    )
+  }
 
-    // Refused on both layers while a card is incomplete: the button here, and a
-    // 409 from the server. Both need payment configured.
-    const shop = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
-    if (!shop.enabled) {
-      console.log('  skip pay refusal: no payment configured (STRIPE_SECRET_KEY unset)')
-    } else {
-      const payButton = [...w.document.querySelectorAll('button')].find((b) =>
-        /Pay now/.test(b.textContent),
-      )
-      check('the Pay button is disabled while a back is missing', payButton?.disabled === true)
-      const refused = await realFetch(`${BASE}/api/prefixes/${prefix}/checkout`, { method: 'POST' })
-      check('the server refuses the checkout with 409', refused.status === 409, String(refused.status))
-    }
+  // --- a colour ribbon: the back is its own uploaded image ----------------
+  {
+    const prefix = await makePrefix('ymcko')
+    await addCard(prefix)
+    const w = await mount(`/p/${prefix}`, { bust: 'i2' })
+    pick(w, 'image')
+    // Svelte renders asynchronously, so even the DOM has to be waited for.
+    check(
+      'the file chooser is inside the back pane',
+      (await waitForEl(w.document, 'input#back-image-1[type=file]')) !== null &&
+        !!w.document.querySelector('.preview.back input#back-image-1[type=file]'),
+    )
+    check(
+      'the pane is a drop area while it has no picture',
+      !!w.document.querySelector('.preview.back .back-drop'),
+    )
+    check('choosing a back writes it to the card',
+      await waitFor(async () => (await api(`/api/prefixes/${prefix}/cards/1`)).back === 'image'))
+    // The page re-counts what is still missing once the row has written and the
+    // response has landed.
+    check('the page reports the card as incomplete',
+      await waitFor(() => /without a finished back/.test(w.document.body.textContent ?? '')))
 
     // Upload the back through the row's own input, the way a customer would:
     // the bundle builds a real multipart request, so this is the upload
     // endpoint exercised end to end rather than a mocked call.
-    const input = w.document.querySelector('input#back-image-1')
+    const input = await waitForEl(w.document, 'input#back-image-1')
     const back = new File([PNG], 'back.png', { type: 'image/png' })
     Object.defineProperty(input, 'files', { value: [back], configurable: true })
     input.dispatchEvent(new w.Event('change', { bubbles: true }))
-    await settle(1200)
 
+    const stored = await waitFor(async () =>
+      !!(await api(`/api/prefixes/${prefix}/cards/1`)).back_image_content_type,
+    )
+    check('the server stored the back image', stored)
     check(
       'the uploaded back is previewed',
-      !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/back-image"]`),
+      await waitFor(
+        () =>
+          !!w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
+      ),
     )
-    const stored = await api(`/api/prefixes/${prefix}/cards/1`)
-    check('the server stored the colour back', !!stored.back_image_content_type)
-    const t2 = w.document.body.textContent ?? ''
-    check('the card is no longer reported as incomplete', !/without a back image/.test(t2))
+    check('the card is no longer reported as incomplete',
+      await waitFor(() => !/without a finished back/.test(w.document.body.textContent ?? '')))
+
+    // The same picture, but printed on the back instead of uploaded.
+    pick(w, 'front')
+    check(
+      'a front copy needs no upload of its own',
+      await waitFor(async () => (await api(`/api/prefixes/${prefix}/cards/1`)).back === 'front'),
+    )
+    check('the card counts as complete',
+      !/without a finished back/.test(w.document.body.textContent ?? ''))
   }
 
-  // --- colour front, black back: text, printed by the black panel alone ----
+  // --- a black-panel ribbon: text is the only back it can print -----------
   {
-    const prefix = await makePrefix('color_front_black_back')
-    await addCard(prefix, {
-      back_text: '## Songs\n\n- one\n- two\n\n![art](https://example.com/a.png)\n',
-    })
+    const prefix = await makePrefix('ymckoko')
+    await addCard(prefix)
     const w = await mount(`/p/${prefix}`, { bust: 'i3' })
-    const t = w.document.body.textContent ?? ''
+    const offered = [...w.document.querySelectorAll('.back-choice input')].map((i) => i.value)
+    check('a black-panel ribbon offers no picture back',
+      !offered.includes('image') && !offered.includes('front'), offered.join(','))
+    check('it offers single-sided and text',
+      offered.includes('none') && offered.includes('markdown'), offered.join(','))
+
+    // The server holds the same rule, not just the panel that renders it: a
+    // picture back cannot be stored on this ribbon at all.
+    const refused = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ back: 'image' }),
+    })
+    check('the server refuses a picture back on a black-panel ribbon',
+      refused.status === 400, String(refused.status))
+
+    pick(w, 'markdown')
+    const ta = await waitForEl(w.document, 'textarea#back-1')
+    check('choosing text reveals the markdown editor', ta !== null)
+    // The editor stays disabled until the source write has landed: text may not
+    // be sent for a back the server still reads as single-sided.
+    check('the editor becomes usable', ta !== null && (await waitFor(() => ta.disabled === false)))
+
+    const md = '## Songs\n\n- one\n- two\n\n![art](https://example.com/a.png)\n'
+    if (ta) {
+      ta.value = md
+      ta.dispatchEvent(new w.Event('input', { bubbles: true }))
+    }
+
+    check(
+      'the text is stored on the card',
+      await waitFor(async () =>
+        ((await api(`/api/prefixes/${prefix}/cards/1`)).back_text ?? '').includes('## Songs'),
+      ),
+    )
+    check(
+      'the markdown is rendered into the pane',
+      await waitFor(() => /<h2>Songs<\/h2>/.test(w.document.querySelector('.preview.back')?.innerHTML ?? '')),
+    )
+
     const pane = w.document.querySelector('.preview.back.black-only')
-    const inner = pane?.innerHTML ?? ''
-    check('the black back renders its own pane', !!pane)
+    const t = w.document.body.textContent ?? ''
+    check('the back renders its 1-bit pane', !!pane)
     check('the pane is labelled black only', /black only \(1 bit\)/i.test(t))
-    check('the markdown is rendered into the pane', /<h2>Songs<\/h2>/.test(inner), inner)
-    check('no image is rendered on the black back', !/<img\b/.test(inner), inner)
-    check('the black back loads no back image', !w.document.querySelector('img[src*="/back-image"]'))
+    // A text back needs no picture, so its pane is not a drop area — and on this
+    // ribbon a picture back cannot be printed at all.
+    check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
+    check('no image is rendered on the black back', !/<img\b/.test(pane?.innerHTML ?? ''))
     // The medium refuses a picture, so the editor says so instead of leaving a
     // gap where the customer's artwork would have been.
+    check('the editor says image markup is not printed',
+      /image markup/i.test(t) && /cannot\s+print/i.test(t))
+    // A markdown back with text is complete: the page stops counting it as
+    // unfinished once that card's write has landed.
+    check('a text back is complete with no upload at all',
+      await waitFor(() => !/without a finished back/.test(w.document.body.textContent ?? '')))
+  }
+
+  // --- dropping a picture onto the empty back pane -------------------------
+  // The empty image area *is* the upload: a picture dropped anywhere on it
+  // becomes the card's back, rather than the picker being the only way in.
+  {
+    const prefix = await makePrefix('ymcko')
+    await addCard(prefix)
+    const w = await mount(`/p/${prefix}`, { bust: 'i5' })
+    pick(w, 'image') // an image back with no picture yet: the pane has the drop area
+    const drop = await waitForEl(w.document, '.preview.back .back-drop')
+    check('an image back with no picture is a drop area', drop !== null)
+
+    // Dropped on the overlay that covers the pane — the element a real drop
+    // lands on, since drop events bubble up rather than down.
+    const ev = new w.Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(ev, 'dataTransfer', {
+      value: { files: [new File([PNG], 'dropped.png', { type: 'image/png' })] },
+    })
+    drop.dispatchEvent(ev)
+
     check(
-      'the editor says image markup is not printed',
-      /image markup/i.test(t) && /cannot\s+print/i.test(t),
+      'a picture dropped on the pane becomes the card’s back picture',
+      await waitFor(async () => {
+        const c = await api(`/api/prefixes/${prefix}/cards/1`)
+        return c.back === 'image' && !!c.back_image_content_type
+      }),
     )
     check(
-      'the back is edited as text, not uploaded',
-      !!w.document.querySelector('textarea#back-1') && !w.document.querySelector('.card input[type=file]'),
+      'the dropped picture is previewed in the pane',
+      await waitFor(
+        () =>
+          !!w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
+      ),
     )
-    check('a black back is complete without any upload', !/without a back image/.test(t))
   }
 }
 

@@ -134,7 +134,7 @@ def payment_event(
     payment_status: str = "paid",
     use_metadata: bool = False,
     customer_email: Any = CUSTOMER_EMAIL,
-    amount_total: int = 2 * 500 + 250,
+    amount_total: int = 4 * 500 + 250,
     currency: str = "eur",
 ) -> dict:
     obj: dict = {"id": session, "object": "checkout.session", "payment_status": payment_status}
@@ -143,8 +143,9 @@ def payment_event(
             obj["metadata"] = {"prefix": prefix}
         else:
             obj["client_reference_id"] = prefix
-    # Two cards plus shipping, as section 3's session is priced; Stripe always
-    # reports both, and the order confirmation states the amount.
+    # What section 3's session is priced at — two cards on the default YMCKOKO
+    # ribbon is four printed sides, plus shipping. Stripe always reports both the
+    # amount and the currency, and the order confirmation states the amount.
     obj["amount_total"] = amount_total
     obj["currency"] = currency
     if customer_email is not None:
@@ -176,7 +177,12 @@ def new_prefix(cards: int = 0, start_checkout: bool = False) -> str:
     png = open(CARD_PNG, "rb").read()
     for index in range(cards):
         data, content_type = multipart(
-            {"name": f"Card {index + 1}", "serial_number": f"S{index + 1}", "back_text": "01 Song"},
+            {
+                "name": f"Card {index + 1}",
+                "serial_number": f"S{index + 1}",
+                "back": "markdown",
+                "back_text": "01 Song",
+            },
             "card.png",
             png,
         )
@@ -224,10 +230,15 @@ config = config or {}
 check("GET /api/shop/config is 200", status == 200, str(status))
 check("payment reports as enabled", config.get("enabled") is True, str(config))
 check("currency is eur", config.get("currency") == "eur", str(config.get("currency")))
-prices = {p.get("print_mode"): p.get("price_cents") for p in config.get("prices", [])}
+prices = {p.get("ribbon"): p.get("price_cents") for p in config.get("prices", [])}
 check(
-    "per-card price for the default mode is 500",
-    prices.get("color_front_black_back") == 500,
+    "one price per ribbon, the price of one printed side",
+    set(prices) == {"ymcko", "ymckoko"},
+    str(prices),
+)
+check(
+    "a printed side on the default ribbon is 500",
+    prices.get("ymckoko") == 500,
     str(prices),
 )
 check("shipping is 250", config.get("shipping_cents") == 250, str(config.get("shipping_cents")))
@@ -267,8 +278,8 @@ session = session or {}
 check("checkout returns 200", status == 200, f"{status} {session}")
 check("it returns a checkout URL", bool(session.get("url")), str(session))
 check(
-    "the amount is 2 cards plus shipping",
-    session.get("amount_total") == 2 * 500 + 250,
+    "the amount is 4 printed sides plus shipping",
+    session.get("amount_total") == 4 * 500 + 250,
     str(session.get("amount_total")),
 )
 check(
@@ -332,9 +343,16 @@ else:
         field("metadata[prefix]") == prefix,
         str(field("metadata[prefix]")),
     )
-    check("quantity is the card count", field("line_items[0][quantity]") == "2", str(field("line_items[0][quantity]")))
+    # Two cards on the default YMCKOKO ribbon: it always burns a full
+    # double-sided card, so the order is billed for 4 printed sides however its
+    # backs are filled in.
     check(
-        "unit_amount is the per-card price",
+        "quantity is the number of printed sides",
+        field("line_items[0][quantity]") == "4",
+        str(field("line_items[0][quantity]")),
+    )
+    check(
+        "unit_amount is the price of one printed side",
         field("line_items[0][price_data][unit_amount]") == "500",
         str(field("line_items[0][price_data][unit_amount]")),
     )
@@ -483,7 +501,7 @@ else:
         )
         check(
             "it states the amount that was paid",
-            "12.50 EUR" in (customer.get("text") or ""),
+            "22.50 EUR" in (customer.get("text") or ""),
             str(customer.get("text"))[:200],
         )
         if OPERATOR_EMAIL:
@@ -569,7 +587,7 @@ check(
 )
 # The unsealed prefix is writable again: the customer can edit cards once more.
 data, content_type = multipart(
-    {"name": "Edited", "serial_number": "S1", "back_text": "01 Song"},
+    {"name": "Edited", "serial_number": "S1", "back": "markdown", "back_text": "01 Song"},
     "card.png",
     open(CARD_PNG, "rb").read(),
 )

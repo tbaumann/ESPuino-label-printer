@@ -4,11 +4,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::backtext;
 use crate::error::ApiError;
 use crate::models::{
-    Card, CardPatch, ModePrice, NeedsAttentionKind, PaymentAnomaly, Prefix, PrefixStatus,
-    PrintMode, PrintQueue, PrintQueueCard, Ribbon, RibbonStock,
+    BackAvailability, BackDepth, BackSource, Card, CardPatch, NeedsAttentionKind, PaymentAnomaly,
+    Prefix, PrefixStatus, PrintQueue, PrintQueueCard, RenderStatus, Ribbon, RibbonPrice,
+    RibbonStock,
 };
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -37,7 +37,7 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.print_mode, p.paid_print_mode,
+        p.order_ref, p.ribbon, p.paid_ribbon,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count
  FROM prefixes p";
 
@@ -45,7 +45,7 @@ const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_cha
 /// the print queue UI can tell a `printing` prefix that is a resume (still has
 /// unprinted cards) from one that is done.
 const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.print_mode, p.paid_print_mode,
+        p.order_ref, p.ribbon, p.paid_ribbon,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid AND c.printed_at IS NULL)
             AS unprinted_count
@@ -55,25 +55,25 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let status_raw: String = row.get("status");
     let status = PrefixStatus::parse(&status_raw)
         .ok_or_else(|| ApiError::Internal(format!("unknown prefix status '{status_raw}'")))?;
-    let mode_raw: String = row.get("print_mode");
-    let print_mode = PrintMode::parse(&mode_raw)
-        .ok_or_else(|| ApiError::Internal(format!("unknown prefix print_mode '{mode_raw}'")))?;
-    let paid_raw: Option<String> = row.get("paid_print_mode");
-    let paid_print_mode =
-        match paid_raw.as_deref() {
-            None => None,
-            Some(s) => Some(PrintMode::parse(s).ok_or_else(|| {
-                ApiError::Internal(format!("unknown prefix paid_print_mode '{s}'"))
-            })?),
-        };
+    let ribbon_raw: String = row.get("ribbon");
+    let ribbon = Ribbon::parse(&ribbon_raw)
+        .ok_or_else(|| ApiError::Internal(format!("unknown prefix ribbon '{ribbon_raw}'")))?;
+    let paid_raw: Option<String> = row.get("paid_ribbon");
+    let paid_ribbon = match paid_raw.as_deref() {
+        None => None,
+        Some(s) => Some(
+            Ribbon::parse(s)
+                .ok_or_else(|| ApiError::Internal(format!("unknown prefix paid_ribbon '{s}'")))?,
+        ),
+    };
     Ok(Prefix {
         uuid: Uuid::parse_str(row.get::<String, _>("uuid").as_str())
             .map_err(|e| ApiError::Internal(e.to_string()))?,
         created_at: row.get("created_at"),
         status,
         status_changed_at: row.get("status_changed_at"),
-        print_mode,
-        paid_print_mode,
+        ribbon,
+        paid_ribbon,
         order_ref: row.get("order_ref"),
         card_count: row.get("card_count"),
         // The public view never carries operator-only print state.
@@ -91,16 +91,16 @@ fn admin_prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiErr
 pub async fn create_prefix(
     pool: &SqlitePool,
     uuid: Option<Uuid>,
-    print_mode: Option<PrintMode>,
+    ribbon: Option<Ribbon>,
 ) -> Result<Prefix, ApiError> {
     let uuid = uuid.unwrap_or_else(Uuid::new_v4);
-    let print_mode = print_mode.unwrap_or(PrintMode::ColorFrontBlackBack);
+    let ribbon = ribbon.unwrap_or(Ribbon::Ymckoko);
     let res = sqlx::query(
-        "INSERT INTO prefixes (uuid, status, status_changed_at, print_mode)
+        "INSERT INTO prefixes (uuid, status, status_changed_at, ribbon)
          VALUES (?1, 'draft', datetime('now'), ?2)",
     )
     .bind(uuid.to_string())
-    .bind(print_mode.as_str())
+    .bind(ribbon.as_str())
     .execute(pool)
     .await;
 
@@ -115,18 +115,22 @@ pub async fn create_prefix(
     get_prefix(pool, uuid).await
 }
 
-/// Change a prefix's print mode. Idempotent: re-applying the current mode is a
+/// Change a prefix's ribbon. Idempotent: re-applying the current ribbon is a
 /// no-op that still returns the prefix.
-pub async fn set_prefix_mode(
+///
+/// Deliberately not guarded here — whether the prefix's *cards* can be printed
+/// on the new ribbon is [`cards_incompatible_with_ribbon`], which the route
+/// checks first so a refusal happens before anything is written.
+pub async fn set_prefix_ribbon(
     pool: &SqlitePool,
     uuid: Uuid,
-    mode: PrintMode,
+    ribbon: Ribbon,
 ) -> Result<Prefix, ApiError> {
     let current = get_prefix(pool, uuid).await?;
-    if current.print_mode != mode {
-        sqlx::query("UPDATE prefixes SET print_mode = ?2 WHERE uuid = ?1")
+    if current.ribbon != ribbon {
+        sqlx::query("UPDATE prefixes SET ribbon = ?2 WHERE uuid = ?1")
             .bind(uuid.to_string())
-            .bind(mode.as_str())
+            .bind(ribbon.as_str())
             .execute(pool)
             .await?;
     }
@@ -192,58 +196,57 @@ pub async fn set_ribbon_stock(
     Ok(RibbonStock { ribbon, in_stock })
 }
 
-/// Every print mode's price, ordered by mode, for the shop config — each one
-/// carrying whether it can be ordered right now.
+/// The price of one printed side per ribbon, ordered by ribbon, for the shop
+/// config — each one carrying whether it can be ordered right now.
 ///
-/// Availability is derived here, from the *ribbon* flags, rather than stored
-/// per mode: single-sided and double-sided colour share YMCKO, so they are
-/// available or unavailable together by construction.
-pub async fn list_mode_prices(pool: &SqlitePool) -> Result<Vec<ModePrice>, ApiError> {
+/// The price is per *side*: how many of them a card costs is the ribbon's rule
+/// ([`Ribbon::billed_sides`]), applied at the checkout, not stored per price.
+pub async fn list_ribbon_prices(pool: &SqlitePool) -> Result<Vec<RibbonPrice>, ApiError> {
     let ribbons = list_ribbon_stock(pool).await?;
-    let rows = sqlx::query("SELECT print_mode, price_cents FROM mode_prices ORDER BY print_mode")
+    let rows = sqlx::query("SELECT ribbon, price_cents FROM ribbon_prices ORDER BY ribbon")
         .fetch_all(pool)
         .await?;
     rows.iter()
         .map(|r| {
-            let mode_raw: String = r.get("print_mode");
-            let print_mode = PrintMode::parse(&mode_raw).ok_or_else(|| {
-                ApiError::Internal(format!("unknown print_mode '{mode_raw}' in mode_prices"))
+            let ribbon_raw: String = r.get("ribbon");
+            let ribbon = Ribbon::parse(&ribbon_raw).ok_or_else(|| {
+                ApiError::Internal(format!("unknown ribbon '{ribbon_raw}' in ribbon_prices"))
             })?;
-            Ok(ModePrice {
-                print_mode,
+            Ok(RibbonPrice {
+                ribbon,
                 price_cents: r.get("price_cents"),
                 available: ribbons
                     .iter()
-                    .find(|s| s.ribbon == print_mode.ribbon())
+                    .find(|s| s.ribbon == ribbon)
                     .is_some_and(|s| s.in_stock),
             })
         })
         .collect()
 }
 
-/// The price of one card in a given mode, in the currency's minor unit.
+/// The price of one printed side on a ribbon, in the currency's minor unit.
 ///
-/// A mode with no configured price is a misconfiguration, not a free card, so
+/// A ribbon with no configured price is a misconfiguration, not a free card, so
 /// it surfaces as an error rather than silently pricing at zero.
-pub async fn mode_price(pool: &SqlitePool, mode: PrintMode) -> Result<i64, ApiError> {
-    let row = sqlx::query("SELECT price_cents FROM mode_prices WHERE print_mode = ?1")
-        .bind(mode.as_str())
+pub async fn ribbon_price(pool: &SqlitePool, ribbon: Ribbon) -> Result<i64, ApiError> {
+    let row = sqlx::query("SELECT price_cents FROM ribbon_prices WHERE ribbon = ?1")
+        .bind(ribbon.as_str())
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| ApiError::Internal(format!("no price configured for print mode {mode}")))?;
+        .ok_or_else(|| ApiError::Internal(format!("no price configured for ribbon {ribbon}")))?;
     Ok(row.get("price_cents"))
 }
 
-/// Freeze the mode a prefix was charged for, so the spooler prints what the
-/// customer paid for even if the operator later changes the prefix's mode.
-pub async fn set_paid_print_mode(
+/// Freeze the ribbon a prefix was charged for, so the spooler prints what the
+/// customer paid for even if the operator later changes the prefix's ribbon.
+pub async fn set_paid_ribbon(
     pool: &SqlitePool,
     uuid: Uuid,
-    mode: PrintMode,
+    ribbon: Ribbon,
 ) -> Result<(), ApiError> {
-    sqlx::query("UPDATE prefixes SET paid_print_mode = ?2 WHERE uuid = ?1")
+    sqlx::query("UPDATE prefixes SET paid_ribbon = ?2 WHERE uuid = ?1")
         .bind(uuid.to_string())
-        .bind(mode.as_str())
+        .bind(ribbon.as_str())
         .execute(pool)
         .await?;
     Ok(())
@@ -351,17 +354,69 @@ pub async fn ensure_writable(
     Ok(prefix)
 }
 
+fn render_status(v: &str) -> Result<RenderStatus, ApiError> {
+    RenderStatus::parse(v)
+        .ok_or_else(|| ApiError::Internal(format!("unknown render status {v}")))
+}
+
+fn back_source_of(row: &sqlx::sqlite::SqliteRow) -> Result<BackSource, ApiError> {
+    let raw: String = row.get("back_source");
+    BackSource::parse(&raw)
+        .ok_or_else(|| ApiError::Internal(format!("unknown card back_source '{raw}'")))
+}
+
+/// Whether a back side is actually *rendered* for a card: a `none` back never
+/// is, and a back whose material has not been supplied yet — an `image` with no
+/// upload, a `markdown` with no text — is not there either.
+///
+/// The distinction matters because the render-status columns default to
+/// `'pending'` on every row: without this a single-sided card, or a colour card
+/// whose back image has not been uploaded, would report a real pending back
+/// render instead of no back at all.
+fn back_renders(back: BackSource, has_image: bool, has_text: bool) -> bool {
+    match back {
+        BackSource::None => false,
+        BackSource::Front => true,
+        BackSource::Image => has_image,
+        BackSource::Markdown => has_text,
+    }
+}
+
+/// Whether a stored text field counts as supplied. Whitespace is not text, so
+/// a card holding a lone newline is still missing its markdown back.
+fn has_text(s: Option<&str>) -> bool {
+    s.is_some_and(|t| !t.trim().is_empty())
+}
+
+/// Map the four status columns onto the Card model, suppressing the back sides
+/// a card has nothing to render.
 fn card_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Card, ApiError> {
+    let back = back_source_of(row)?;
+    let back_text: Option<String> = row.get("back_text");
+    let back_image: Option<String> = row.get("back_image_content_type");
+    let has_back = back_renders(back, back_image.is_some(), has_text(back_text.as_deref()));
     Ok(Card {
         id: row.get("id"),
         name: row.get("name"),
         serial_number: row.get("serial_number"),
-        back_text: row.get("back_text"),
+        back,
+        back_text,
         image_content_type: row.get("image_content_type"),
-        back_image_content_type: row.get("back_image_content_type"),
+        back_image_content_type: back_image,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
-        printed_at: row.get("printed_at"),
+        display_front: render_status(&row.get::<String, _>("front_display_status"))?,
+        display_back: if has_back {
+            Some(render_status(&row.get::<String, _>("back_display_status"))?)
+        } else {
+            None
+        },
+        print_front: render_status(&row.get::<String, _>("front_raster_status"))?,
+        print_back: if has_back {
+            Some(render_status(&row.get::<String, _>("back_raster_status"))?)
+        } else {
+            None
+        },
     })
 }
 
@@ -396,14 +451,16 @@ pub async fn next_card_id(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiErr
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
 ///
 /// A `back_image_path`/`back_image_content_type` of `None` clears any stored
-/// colour back image. Which back fields are valid at all is enforced by the
-/// route layer against the prefix's `print_mode` before this is called.
+/// back image. Whether `back` is one the prefix's ribbon can print, and whether
+/// a `back_text` goes with it, is enforced by the route layer before this is
+/// called.
 pub async fn upsert_card(
     pool: &SqlitePool,
     prefix: Uuid,
     id: i64,
     name: &str,
     serial_number: Option<&str>,
+    back: BackSource,
     back_text: Option<&str>,
     image_path: &str,
     image_content_type: &str,
@@ -412,12 +469,13 @@ pub async fn upsert_card(
 ) -> Result<Card, ApiError> {
     sqlx::query(
         "INSERT INTO cards
-            (prefix_uuid, id, name, serial_number, back_text, image_path, image_content_type,
-             back_image_path, back_image_content_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (prefix_uuid, id, name, serial_number, back_source, back_text, image_path,
+             image_content_type, back_image_path, back_image_content_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (prefix_uuid, id) DO UPDATE SET
             name = excluded.name,
             serial_number = excluded.serial_number,
+            back_source = excluded.back_source,
             back_text = excluded.back_text,
             image_path = excluded.image_path,
             image_content_type = excluded.image_content_type,
@@ -429,6 +487,7 @@ pub async fn upsert_card(
     .bind(id)
     .bind(name)
     .bind(serial_number)
+    .bind(back.as_str())
     .bind(back_text)
     .bind(image_path)
     .bind(image_content_type)
@@ -440,11 +499,13 @@ pub async fn upsert_card(
     get_card(pool, prefix, id).await
 }
 
-/// Point a card's colour back image at a freshly written blob, leaving its
-/// front image and its text fields alone.
+/// Point a card's back image at a freshly written blob, leaving its front image
+/// and its text fields alone.
 ///
-/// The card has to exist: a back image belongs to a card, and the caller has
-/// already checked that the prefix's mode has a colour back at all.
+/// The back source becomes [`BackSource::Image`]: attaching an image *is* saying
+/// that this card's back is that image, so the two are written together rather
+/// than leaving a card whose stored image nothing would look at. The caller has
+/// already checked that the prefix's ribbon can print a colour back.
 pub async fn set_card_back_image(
     pool: &SqlitePool,
     prefix: Uuid,
@@ -456,6 +517,7 @@ pub async fn set_card_back_image(
         "UPDATE cards
             SET back_image_path = ?3,
                 back_image_content_type = ?4,
+                back_source = 'image',
                 updated_at = datetime('now')
           WHERE prefix_uuid = ?1 AND id = ?2",
     )
@@ -473,30 +535,153 @@ pub async fn set_card_back_image(
     get_card(pool, prefix, id).await
 }
 
-/// How many of a prefix's cards have no colour back image yet.
+/// How many of a prefix's cards are still missing the material their back is
+/// made of: an `image` back with nothing uploaded, or a `markdown` back with no
+/// text. A single-sided card, and a `front` back (which needs nothing extra),
+/// can never be incomplete.
 ///
-/// Zero for a mode that has no colour back at all, and for an empty prefix —
-/// this answers "is anything missing", not "is there anything here".
-pub async fn cards_missing_back_image(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiError> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS missing FROM cards
-          WHERE prefix_uuid = ?1 AND back_image_content_type IS NULL",
+/// Zero for an empty prefix — this answers "is anything missing", not "is there
+/// anything here".
+///
+/// Deliberately computed through [`back_renders`] rather than re-expressed in
+/// SQL: this, the card model and the print queue are three views of one
+/// question, and a second copy of the rule (with a second idea of what counts
+/// as empty text) is exactly how they would drift apart.
+pub async fn cards_missing_back(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiError> {
+    let rows = sqlx::query(
+        "SELECT back_source, back_text, back_image_content_type
+           FROM cards WHERE prefix_uuid = ?1",
     )
     .bind(prefix.to_string())
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(row.get("missing"))
+    let mut missing = 0;
+    for r in &rows {
+        let back = back_source_of(r)?;
+        let back_text: Option<String> = r.get("back_text");
+        let back_image: Option<String> = r.get("back_image_content_type");
+        let supplied = back_renders(back, back_image.is_some(), has_text(back_text.as_deref()));
+        if back.is_double_sided() && !supplied {
+            missing += 1;
+        }
+    }
+    Ok(missing)
 }
 
-/// Update a card's metadata without touching its image.
+/// Total ribbon panels a prefix's cards are billed for on a given ribbon.
+///
+/// The rule is [`Ribbon::billed_sides`], applied per card: YMCKO charges per
+/// printed side, YMCKOKO charges a full double-sided card whatever the back is.
+/// Derived here from the stored back sources rather than from the request, so
+/// the figure the checkout locks into Stripe is the one the cards actually are.
+pub async fn billed_sides(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    ribbon: Ribbon,
+) -> Result<i64, ApiError> {
+    let rows = sqlx::query(
+        "SELECT back_source, COUNT(*) AS n FROM cards WHERE prefix_uuid = ?1 GROUP BY back_source",
+    )
+    .bind(prefix.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut total = 0;
+    for r in &rows {
+        let back = back_source_of(r)?;
+        total += ribbon.billed_sides(back) * r.get::<i64, _>("n");
+    }
+    Ok(total)
+}
+
+/// How many of a prefix's cards carry a back the given ribbon cannot print —
+/// i.e. how many would be stranded by switching the prefix to it.
+///
+/// Derived from [`Ribbon::allows_back`] rather than a second copy of the rule,
+/// so the two cannot drift. Used to refuse a ribbon change that would leave an
+/// order unprintable, which nobody would otherwise notice until the spooler
+/// went looking for a raster.
+pub async fn cards_incompatible_with_ribbon(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    ribbon: Ribbon,
+) -> Result<i64, ApiError> {
+    if ribbon == Ribbon::Ymcko {
+        return Ok(0); // YMCKO prints any back side.
+    }
+    let rows = sqlx::query(
+        "SELECT back_source, COUNT(*) AS n FROM cards WHERE prefix_uuid = ?1 GROUP BY back_source",
+    )
+    .bind(prefix.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut bad = 0;
+    for r in &rows {
+        let src = back_source_of(r)?;
+        if !ribbon.allows_back(src) {
+            bad += r.get::<i64, _>("n");
+        }
+    }
+    Ok(bad)
+}
+
+/// Update a card's metadata without touching its front image.
+///
+/// The back side is one choice, so a patch carries at most one intent for it:
+/// the new `back` (validated against the prefix's ribbon) and, for a markdown
+/// back, its text. Both are validated before anything is written, so a refused
+/// patch leaves the card exactly as it was.
+///
+/// Switching source deliberately leaves the *other* material in place: turning a
+/// card from `image` to `markdown` and back again must not lose the uploaded
+/// image or the typed text. Only the source decides what is rendered.
 pub async fn update_card_meta(
     pool: &SqlitePool,
     prefix: Uuid,
     id: i64,
     patch: &CardPatch,
 ) -> Result<Card, ApiError> {
-    get_card(pool, prefix, id).await?; // 404 if the card is unknown
-    let mode = get_prefix(pool, prefix).await?.print_mode;
+    let card = get_card(pool, prefix, id).await?; // 404 if the card is unknown
+    let ribbon = get_prefix(pool, prefix).await?.ribbon;
+
+    // Validate the whole back change before writing any of it.
+    if let Some(back) = patch.back {
+        if !ribbon.allows_back(back) {
+            return Err(ApiError::BadRequest(format!(
+                "a '{back}' back cannot be printed on a {ribbon} prefix: its back panel is \
+                 black only, so use 'none' or 'markdown'"
+            )));
+        }
+    }
+    if let Some(text) = patch.back_text.as_deref() {
+        let effective = patch.back.unwrap_or(card.back);
+        if effective != BackSource::Markdown {
+            return Err(ApiError::BadRequest(
+                "back_text is only valid for a 'markdown' back".into(),
+            ));
+        }
+        let value = if text.trim().is_empty() { None } else { Some(text) };
+        sqlx::query(
+            "UPDATE cards SET back_text = ?3, updated_at = datetime('now')
+              WHERE prefix_uuid = ?1 AND id = ?2",
+        )
+        .bind(prefix.to_string())
+        .bind(id)
+        .bind(value)
+        .execute(pool)
+        .await?;
+    }
+
+    if let Some(back) = patch.back {
+        sqlx::query(
+            "UPDATE cards SET back_source = ?3, updated_at = datetime('now')
+              WHERE prefix_uuid = ?1 AND id = ?2",
+        )
+        .bind(prefix.to_string())
+        .bind(id)
+        .bind(back.as_str())
+        .execute(pool)
+        .await?;
+    }
 
     if let Some(raw) = patch.name.as_deref() {
         let name = raw.trim();
@@ -514,28 +699,17 @@ pub async fn update_card_meta(
         .await?;
     }
 
-    // Column names come from this fixed list, so interpolating them is safe.
-    for (col, value) in [
-        ("serial_number", patch.serial_number.as_deref()),
-        ("back_text", patch.back_text.as_deref()),
-    ] {
-        if let Some(v) = value {
-            if col == "back_text" && !mode.allows_back_text() {
-                return Err(ApiError::BadRequest(format!(
-                    "back_text is only valid in a colour_front_black_back prefix, not {mode}"
-                )));
-            }
-            let v = if v.trim().is_empty() { None } else { Some(v) };
-            sqlx::query(&format!(
-                "UPDATE cards SET {col} = ?3, updated_at = datetime('now')
-                  WHERE prefix_uuid = ?1 AND id = ?2"
-            ))
-            .bind(prefix.to_string())
-            .bind(id)
-            .bind(v)
-            .execute(pool)
-            .await?;
-        }
+    if let Some(v) = patch.serial_number.as_deref() {
+        let v = if v.trim().is_empty() { None } else { Some(v) };
+        sqlx::query(
+            "UPDATE cards SET serial_number = ?3, updated_at = datetime('now')
+              WHERE prefix_uuid = ?1 AND id = ?2",
+        )
+        .bind(prefix.to_string())
+        .bind(id)
+        .bind(v)
+        .execute(pool)
+        .await?;
     }
 
     get_card(pool, prefix, id).await
@@ -582,6 +756,52 @@ pub async fn delete_card(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<(),
     Ok(())
 }
 
+
+/// Record the outcome of rendering a card's derived artifacts.
+///
+/// Each pair is `(status, error)` where `error` is `Some` only on `failed`. A
+/// side the mode has no back for passes `None` for the whole back pair, so its
+/// columns stay at the `'pending'` default without ever being read as a real
+/// pending back render (the model suppresses them for back-less modes).
+pub async fn set_card_render_status(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    id: i64,
+    front_display: Option<(RenderStatus, Option<String>)>,
+    front_raster: Option<(RenderStatus, Option<String>)>,
+    back_display: Option<(RenderStatus, Option<String>)>,
+    back_raster: Option<(RenderStatus, Option<String>)>,
+) -> Result<Card, ApiError> {
+    get_card(pool, prefix, id).await?; // 404 for an unknown card
+    let stub = || (RenderStatus::Pending, None);
+    let (fd, fde) = front_display.unwrap_or_else(stub);
+    let (fr, fre) = front_raster.unwrap_or_else(stub);
+    let (bd, bde) = back_display.unwrap_or_else(stub);
+    let (br, bre) = back_raster.unwrap_or_else(stub);
+    sqlx::query(
+        "UPDATE cards SET
+            front_display_status = ?3, front_display_error = ?4,
+            front_raster_status = ?5, front_raster_error = ?6,
+            back_display_status = ?7, back_display_error = ?8,
+            back_raster_status = ?9, back_raster_error = ?10,
+            updated_at = datetime('now')
+          WHERE prefix_uuid = ?1 AND id = ?2",
+    )
+    .bind(prefix.to_string())
+    .bind(id)
+    .bind(fd.as_str())
+    .bind(fde)
+    .bind(fr.as_str())
+    .bind(fre)
+    .bind(bd.as_str())
+    .bind(bde)
+    .bind(br.as_str())
+    .bind(bre)
+    .execute(pool)
+    .await?;
+    get_card(pool, prefix, id).await
+}
+
 /// Mark a card printed, once. The spooler calls this only after the printer
 /// confirms the card was ejected.
 ///
@@ -611,45 +831,74 @@ pub async fn mark_card_printed(pool: &SqlitePool, prefix: Uuid, id: i64) -> Resu
 /// half-finished order that can be picked up where it left off.
 pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, ApiError> {
     let p = get_prefix(pool, prefix).await?;
-    // The spooler prints the mode that was paid for, not the prefix's current
-    // one — an operator changing the mode after payment must not change what
-    // gets printed. Prefixes never priced through checkout fall back to the
-    // current mode.
-    let print_mode = p.paid_print_mode.unwrap_or(p.print_mode);
+    // The spooler prints the ribbon that was paid for, not the prefix's current
+    // one — an operator changing it after payment must not change what gets
+    // printed. Prefixes never priced through checkout fall back to the current
+    // ribbon.
+    let ribbon = p.paid_ribbon.unwrap_or(p.ribbon);
     let rows = sqlx::query(
-        "SELECT id, name, printed_at, back_text FROM cards
-          WHERE prefix_uuid = ?1 ORDER BY id ASC",
+        "SELECT id, name, printed_at, back_source, back_text, back_image_content_type,
+                front_raster_status, back_raster_status
+          FROM cards WHERE prefix_uuid = ?1 ORDER BY id ASC",
     )
     .bind(prefix.to_string())
     .fetch_all(pool)
     .await?;
+
+    // The back side a card actually has, and whether its needed rasters are
+    // ready. This is the spooler's ground truth: it prints only `printable`
+    // cards, and fetches `print-raster/back` exactly when `back` is not
+    // `none`. It never silently prints an original whose render is pending or
+    // failed.
+    let parse_status =
+        |v: String| RenderStatus::parse(&v).unwrap_or(RenderStatus::Pending);
     let cards = rows
         .iter()
         .map(|r| {
+            let back = back_source_of(r)?;
             let back_text: Option<String> = r.get("back_text");
-            PrintQueueCard {
+            let back_image: Option<String> = r.get("back_image_content_type");
+            let front_ready = parse_status(r.get::<String, _>("front_raster_status"))
+                == RenderStatus::Ready;
+            let back_ready = parse_status(r.get::<String, _>("back_raster_status"))
+                == RenderStatus::Ready;
+            // Whether there is anything to print on the back at all. A card
+            // whose material is still missing is not printable, exactly as the
+            // checkout's gate refuses to sell it.
+            let material = back_renders(back, back_image.is_some(), has_text(back_text.as_deref()));
+            let (back_avail, printable) = match (back.is_double_sided(), material) {
+                (false, _) => (BackAvailability::None, front_ready),
+                (true, false) => (BackAvailability::None, false),
+                // The colour the back prints in is the ribbon's, not the card's.
+                (true, true) => (
+                    match ribbon.back_depth() {
+                        BackDepth::Color => BackAvailability::Color,
+                        BackDepth::Black => BackAvailability::Black,
+                    },
+                    front_ready && back_ready,
+                ),
+            };
+            Ok(PrintQueueCard {
                 id: r.get("id"),
                 name: r.get("name"),
                 printed_at: r.get("printed_at"),
-                // Only the black-back mode has a back rendered from markdown.
-                // Every other mode has no black back at all, so there is
-                // nothing for the spooler to print there.
-                back_html: if print_mode.allows_back_text() {
-                    back_text.map(|md| backtext::render_back_text(&md))
-                } else {
-                    None
-                },
-            }
+                back: back_avail,
+                billed_sides: ribbon.billed_sides(back),
+                printable,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    // Derived before `cards` is moved into the queue.
     let unprinted_count = cards.iter().filter(|c| c.printed_at.is_none()).count() as i64;
+    let billed_sides = cards.iter().map(|c| c.billed_sides).sum();
     let resume = p.status == PrefixStatus::Printing && unprinted_count > 0;
     Ok(PrintQueue {
         prefix,
         status: p.status,
-        print_mode,
+        ribbon,
         cards,
         unprinted_count,
+        billed_sides,
         resume,
     })
 }
@@ -853,6 +1102,110 @@ mod tests {
         pool
     }
 
+    /// A card with a front image and, if `back` needs it, the material for it.
+    /// The blob paths are never read by these tests, only the metadata.
+    async fn card(pool: &SqlitePool, prefix: Uuid, id: i64, back: BackSource) {
+        let (image, text) = match back {
+            BackSource::Image => (Some("blobs/x-back.png"), None),
+            BackSource::Markdown => (None, Some("# Songs\n- one\n")),
+            _ => (None, None),
+        };
+        upsert_card(
+            pool,
+            prefix,
+            id,
+            "c",
+            None,
+            back,
+            text,
+            "blobs/f.png",
+            "image/png",
+            image,
+            image.map(|_| "image/png"),
+        )
+        .await
+        .expect("upsert card");
+    }
+
+    // -----------------------------------------------------------------------
+    // Model: the two enums, and the rules that hang off them
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn back_source_parse_round_trips_every_value() {
+        for (text, back) in [
+            ("none", BackSource::None),
+            ("front", BackSource::Front),
+            ("image", BackSource::Image),
+            ("markdown", BackSource::Markdown),
+        ] {
+            assert_eq!(BackSource::parse(text), Some(back));
+            assert_eq!(back.as_str(), text);
+        }
+        assert_eq!(BackSource::parse("colour"), None);
+        // A card with no back is single-sided; every other value is not.
+        assert!(!BackSource::None.is_double_sided());
+        for b in [BackSource::Front, BackSource::Image, BackSource::Markdown] {
+            assert!(b.is_double_sided(), "{b} is a double-sided card");
+        }
+    }
+
+    #[test]
+    fn ribbon_parse_round_trips_both_ribbons() {
+        for (text, ribbon) in [("ymcko", Ribbon::Ymcko), ("ymckoko", Ribbon::Ymckoko)] {
+            assert_eq!(Ribbon::parse(text), Some(ribbon));
+            assert_eq!(ribbon.as_str(), text);
+        }
+        assert_eq!(Ribbon::parse("ymckokok"), None);
+    }
+
+    #[test]
+    fn only_ymcko_can_print_a_colour_back() {
+        // YMCKO's back is a panel set of its own: anything print there.
+        for back in [
+            BackSource::None,
+            BackSource::Front,
+            BackSource::Image,
+            BackSource::Markdown,
+        ] {
+            assert!(Ribbon::Ymcko.allows_back(back), "ymcko allows {back}");
+        }
+        // YMCKOKO's back is the second black panel: text yes, colour no.
+        assert!(Ribbon::Ymckoko.allows_back(BackSource::None));
+        assert!(Ribbon::Ymckoko.allows_back(BackSource::Markdown));
+        assert!(!Ribbon::Ymckoko.allows_back(BackSource::Image));
+        assert!(!Ribbon::Ymckoko.allows_back(BackSource::Front));
+    }
+
+    #[test]
+    fn back_depth_is_the_ribbons_consequence() {
+        assert_eq!(Ribbon::Ymcko.back_depth(), BackDepth::Color);
+        assert_eq!(Ribbon::Ymckoko.back_depth(), BackDepth::Black);
+    }
+
+    #[test]
+    fn billing_is_per_printed_side_on_ymcko_and_always_two_on_ymckoko() {
+        // YMCKO bills the sides actually printed.
+        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::None), 1);
+        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Front), 2);
+        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Image), 2);
+        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Markdown), 2);
+        // YMCKOKO always burns a full double-sided card: the second black panel
+        // is lost either way, so a blank back saves nothing.
+        for back in [
+            BackSource::None,
+            BackSource::Front,
+            BackSource::Image,
+            BackSource::Markdown,
+        ] {
+            assert_eq!(Ribbon::Ymckoko.billed_sides(back), 2, "{back}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefixes
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
     async fn upsert_creates_and_is_idempotent() {
         let pool = test_pool().await;
@@ -901,126 +1254,86 @@ mod tests {
         assert!(matches!(err, ApiError::Conflict(_)));
     }
 
-    #[test]
-    fn print_mode_parse_round_trips_all_modes() {
-        for (text, mode) in [
-            ("single_sided", PrintMode::SingleSided),
-            ("double_sided_color", PrintMode::DoubleSidedColor),
-            ("color_front_black_back", PrintMode::ColorFrontBlackBack),
-        ] {
-            assert_eq!(PrintMode::parse(text), Some(mode));
-            assert_eq!(mode.as_str(), text);
-        }
-        assert_eq!(PrintMode::parse("colour_front_black"), None);
-    }
-
-    #[test]
-    fn print_mode_back_field_capabilities() {
-        // Only the black-back mode renders markdown back text.
-        assert!(PrintMode::ColorFrontBlackBack.allows_back_text());
-        assert!(!PrintMode::SingleSided.allows_back_text());
-        assert!(!PrintMode::DoubleSidedColor.allows_back_text());
-
-        // Only double-sided colour takes a colour back image.
-        assert!(PrintMode::DoubleSidedColor.allows_back_image());
-        assert!(!PrintMode::SingleSided.allows_back_image());
-        assert!(!PrintMode::ColorFrontBlackBack.allows_back_image());
-    }
-
     #[tokio::test]
-    async fn prefix_defaults_to_color_front_black_back() {
+    async fn prefix_defaults_to_ymckoko() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
-        assert_eq!(p.print_mode, PrintMode::ColorFrontBlackBack);
+        assert_eq!(p.ribbon, Ribbon::Ymckoko);
+        assert_eq!(p.paid_ribbon, None);
     }
 
     #[tokio::test]
-    async fn prefix_accepts_an_explicit_mode() {
+    async fn prefix_accepts_an_explicit_ribbon() {
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::SingleSided))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .expect("create");
-        assert_eq!(p.print_mode, PrintMode::SingleSided);
+        assert_eq!(p.ribbon, Ribbon::Ymcko);
     }
 
     #[tokio::test]
-    async fn set_prefix_mode_is_idempotent_and_persists() {
+    async fn set_prefix_ribbon_is_idempotent_and_persists() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
-        let switched = set_prefix_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+        let switched = set_prefix_ribbon(&pool, p.uuid, Ribbon::Ymcko)
             .await
             .expect("switch");
-        assert_eq!(switched.print_mode, PrintMode::DoubleSidedColor);
+        assert_eq!(switched.ribbon, Ribbon::Ymcko);
         // Re-applying is a no-op that still returns the prefix.
-        let again = set_prefix_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
+        let again = set_prefix_ribbon(&pool, p.uuid, Ribbon::Ymcko)
             .await
             .expect("switch again");
-        assert_eq!(again.print_mode, PrintMode::DoubleSidedColor);
+        assert_eq!(again.ribbon, Ribbon::Ymcko);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cards: the back side and what is still missing
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_cards_back_source_and_material_round_trip() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::Image).await;
+        card(&pool, p.uuid, 2, BackSource::Markdown).await;
+        card(&pool, p.uuid, 3, BackSource::None).await;
+
+        let c = get_card(&pool, p.uuid, 1).await.expect("card 1");
+        assert_eq!(c.back, BackSource::Image);
+        assert_eq!(c.back_image_content_type.as_deref(), Some("image/png"));
+        assert!(c.back_text.is_none());
+        // A back image exists, so both back artifacts are reported — the front
+        // always is.
+        assert!(c.display_back.is_some() && c.print_back.is_some());
+
+        let c = get_card(&pool, p.uuid, 2).await.expect("card 2");
+        assert_eq!(c.back, BackSource::Markdown);
+        assert!(c.back_image_content_type.is_none());
+        assert!(c.display_back.is_some());
+
+        // A single-sided card has no back side at all, so the back statuses are
+        // absent rather than a synthetic 'pending'.
+        let c = get_card(&pool, p.uuid, 3).await.expect("card 3");
+        assert_eq!(c.back, BackSource::None);
+        assert!(c.display_back.is_none() && c.print_back.is_none());
     }
 
     #[tokio::test]
-    async fn back_image_content_type_round_trips_on_card() {
+    async fn a_back_without_its_material_reads_as_no_back_yet() {
+        // A card created from its front alone is the bulk upload flow: the back
+        // is chosen, but its image or text is not there yet. That must read as
+        // "no back yet", not as a real pending render.
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .expect("create");
-        let card = upsert_card(
-            &pool,
-            p.uuid,
-            1,
-            "front",
-            None,
-            None, // back_text is meaningless in colour mode
-            "blobs/1.png",
-            "image/png",
-            Some("blobs/1-back.png"),
-            Some("image/png"),
-        )
-        .await
-        .expect("upsert");
-        assert_eq!(card.image_content_type, "image/png");
-        assert_eq!(card.back_image_content_type.as_deref(), Some("image/png"));
-        assert!(card.back_text.is_none());
-    }
-
-    #[tokio::test]
-    async fn non_black_back_mode_keeps_back_text_field_null() {
-        let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::SingleSided))
-            .await
-            .expect("create");
-        let card = upsert_card(
-            &pool,
-            p.uuid,
-            1,
-            "front",
-            None,
-            None,
-            "blobs/1.png",
-            "image/png",
-            None,
-            None,
-        )
-        .await
-        .expect("upsert");
-        assert!(card.back_image_content_type.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_colour_card_can_be_created_front_only_and_completed_later() {
-        // The front-image upload is bulk; the colour back is per card. A card
-        // therefore starts without one, and the count of incomplete cards is
-        // what the checkout gate reads.
-        let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
-            .await
-            .expect("create");
-        let card = upsert_card(
+        upsert_card(
             &pool,
             p.uuid,
             1,
             "front only",
             None,
+            BackSource::Image,
             None,
             "blobs/1.png",
             "image/png",
@@ -1029,8 +1342,34 @@ mod tests {
         )
         .await
         .expect("upsert");
-        assert!(card.back_image_content_type.is_none());
-        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 1);
+
+        let c = get_card(&pool, p.uuid, 1).await.expect("card");
+        assert_eq!(c.back, BackSource::Image);
+        assert!(c.display_back.is_none() && c.print_back.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_image_card_is_completed_by_its_back_upload() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "front only",
+            None,
+            BackSource::Image,
+            None,
+            "blobs/1.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 1);
 
         let completed = set_card_back_image(&pool, p.uuid, 1, "blobs/1-back.png", "image/png")
             .await
@@ -1042,53 +1381,143 @@ mod tests {
         // The front and the metadata are untouched by the back write.
         assert_eq!(completed.image_content_type, "image/png");
         assert_eq!(completed.name, "front only");
-        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 0);
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn missing_back_images_are_counted_per_card_and_only_when_absent() {
+    async fn attaching_a_back_image_makes_the_card_an_image_back() {
+        // Attaching an image *is* saying the back is that image, so the source
+        // follows it rather than leaving a stored blob nothing renders.
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::Markdown).await;
+
+        let updated = set_card_back_image(&pool, p.uuid, 1, "blobs/1-back.png", "image/png")
+            .await
+            .expect("attach");
+        assert_eq!(updated.back, BackSource::Image);
+        // The markdown is kept: switching back and forth must not lose work.
+        assert!(updated.back_text.is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_back_counts_only_unsupplied_material() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .expect("create");
         // An empty prefix is not "incomplete" — there is nothing to print.
-        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 0);
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 0);
 
-        for id in 1..=3 {
-            let back = if id == 2 {
-                Some("blobs/2-back.png")
-            } else {
-                None
-            };
-            upsert_card(
-                &pool,
-                p.uuid,
-                id,
-                "c",
-                None,
-                None,
-                "blobs/f.png",
-                "image/png",
-                back,
-                back.map(|_| "image/png"),
-            )
-            .await
-            .expect("upsert");
-        }
-        // Two of the three are still missing their back; the count is per card.
-        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 2);
+        // A single-sided card, and a `front` back, need nothing extra.
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        card(&pool, p.uuid, 2, BackSource::Front).await;
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 0);
 
-        // Replacing an existing back with another keeps the card complete.
-        set_card_back_image(&pool, p.uuid, 2, "blobs/2-back.jpg", "image/jpeg")
+        // An image back and a markdown back with their material are complete...
+        card(&pool, p.uuid, 3, BackSource::Image).await;
+        card(&pool, p.uuid, 4, BackSource::Markdown).await;
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 0);
+
+        // ...and without it are not. Whitespace-only text is not text.
+        upsert_card(
+            &pool,
+            p.uuid,
+            5,
+            "no image",
+            None,
+            BackSource::Image,
+            None,
+            "blobs/5.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        upsert_card(
+            &pool,
+            p.uuid,
+            6,
+            "blank text",
+            None,
+            BackSource::Markdown,
+            Some("  \n "),
+            "blobs/6.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+        assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn incompatibility_is_counted_from_the_ribbons_own_rule() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
-            .expect("replace");
-        assert_eq!(cards_missing_back_image(&pool, p.uuid).await.unwrap(), 2);
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        card(&pool, p.uuid, 2, BackSource::Front).await;
+        card(&pool, p.uuid, 3, BackSource::Image).await;
+        card(&pool, p.uuid, 4, BackSource::Markdown).await;
+
+        // YMCKO prints any of them, so nothing blocks a change to it.
+        assert_eq!(
+            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymcko)
+                .await
+                .unwrap(),
+            0
+        );
+        // YMCKOKO cannot print the colour-backed pair.
+        assert_eq!(
+            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
+                .await
+                .unwrap(),
+            2
+        );
+        // Switching is then legal only after they are single-sided again.
+        set_card_back_image(&pool, p.uuid, 3, "blobs/3-back.png", "image/png")
+            .await
+            .expect("re-attach");
+        update_card_meta(
+            &pool,
+            p.uuid,
+            3,
+            &CardPatch {
+                back: Some(BackSource::None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("single-sided again");
+        update_card_meta(
+            &pool,
+            p.uuid,
+            2,
+            &CardPatch {
+                back: Some(BackSource::None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("single-sided again");
+        assert_eq!(
+            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn back_image_for_an_unknown_card_is_a_404() {
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .expect("create");
         let err = set_card_back_image(&pool, p.uuid, 7, "blobs/7-back.png", "image/png")
@@ -1096,6 +1525,389 @@ mod tests {
             .expect_err("no such card");
         assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
     }
+
+    // -----------------------------------------------------------------------
+    // Card patches: the back is one choice, validated as one
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn back_text_is_refused_unless_the_back_is_markdown() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+
+        let err = update_card_meta(
+            &pool,
+            p.uuid,
+            1,
+            &CardPatch {
+                back_text: Some("# Songs".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("back_text on a single-sided card");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+
+        // Setting the source and the text together is one accepted patch.
+        let updated = update_card_meta(
+            &pool,
+            p.uuid,
+            1,
+            &CardPatch {
+                back: Some(BackSource::Markdown),
+                back_text: Some("# Songs".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source and text together");
+        assert_eq!(updated.back, BackSource::Markdown);
+        assert_eq!(updated.back_text.as_deref(), Some("# Songs"));
+    }
+
+    #[tokio::test]
+    async fn a_markdown_back_is_refused_on_an_ineligible_ribbon() {
+        // Markdown is fine on YMCKOKO; a colour back is not.
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+
+        let err = update_card_meta(
+            &pool,
+            p.uuid,
+            1,
+            &CardPatch {
+                back: Some(BackSource::Image),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("an image back cannot be printed on YMCKOKO");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+
+        let ok = update_card_meta(
+            &pool,
+            p.uuid,
+            1,
+            &CardPatch {
+                back: Some(BackSource::Markdown),
+                back_text: Some("- one".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("markdown is printable on YMCKOKO");
+        assert_eq!(ok.back, BackSource::Markdown);
+    }
+
+    #[tokio::test]
+    async fn a_refused_patch_writes_nothing() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+
+        // The name is valid, the back is not. Neither may land.
+        let err = update_card_meta(
+            &pool,
+            p.uuid,
+            1,
+            &CardPatch {
+                name: Some("Renamed".into()),
+                back: Some(BackSource::Image),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("image back on YMCKOKO");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+
+        let c = get_card(&pool, p.uuid, 1).await.expect("card");
+        assert_eq!(c.name, "c", "the valid half of a refused patch must not land");
+        assert_eq!(c.back, BackSource::None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pricing and stock
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ribbon_prices_are_seeded_per_ribbon() {
+        let pool = test_pool().await;
+        let prices = list_ribbon_prices(&pool).await.expect("list");
+        // The migration collapses the three mode prices onto the two ribbons,
+        // at the historical per-side default of 500.
+        assert_eq!(prices.len(), 2);
+        for p in &prices {
+            assert_eq!(p.price_cents, 500, "ribbon {} should default to 500", p.ribbon);
+        }
+        let ribbons: Vec<_> = prices.iter().map(|p| p.ribbon).collect();
+        assert!(ribbons.contains(&Ribbon::Ymcko));
+        assert!(ribbons.contains(&Ribbon::Ymckoko));
+    }
+
+    #[tokio::test]
+    async fn ribbon_stock_flags_are_seeded_in_stock() {
+        let pool = test_pool().await;
+        let stock = list_ribbon_stock(&pool).await.expect("stock");
+        assert_eq!(stock.len(), 2);
+        assert!(stock.iter().all(|s| s.in_stock));
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_ribbon_flag_makes_its_price_unavailable() {
+        let pool = test_pool().await;
+        set_ribbon_stock(&pool, Ribbon::Ymcko, false)
+            .await
+            .expect("clear ymcko");
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
+
+        let prices = list_ribbon_prices(&pool).await.expect("list");
+        let available = |ribbon: Ribbon| {
+            prices
+                .iter()
+                .find(|p| p.ribbon == ribbon)
+                .expect("ribbon in the list")
+                .available
+        };
+        assert!(!available(Ribbon::Ymcko));
+        // The other ribbon is independent.
+        assert!(available(Ribbon::Ymckoko));
+
+        // Setting it back restores it.
+        set_ribbon_stock(&pool, Ribbon::Ymcko, true)
+            .await
+            .expect("restock");
+        let prices = list_ribbon_prices(&pool).await.expect("list");
+        assert!(prices.iter().all(|p| p.available));
+    }
+
+    #[tokio::test]
+    async fn a_ribbon_with_no_flag_counts_as_out_of_stock() {
+        let pool = test_pool().await;
+        sqlx::query("DELETE FROM ribbon_stock WHERE ribbon = 'ymckoko'")
+            .execute(&pool)
+            .await
+            .expect("delete flag");
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+        // ...and the ribbon is not offered, rather than silently so.
+        let prices = list_ribbon_prices(&pool).await.expect("list");
+        assert!(
+            !prices
+                .iter()
+                .find(|p| p.ribbon == Ribbon::Ymckoko)
+                .expect("ribbon")
+                .available
+        );
+    }
+
+    #[tokio::test]
+    async fn ribbon_price_lookup_returns_the_configured_price() {
+        let pool = test_pool().await;
+        assert_eq!(
+            ribbon_price(&pool, Ribbon::Ymckoko).await.expect("price"),
+            500
+        );
+        assert_eq!(
+            ribbon_price(&pool, Ribbon::Ymcko).await.expect("price"),
+            500
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Print queue
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn print_queue_reports_the_back_the_ribbon_prints() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::Markdown).await;
+        card(&pool, p.uuid, 2, BackSource::None).await;
+
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.ribbon, Ribbon::Ymckoko);
+        // YMCKOKO's back is the black panel, so a markdown back is a 1-bit one.
+        assert_eq!(q.cards[0].back, BackAvailability::Black);
+        // A single-sided card has nothing to print on the back.
+        assert_eq!(q.cards[1].back, BackAvailability::None);
+        // YMCKOKO bills two panels for every card, single-sided or not.
+        assert_eq!(q.billed_sides, 4);
+        assert_eq!(q.cards[0].billed_sides, 2);
+        assert_eq!(q.cards[1].billed_sides, 2);
+    }
+
+    #[tokio::test]
+    async fn print_queue_colours_the_same_back_differently_on_ymcko() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::Markdown).await;
+        card(&pool, p.uuid, 2, BackSource::Image).await;
+        card(&pool, p.uuid, 3, BackSource::Front).await;
+        card(&pool, p.uuid, 4, BackSource::None).await;
+
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.ribbon, Ribbon::Ymcko);
+        // The same markdown back that is black on YMCKOKO is colour here: the
+        // colour depth is the ribbon's, not the source's.
+        assert_eq!(q.cards[0].back, BackAvailability::Color);
+        assert_eq!(q.cards[1].back, BackAvailability::Color);
+        assert_eq!(q.cards[2].back, BackAvailability::Color);
+        assert_eq!(q.cards[3].back, BackAvailability::None);
+        // YMCKO bills per printed side.
+        assert_eq!(q.billed_sides, 2 + 2 + 2 + 1);
+    }
+
+    #[tokio::test]
+    async fn a_double_sided_card_missing_its_material_is_not_printable() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            "no image yet",
+            None,
+            BackSource::Image,
+            None,
+            "blobs/1.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        // No back material and no back to fetch — and the card must not be
+        // printed, rather than silently coming out single-sided.
+        assert_eq!(q.cards[0].back, BackAvailability::None);
+        assert!(!q.cards[0].printable);
+    }
+
+    #[tokio::test]
+    async fn print_queue_marks_a_card_printable_only_when_its_rasters_are_ready() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::Image).await;
+
+        // No render has run yet, so the rasters are still pending: the card is
+        // not printable — never silently printed from the original.
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.cards[0].back, BackAvailability::Color);
+        assert!(!q.cards[0].printable);
+
+        // The front alone is not enough: this card prints both sides.
+        sqlx::query("UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
+            .bind(p.uuid.to_string())
+            .execute(&pool)
+            .await
+            .expect("mark front ready");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert!(!q.cards[0].printable);
+
+        // With both rasters ready, the same card is printable.
+        sqlx::query("UPDATE cards SET back_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
+            .bind(p.uuid.to_string())
+            .execute(&pool)
+            .await
+            .expect("mark back ready");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert!(q.cards[0].printable);
+    }
+
+    #[tokio::test]
+    async fn a_single_sided_card_needs_only_its_front_raster() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+
+        sqlx::query("UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
+            .bind(p.uuid.to_string())
+            .execute(&pool)
+            .await
+            .expect("mark front ready");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.cards[0].back, BackAvailability::None);
+        assert!(q.cards[0].printable);
+    }
+
+    #[tokio::test]
+    async fn paid_ribbon_is_snapshotted_and_used_by_the_print_queue() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+            .await
+            .expect("create");
+        // A prefix never priced through checkout has no paid ribbon; the queue
+        // falls back to the current one.
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.ribbon, Ribbon::Ymckoko);
+
+        // Freeze the ribbon as if a checkout had priced it.
+        set_paid_ribbon(&pool, p.uuid, Ribbon::Ymcko)
+            .await
+            .expect("freeze");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.ribbon, Ribbon::Ymcko);
+
+        // Even if the operator later changes the prefix's ribbon, the queue
+        // still reports the paid-for one.
+        set_prefix_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
+            .await
+            .expect("operator changes ribbon");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.ribbon, Ribbon::Ymcko);
+    }
+
+    #[tokio::test]
+    async fn only_unprinted_cards_make_a_printing_prefix_a_resume() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        card(&pool, p.uuid, 2, BackSource::None).await;
+        set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("pending");
+        set_status(&pool, p.uuid, PrefixStatus::Paid, Some("cs_1"), false)
+            .await
+            .expect("paid");
+        set_status(&pool, p.uuid, PrefixStatus::Queued, None, false)
+            .await
+            .expect("queued");
+        set_status(&pool, p.uuid, PrefixStatus::Printing, None, false)
+            .await
+            .expect("printing");
+
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.unprinted_count, 2);
+        assert!(q.resume);
+
+        mark_card_printed(&pool, p.uuid, 1).await.expect("mark 1");
+        mark_card_printed(&pool, p.uuid, 2).await.expect("mark 2");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.unprinted_count, 0);
+        assert!(!q.resume, "nothing left to print, so nothing to resume");
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment anomalies and email claims
+    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn abandoned_payment_pending_flags_only_stale_prefixes() {
@@ -1181,147 +1993,6 @@ mod tests {
         assert_eq!(rows[0].amount_cents, Some(1750));
         assert_eq!(rows[0].currency.as_deref(), Some("eur"));
     }
-
-    #[tokio::test]
-    async fn mode_prices_are_seeded_for_every_mode() {
-        let pool = test_pool().await;
-        let prices = list_mode_prices(&pool).await.expect("list");
-        // The migration seeds every mode at the historical default of 500.
-        assert_eq!(prices.len(), 3);
-        for p in &prices {
-            assert_eq!(
-                p.price_cents, 500,
-                "mode {:?} should default to 500",
-                p.print_mode
-            );
-        }
-        let modes: Vec<_> = prices.iter().map(|p| p.print_mode).collect();
-        assert!(modes.contains(&PrintMode::SingleSided));
-        assert!(modes.contains(&PrintMode::DoubleSidedColor));
-        assert!(modes.contains(&PrintMode::ColorFrontBlackBack));
-    }
-
-    #[test]
-    fn print_mode_maps_onto_a_ribbon() {
-        // Single-sided and double-sided colour share YMCKO, which is the whole
-        // reason availability is a ribbon flag and not a mode flag.
-        assert_eq!(PrintMode::SingleSided.ribbon(), Ribbon::Ymcko);
-        assert_eq!(PrintMode::DoubleSidedColor.ribbon(), Ribbon::Ymcko);
-        assert_eq!(PrintMode::ColorFrontBlackBack.ribbon(), Ribbon::Ymckoko);
-    }
-
-    #[test]
-    fn ribbon_parse_round_trips_both_ribbons() {
-        for (text, ribbon) in [("ymcko", Ribbon::Ymcko), ("ymckoko", Ribbon::Ymckoko)] {
-            assert_eq!(Ribbon::parse(text), Some(ribbon));
-            assert_eq!(ribbon.as_str(), text);
-        }
-        assert_eq!(Ribbon::parse("ymckokok"), None);
-    }
-
-    #[tokio::test]
-    async fn ribbon_stock_flags_are_seeded_in_stock() {
-        let pool = test_pool().await;
-        let stock = list_ribbon_stock(&pool).await.expect("stock");
-        assert_eq!(stock.len(), 2);
-        assert!(stock.iter().all(|s| s.in_stock));
-        assert!(ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
-        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
-    }
-
-    #[tokio::test]
-    async fn clearing_a_ribbon_flag_takes_its_modes_out_together() {
-        let pool = test_pool().await;
-        set_ribbon_stock(&pool, Ribbon::Ymcko, false)
-            .await
-            .expect("clear ymcko");
-        assert!(!ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
-
-        let prices = list_mode_prices(&pool).await.expect("list");
-        let available = |mode: PrintMode| {
-            prices
-                .iter()
-                .find(|p| p.print_mode == mode)
-                .expect("mode in the list")
-                .available
-        };
-        // One flag, two modes: this is the pair that goes out together.
-        assert!(!available(PrintMode::SingleSided));
-        assert!(!available(PrintMode::DoubleSidedColor));
-        // The black-back mode runs on the other ribbon and is untouched.
-        assert!(available(PrintMode::ColorFrontBlackBack));
-
-        // Setting it back restores both.
-        set_ribbon_stock(&pool, Ribbon::Ymcko, true)
-            .await
-            .expect("restock");
-        let prices = list_mode_prices(&pool).await.expect("list");
-        assert!(prices.iter().all(|p| p.available));
-    }
-
-    #[tokio::test]
-    async fn a_ribbon_with_no_flag_counts_as_out_of_stock() {
-        let pool = test_pool().await;
-        sqlx::query("DELETE FROM ribbon_stock WHERE ribbon = 'ymckoko'")
-            .execute(&pool)
-            .await
-            .expect("delete flag");
-        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
-        // ...and the mode it gates is not offered, rather than silently so.
-        let prices = list_mode_prices(&pool).await.expect("list");
-        assert!(
-            !prices
-                .iter()
-                .find(|p| p.print_mode == PrintMode::ColorFrontBlackBack)
-                .expect("mode")
-                .available
-        );
-    }
-
-    #[tokio::test]
-    async fn mode_price_lookup_returns_the_configured_price() {
-        let pool = test_pool().await;
-        assert_eq!(
-            mode_price(&pool, PrintMode::ColorFrontBlackBack)
-                .await
-                .expect("price"),
-            500
-        );
-        assert_eq!(
-            mode_price(&pool, PrintMode::SingleSided)
-                .await
-                .expect("price"),
-            500
-        );
-    }
-
-    #[tokio::test]
-    async fn paid_print_mode_is_snapshotted_and_used_by_the_print_queue() {
-        let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::ColorFrontBlackBack))
-            .await
-            .expect("create");
-        // A prefix never priced through checkout has no paid mode; the queue
-        // falls back to the current mode.
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.print_mode, PrintMode::ColorFrontBlackBack);
-
-        // Freeze the mode as if a checkout had priced it.
-        set_paid_print_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
-            .await
-            .expect("freeze");
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
-
-        // Even if the operator later changes the prefix's current mode, the
-        // queue still reports the paid-for one.
-        set_prefix_mode(&pool, p.uuid, PrintMode::SingleSided)
-            .await
-            .expect("operator changes mode");
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
-    }
-
 
     #[tokio::test]
     async fn a_notification_claim_is_won_once() {
@@ -1413,60 +2084,4 @@ mod tests {
         .await
         .expect("reclaim"));
     }
-
-    #[tokio::test]
-    async fn print_queue_renders_the_black_back_per_mode() {
-        let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(PrintMode::ColorFrontBlackBack))
-            .await
-            .expect("create");
-        upsert_card(
-            &pool,
-            p.uuid,
-            1,
-            "card",
-            None,
-            Some("# Title\n\n**bold**\n"),
-            "blobs/1.png",
-            "image/png",
-            None,
-            None,
-        )
-        .await
-        .expect("upsert");
-        upsert_card(
-            &pool,
-            p.uuid,
-            2,
-            "no back",
-            None,
-            None,
-            "blobs/2.png",
-            "image/png",
-            None,
-            None,
-        )
-        .await
-        .expect("upsert");
-
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.print_mode, PrintMode::ColorFrontBlackBack);
-        // The queue hands the spooler the *rendered* back, not the markdown.
-        assert_eq!(
-            q.cards[0].back_html.as_deref(),
-            Some("<h1>Title</h1>\n<p><strong>bold</strong></p>\n")
-        );
-        // A card with no back text has nothing to print on the back.
-        assert!(q.cards[1].back_html.is_none());
-
-        // Priced — and therefore printed — as a mode with no black back: the
-        // render is dropped even though the stored back_text is still there.
-        set_paid_print_mode(&pool, p.uuid, PrintMode::DoubleSidedColor)
-            .await
-            .expect("freeze");
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.print_mode, PrintMode::DoubleSidedColor);
-        assert!(q.cards[0].back_html.is_none());
-    }
-
 }

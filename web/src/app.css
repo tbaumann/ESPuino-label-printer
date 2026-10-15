@@ -721,3 +721,140 @@ select:focus {
   max-height: 140px;
   overflow: auto;
 }
+
+/* ---------- the per-card back ---------- */
+
+/* Which back the card has: chosen in the editor, one row per source the ribbon
+   can print, with what that source needs below it. A vertical list, not tiles:
+   the summaries are sentences, and `label`'s caption styling has to be undone
+   for them to read. */
+.back-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.back-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  /* `label` styles these as field captions by default. */
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 0;
+}
+
+.back-choice.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+}
+
+.back-choice input[type='radio'] {
+  margin: 3px 0 0;
+  flex: none;
+}
+
+.back-choice .hint {
+  display: block;
+  font-weight: 400;
+  margin-top: 1px;
+}
+
+/* The back pane carries the picture an `image` back needs: the file chooser sits
+   *in* the pane, and the whole pane is a drop area for one. */
+.preview.back {
+  position: relative;
+  overflow: hidden;
+}
+
+/* What the back is made of, or the prompt to supply the picture it needs. */
+.preview.back .back-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.preview.back .back-body > * {
+  min-height: 0;
+}
+
+.preview.back .back-body img {
+  flex: 1 1 auto;
+}
+
+.preview.back .back-body .panel {
+  overflow: auto;
+}
+
+.preview.back .no-back-image {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.preview.back .no-back-image .hint {
+  margin-top: 0;
+}
+
+/* The file chooser, inside the pane and above the drop target, centred across
+   the pane so it reads as part of the picture's own frame. */
+.preview.back .back-choose {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.preview.back .back-choose input[type='file'] {
+  font-size: 11px;
+}
+
+.preview.back .back-choose label {
+  margin-bottom: 2px;
+}
+
+/* A real button laid over the whole pane: focusable, answers Enter/Space,
+   transparent, and *under* the chooser so the file input stays clickable. */
+.preview.back .back-drop {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.preview.back.droppable {
+  border-style: dashed;
+}
+
+.preview.back.droppable:hover .back-drop:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+.preview.back.over {
+  border-style: solid;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* A markdown back on a colour ribbon: the same text, but the medium is not
+   1 bit, so the pane must not pretend to be the black panel. */
+.preview.back.black-only.color-ink {
+  font-family: var(--sans);
+  font-size: 11px;
+}

@@ -13,11 +13,12 @@ use crate::auth;
 use crate::db;
 use crate::error::ApiError;
 use crate::models::{
-    AdminLogin, AdminSession, Card, CardIndex, CardPatch, NeedsAttentionItem, NeedsAttentionKind,
-    Prefix, PrefixInput, PrefixModePatch, PrefixStatus, PrintMode, PrintQueue, Ribbon, RibbonStock,
-    RibbonStockPatch, ShopConfig, StatusInput,
+    AdminLogin, AdminSession, BackSource, Card, CardIndex, CardPatch, NeedsAttentionItem,
+    NeedsAttentionKind, Prefix, PrefixInput, PrefixRibbonPatch, PrefixStatus, PrintQueue, Ribbon,
+    RibbonStock, RibbonStockPatch, ShopConfig, StatusInput,
 };
 use crate::notify;
+use crate::render;
 use crate::stripe;
 use crate::AppState;
 
@@ -49,6 +50,7 @@ fn content_type_for(ext: &str) -> &'static str {
         "jpg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
+        "bmp" => "image/bmp",
         _ => "application/octet-stream",
     }
 }
@@ -89,38 +91,43 @@ fn write_blob(
     Ok(rel)
 }
 
-/// Pull `name`, `serial_number`, `back_text`, an `image` file and an optional
-/// `back_image` file out of a multipart form, validating the back fields
-/// against the prefix's `print_mode` *before* writing anything to disk.
+/// A card write, as the multipart form described it.
+struct StoredCard {
+    name: String,
+    serial_number: Option<String>,
+    /// The card's back side, already validated against the prefix's ribbon.
+    back: BackSource,
+    /// Markdown for a `markdown` back; `None` otherwise.
+    back_text: Option<String>,
+    image_rel: String,
+    image_content_type: String,
+    /// The stored back image, when the form carried one.
+    back_image_rel: Option<String>,
+    back_image_content_type: Option<String>,
+}
+
+/// Pull `name`, `serial_number`, `back`, `back_text`, an `image` file and an
+/// optional `back_image` file out of a multipart form, validating the back
+/// fields against the prefix's ribbon *before* writing anything to disk.
 ///
-/// The `back_image` is **optional even in `double_sided_color`**: a card exists
-/// from its front image, and the colour back is added per card afterwards
+/// The `back_image` is **optional even for an `image` back**: a card exists
+/// from its front image, and the back image is added per card afterwards
 /// (`put_card_back_image`, or this same form). Requiring it here would mean the
 /// front-image upload — a bulk, folder-at-a-time flow — could create nothing at
-/// all in that mode. What has to hold is that no *order* is sold with a back
-/// missing, and that is checked where the money is (`ensure_order_printable`),
-/// not here.
+/// all for a double-sided card. What has to hold is that no *order* is sold with
+/// a back missing, and that is checked where the money is
+/// (`ensure_order_printable`), not here.
 async fn store_card_form(
     mut mp: Multipart,
     data_dir: &PathBuf,
     prefix: Uuid,
     id: i64,
-    mode: PrintMode,
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    ),
-    ApiError,
-> {
+    ribbon: Ribbon,
+) -> Result<StoredCard, ApiError> {
     let mut name: Option<String> = None;
     let mut serial: Option<String> = None;
-    let mut back: Option<String> = None;
+    let mut back_field: Option<BackSource> = None;
+    let mut back_text: Option<String> = None;
     let mut image: Option<(Vec<u8>, String)> = None;
     let mut back_image: Option<(Vec<u8>, String)> = None;
 
@@ -147,13 +154,24 @@ async fn store_card_form(
                     serial = Some(v);
                 }
             }
+            Some("back") => {
+                let v = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                back_field = Some(BackSource::parse(v.trim()).ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "unknown back '{v}': expected one of none, front, image, markdown"
+                    ))
+                })?);
+            }
             Some("back_text") => {
                 let v = field
                     .text()
                     .await
                     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 if !v.is_empty() {
-                    back = Some(v);
+                    back_text = Some(v);
                 }
             }
             Some("image") => {
@@ -188,23 +206,39 @@ async fn store_card_form(
     if bytes.is_empty() {
         return Err(ApiError::BadRequest("image is empty".into()));
     }
-
-    // Back side validity is fixed by the prefix's print mode. Reject rather
-    // than silently store a field the mode will never render.
-    if back.is_some() && !mode.allows_back_text() {
-        return Err(ApiError::BadRequest(format!(
-            "back_text is only valid in a colour_front_black_back prefix, not {mode}"
-        )));
-    }
-    if back_image.is_some() && !mode.allows_back_image() {
-        return Err(ApiError::BadRequest(format!(
-            "a back_image is only valid in a double_sided_color prefix, not {mode}"
-        )));
-    }
     if let Some((bbytes, _)) = &back_image {
         if bbytes.is_empty() {
             return Err(ApiError::BadRequest("back_image is empty".into()));
         }
+    }
+
+    // What the card's back is, from the two fields that can say it. A sent
+    // `back_image` implies an `image` back — that is the whole of what it means
+    // — but an explicit `back` that contradicts it is a form disagreeing with
+    // itself, so it is refused rather than quietly resolved one way.
+    let back = match (back_field, back_image.is_some()) {
+        (Some(b), true) if b != BackSource::Image => {
+            return Err(ApiError::BadRequest(format!(
+                "a back_image was sent with back = '{b}', which has no use for one"
+            )))
+        }
+        (Some(b), _) => b,
+        (None, true) => BackSource::Image,
+        (None, false) => BackSource::None,
+    };
+
+    // The back side is fixed by the ribbon, which is the one thing a batch
+    // cannot mix. Reject rather than silently store a field nothing will render.
+    if !ribbon.allows_back(back) {
+        return Err(ApiError::BadRequest(format!(
+            "a '{back}' back cannot be printed on a {ribbon} prefix: its back panel is black \
+             only, so use 'none' or 'markdown'"
+        )));
+    }
+    if back_text.is_some() && back != BackSource::Markdown {
+        return Err(ApiError::BadRequest(format!(
+            "back_text is only valid for a 'markdown' back, not '{back}'"
+        )));
     }
 
     let image_rel = write_blob(
@@ -213,7 +247,7 @@ async fn store_card_form(
         &format!("{id}.{}", extension_for(&ct)),
         &bytes,
     )?;
-    let (back_rel, back_ct) = match back_image {
+    let (back_image_rel, back_image_content_type) = match back_image {
         Some((bbytes, bct)) => {
             let rel = write_blob(
                 data_dir,
@@ -226,7 +260,189 @@ async fn store_card_form(
         None => (None, None),
     };
 
-    Ok((name, serial, back, image_rel, ct, back_rel, back_ct))
+    Ok(StoredCard {
+        name,
+        serial_number: serial,
+        back,
+        back_text,
+        image_rel,
+        image_content_type: ct,
+        back_image_rel,
+        back_image_content_type,
+    })
+}
+
+/// Re-render every derived artifact a card needs, synchronously, and record the
+/// availability statuses.
+///
+/// Called after any write that changes a card's front or back (upload, back
+/// image, back source, back_text). Rendering is synchronous: by the time the
+/// write response returns, the display images and rasters are `ready` — or
+/// `failed`, with the reason stored for the admin to inspect. Originals are
+/// never touched.
+///
+/// A side the card has nothing to render — a single-sided card, or a `image`/
+/// `markdown` back whose material has not arrived yet — leaves that side's
+/// statuses `pending`, which the model reads as non-existent rather than a real
+/// pending render. The UI then shows the card it has, and the print queue
+/// reports the card not-yet-printable rather than silently printing the
+/// original.
+///
+/// Raster blobs: `<id>-front-print.bmp` / `<id>-back-print.bmp`; display
+/// images: `<id>-front-display.png` / `<id>-back-display.png`, all under
+/// `blobs/<prefix>/`.
+async fn rerender_card(
+    st: &AppState,
+    prefix: Uuid,
+    id: i64,
+) -> Result<crate::models::Card, ApiError> {
+    use crate::models::RenderStatus;
+    use crate::render::{RenderResult, RasterSize};
+
+    let ribbon = db::get_prefix(&st.pool, prefix).await?.ribbon;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    let raster = RasterSize::from_env();
+
+    // Read a card's original blob (front or back image) from disk. A missing
+    // file is the one case where the whole render must not fail: it is how a
+    // back image *not yet uploaded* is represented.
+    let read_original = |rel: &str| std::fs::read(st.data_dir.join(rel)).ok();
+
+    // Front side (always present). Display + print raster.
+    let front_rel = format!(
+        "blobs/{prefix}/{id}.{}",
+        extension_for(&card.image_content_type)
+    );
+    let front_original = read_original(&front_rel);
+    let front_pair = match front_original.as_deref() {
+        Some(orig) => match render::render_front_display(orig) {
+            RenderResult::Ready(bytes) => {
+                write_blob(&st.data_dir, prefix, &format!("{id}-front-display.png"), &bytes)?;
+                (RenderStatus::Ready, None)
+            }
+            RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
+        },
+        None => (
+            RenderStatus::Failed,
+            Some("front image missing from disk".into()),
+        ),
+    };
+    let front_raster = match front_original.as_deref() {
+        Some(orig) => match render::render_front_raster(orig, &raster) {
+            RenderResult::Ready(bytes) => {
+                write_blob(&st.data_dir, prefix, &format!("{id}-front-print.bmp"), &bytes)?;
+                (RenderStatus::Ready, None)
+            }
+            RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
+        },
+        None => (
+            RenderStatus::Failed,
+            Some("front image missing from disk".into()),
+        ),
+    };
+
+    // The back's own uploaded image, when this card's back is an image. Named
+    // from the stored content type, so a re-upload in another format is found.
+    let back_original = card.back_image_content_type.as_deref().and_then(|ct| {
+        read_original(&format!("blobs/{prefix}/{id}-back.{}", extension_for(ct)))
+    });
+
+    // Back side, from the card's own choice. Where the back is an image, the
+    // *ribbon* decides the colour depth it is rendered in — and because only
+    // YMCKO may print an image back at all (see `Ribbon::allows_back`), that
+    // raster is always 24-bit colour here. A markdown back is the one source a
+    // black-panel ribbon can print too, so the depth is passed to its renderer.
+    let (back_display, back_raster) = match card.back {
+        // A single-sided card: no back side exists, so there is nothing to
+        // render and the statuses stay absent.
+        BackSource::None => (None, None),
+        // The front panel printed a second time, so its source is the front
+        // original and it needs no upload of its own.
+        BackSource::Front => match front_original.as_deref() {
+            Some(orig) => (
+                Some(color_display(st, prefix, id, orig)?),
+                Some(color_raster(st, prefix, id, orig, &raster)?),
+            ),
+            // The front failed to render above; nothing to derive a back from.
+            None => (None, None),
+        },
+        BackSource::Image => match back_original.as_deref() {
+            Some(orig) => (
+                Some(color_display(st, prefix, id, orig)?),
+                Some(color_raster(st, prefix, id, orig, &raster)?),
+            ),
+            // Not uploaded yet: the card is incomplete rather than having an
+            // empty back silently substituted.
+            None => (None, None),
+        },
+        BackSource::Markdown => match card.back_text.as_deref().filter(|t| !t.trim().is_empty()) {
+            // The markdown renderer is a stub until a real markdown→image
+            // backend lands; until then it always reports failed with the
+            // reason, so the card is visibly not printable rather than having a
+            // blank back silently substituted.
+            Some(text) => {
+                let res = render::render_back_markdown_stub(text, &raster, ribbon.back_depth());
+                let (status, err) = match res {
+                    RenderResult::Ready(_) => (RenderStatus::Ready, None),
+                    RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
+                };
+                (Some((status, err.clone())), Some((status, err)))
+            }
+            None => (None, None),
+        },
+    };
+
+    db::set_card_render_status(
+        &st.pool,
+        prefix,
+        id,
+        Some(front_pair),
+        Some(front_raster),
+        back_display,
+        back_raster,
+    )
+    .await
+}
+
+/// Render a colour back display image from `original`, write it and report.
+fn color_display(
+    st: &AppState,
+    prefix: Uuid,
+    id: i64,
+    original: &[u8],
+) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
+    use crate::models::RenderStatus;
+    use crate::render::RenderResult;
+    Ok(match render::render_back_display_color(original) {
+        RenderResult::Ready(bytes) => {
+            write_blob(&st.data_dir, prefix, &format!("{id}-back-display.png"), &bytes)?;
+            (RenderStatus::Ready, None)
+        }
+        RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
+    })
+}
+
+/// Render a 24-bit colour back print raster from `original`, write it and
+/// report. `size` is only the raster's dimensions — the colour depth is the
+/// ribbon's, and a black-panel back never reaches this at all (see
+/// [`crate::models::Ribbon::allows_back`]): its back is the markdown renderer's
+/// 1-bit output.
+fn color_raster(
+    st: &AppState,
+    prefix: Uuid,
+    id: i64,
+    original: &[u8],
+    size: &crate::render::RasterSize,
+) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
+    use crate::models::RenderStatus;
+    use crate::render::RenderResult;
+    Ok(match render::render_back_raster_color(original, size) {
+        RenderResult::Ready(bytes) => {
+            write_blob(&st.data_dir, prefix, &format!("{id}-back-print.bmp"), &bytes)?;
+            (RenderStatus::Ready, None)
+        }
+        RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
+    })
 }
 
 /// Create a prefix, optionally choosing its uuid.
@@ -239,7 +455,7 @@ pub async fn create_prefix(
     State(st): State<AppState>,
     Json(input): Json<PrefixInput>,
 ) -> Result<(StatusCode, Json<Prefix>), ApiError> {
-    let p = db::create_prefix(&st.pool, input.uuid, input.print_mode).await?;
+    let p = db::create_prefix(&st.pool, input.uuid, input.ribbon).await?;
     Ok((StatusCode::CREATED, Json(p)))
 }
 
@@ -343,25 +559,25 @@ pub async fn put_card(
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
-    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+    let ribbon = db::ensure_writable(&st.pool, prefix, caller.is_admin())
         .await?
-        .print_mode;
-    let (name, serial, back, rel, ct, back_rel, back_ct) =
-        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
-    let card = db::upsert_card(
+        .ribbon;
+    let c = store_card_form(mp, &st.data_dir, prefix, id, ribbon).await?;
+    db::upsert_card(
         &st.pool,
         prefix,
         id,
-        &name,
-        serial.as_deref(),
-        back.as_deref(),
-        &rel,
-        &ct,
-        back_rel.as_deref(),
-        back_ct.as_deref(),
+        &c.name,
+        c.serial_number.as_deref(),
+        c.back,
+        c.back_text.as_deref(),
+        &c.image_rel,
+        &c.image_content_type,
+        c.back_image_rel.as_deref(),
+        c.back_image_content_type.as_deref(),
     )
     .await?;
-    Ok(Json(card))
+    Ok(Json(rerender_card(&st, prefix, id).await?))
 }
 
 /// Create a card with a server-assigned id (POST semantics).
@@ -379,26 +595,26 @@ pub async fn post_card(
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
-    let mode = db::ensure_writable(&st.pool, prefix, caller.is_admin())
+    let ribbon = db::ensure_writable(&st.pool, prefix, caller.is_admin())
         .await?
-        .print_mode;
+        .ribbon;
     let id = db::next_card_id(&st.pool, prefix).await?;
-    let (name, serial, back, rel, ct, back_rel, back_ct) =
-        store_card_form(mp, &st.data_dir, prefix, id, mode).await?;
-    let card = db::upsert_card(
+    let c = store_card_form(mp, &st.data_dir, prefix, id, ribbon).await?;
+    db::upsert_card(
         &st.pool,
         prefix,
         id,
-        &name,
-        serial.as_deref(),
-        back.as_deref(),
-        &rel,
-        &ct,
-        back_rel.as_deref(),
-        back_ct.as_deref(),
+        &c.name,
+        c.serial_number.as_deref(),
+        c.back,
+        c.back_text.as_deref(),
+        &c.image_rel,
+        &c.image_content_type,
+        c.back_image_rel.as_deref(),
+        c.back_image_content_type.as_deref(),
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(card)))
+    Ok((StatusCode::CREATED, Json(rerender_card(&st, prefix, id).await?)))
 }
 
 /// Fetch one card's metadata.
@@ -466,6 +682,138 @@ pub async fn get_card_back_image(
         .into_response())
 }
 
+/// Serve a derived artifact (display image or print raster) with the status
+/// semantics the handoff specifies: `404` when the side does not exist for this
+/// card, `423` when it is still pending, `500` when the render failed, and
+/// `200 image/<type>` when ready.
+///
+/// `status` is the card's render status for this artifact; `rel` is the blob
+/// path (only read when `ready`).
+fn serve_artifact(
+    st: &AppState,
+    status: Option<crate::models::RenderStatus>,
+    rel: &str,
+    content_type: &'static str,
+) -> Result<Response, ApiError> {
+    use crate::models::RenderStatus;
+    match status {
+        // The side does not exist for this card (no back in this mode, or a
+        // colour card with no back image yet).
+        None => Err(ApiError::NotFound(format!("no such side for this card"))),
+        Some(RenderStatus::Pending) => Err(ApiError::Locked(
+            "the artifact is still being rendered; retry shortly".into(),
+        )),
+        Some(RenderStatus::Failed) => Err(ApiError::Internal(
+            "the artifact failed to render; see the card's render status for the reason".into(),
+        )),
+        Some(RenderStatus::Ready) => {
+            let bytes = std::fs::read(st.data_dir.join(rel))
+                .map_err(|_| ApiError::NotFound(format!("artifact {rel} missing from disk")))?;
+            Ok((
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Fetch a card's front display image (the normalized PNG the frontend shows).
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display-image", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses(
+        (status = 200, description = "display image bytes", content_type = "image/png"),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
+        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+    ))]
+pub async fn get_card_display_image(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    serve_artifact(
+        &st,
+        Some(card.display_front),
+        &format!("blobs/{prefix}/{id}-front-display.png"),
+        "image/png",
+    )
+}
+
+/// Fetch a card's back display image (colour back, or the rendered black back).
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display-back", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses(
+        (status = 200, description = "back display image bytes", content_type = "image/png"),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
+        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+    ))]
+pub async fn get_card_display_back(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    serve_artifact(
+        &st,
+        card.display_back,
+        &format!("blobs/{prefix}/{id}-back-display.png"),
+        "image/png",
+    )
+}
+
+/// Fetch a card's front print raster (24-bit BMP at the printer DPI). The print
+/// preview and the spooler both read these exact bytes.
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/print-raster", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses(
+        (status = 200, description = "print raster bytes", content_type = "image/bmp"),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
+        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+    ))]
+pub async fn get_card_print_raster(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    serve_artifact(
+        &st,
+        Some(card.print_front),
+        &format!("blobs/{prefix}/{id}-front-print.bmp"),
+        "image/bmp",
+    )
+}
+
+/// Fetch a card's back print raster (24-bit colour or 1-bit black BMP).
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/print-raster/back", tag = "cards",
+    params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+    responses(
+        (status = 200, description = "back print raster bytes", content_type = "image/bmp"),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
+        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+    ))]
+pub async fn get_card_print_raster_back(
+    State(st): State<AppState>,
+    Path((prefix, id)): Path<(String, i64)>,
+) -> Result<Response, ApiError> {
+    let prefix = parse_uuid(&prefix)?;
+    let card = db::get_card(&st.pool, prefix, id).await?;
+    serve_artifact(
+        &st,
+        card.print_back,
+        &format!("blobs/{prefix}/{id}-back-print.bmp"),
+        "image/bmp",
+    )
+}
+
 /// Pull a single named file part out of a multipart body.
 ///
 /// Used by the back-image upload, which takes exactly one file and no text
@@ -497,34 +845,37 @@ async fn read_file_part(mut mp: Multipart, part: &str) -> Result<(Vec<u8>, Strin
     Ok((bytes, ct))
 }
 
-/// Reject a colour back-image write that this prefix or card cannot take.
+/// Reject a back-image write that this prefix or card cannot take.
 ///
 /// Split out from the handler so the two refusals that are not multipart
-/// plumbing — the mode has no colour back at all, and the card does not exist —
-/// are testable without building a multipart body.
+/// plumbing — the ribbon cannot print a colour back at all, and the card does
+/// not exist — are testable without building a multipart body.
 async fn ensure_back_image_writable(
     pool: &SqlitePool,
     prefix: Uuid,
     id: i64,
     admin: bool,
 ) -> Result<(), ApiError> {
-    let mode = db::ensure_writable(pool, prefix, admin).await?.print_mode;
-    if !mode.allows_back_image() {
+    let ribbon = db::ensure_writable(pool, prefix, admin).await?.ribbon;
+    if !ribbon.allows_back(BackSource::Image) {
         return Err(ApiError::BadRequest(format!(
-            "a back_image is only valid in a double_sided_color prefix, not {mode}"
+            "an uploaded back image is a colour back, which the {ribbon} ribbon cannot print; \
+             use a 'markdown' back or a single-sided card instead"
         )));
     }
     db::get_card(pool, prefix, id).await?; // 404 for an unknown card
     Ok(())
 }
 
-/// Upload or replace one card's colour back image, leaving the front alone.
+/// Upload or replace one card's back image, leaving the front alone.
 ///
-/// This is what a `double_sided_color` card's back side is set through: cards
+/// This is how a card's back side is set when it is an uploaded picture: cards
 /// are created from their front image (the dropzone uploads a folder at a
-/// time), and the back is then added per card. Only that mode has a back image
-/// at all, so the other two refuse the upload rather than storing a blob
-/// nothing will ever print.
+/// time), and the back is then added per card. Attaching the image also makes
+/// the card's `back` [`BackSource::Image`] — see `db::set_card_back_image`.
+///
+/// Only a ribbon that can print a colour back accepts this, so a YMCKOKO prefix
+/// refuses the upload rather than storing a blob nothing will ever print.
 ///
 /// Re-uploading replaces the stored blob, whatever format the old one was in —
 /// `write_blob` cleans the earlier file up, so there are no orphans.
@@ -554,32 +905,49 @@ pub async fn put_card_back_image(
         &format!("{id}-back.{}", extension_for(&ct)),
         &bytes,
     )?;
-    Ok(Json(
-        db::set_card_back_image(&st.pool, prefix, id, &rel, &ct).await?,
-    ))
+    db::set_card_back_image(&st.pool, prefix, id, &rel, &ct).await?;
+    Ok(Json(rerender_card(&st, prefix, id).await?))
 }
 
-/// Change a prefix's print mode while it is still writable.
+/// Change a prefix's ribbon while it is still writable.
+///
+/// Refused if the change would strand a card: a YMCKOKO prefix cannot print a
+/// colour back, so a prefix holding one has to have those cards made
+/// single-sided (or markdown-backed) first. Without this the change would
+/// succeed and produce an order the spooler could not print, which nobody would
+/// notice until printing.
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    request_body = PrefixModePatch,
+    request_body = PrefixRibbonPatch,
     responses(
         (status = 200, body = Prefix),
         (status = 400, body = crate::error::ErrorBody),
         (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+        (status = 409, description = "prefix is frozen, or a card's back side cannot be printed on the new ribbon", body = crate::error::ErrorBody)
     ))]
-pub async fn patch_prefix_mode(
+pub async fn patch_prefix_ribbon(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(prefix): Path<String>,
-    Json(input): Json<PrefixModePatch>,
+    Json(input): Json<PrefixRibbonPatch>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    let current = db::get_prefix(&st.pool, prefix).await?;
+    if current.ribbon == input.ribbon {
+        return Ok(Json(current)); // idempotent: nothing to check or write
+    }
+    let stranded = db::cards_incompatible_with_ribbon(&st.pool, prefix, input.ribbon).await?;
+    if stranded > 0 {
+        return Err(ApiError::Conflict(format!(
+            "{stranded} of prefix {prefix}'s cards have a back side the {} ribbon cannot print; \
+             make them single-sided or markdown-backed first",
+            input.ribbon
+        )));
+    }
     Ok(Json(
-        db::set_prefix_mode(&st.pool, prefix, input.print_mode).await?,
+        db::set_prefix_ribbon(&st.pool, prefix, input.ribbon).await?,
     ))
 }
 
@@ -681,9 +1049,8 @@ pub async fn patch_card(
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    Ok(Json(
-        db::update_card_meta(&st.pool, prefix, id, &patch).await?,
-    ))
+    db::update_card_meta(&st.pool, prefix, id, &patch).await?;
+    Ok(Json(rerender_card(&st, prefix, id).await?))
 }
 
 /// The print queue for one prefix: its cards ordered by id, with the operator's
@@ -965,17 +1332,18 @@ fn public_base_url(st: &AppState, headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
-/// Public shop settings: price, currency, ribbon availability, and whether
-/// payment works at all. The customer UI needs this to show a total — and which
-/// print modes can actually be ordered — before sending anyone to Stripe.
+/// Public shop settings: price per printed side, currency, ribbon availability,
+/// and whether payment works at all. The customer UI needs this to show a total
+/// — and which ribbons can actually be ordered — before sending anyone to
+/// Stripe.
 ///
-/// Each mode carries an `available` flag, and the two ribbon stock flags behind
-/// it are served as well. An out-of-stock mode stays in the list rather than
+/// Each ribbon carries an `available` flag, and the two stock flags behind it
+/// are served as well. An out-of-stock ribbon stays in the list rather than
 /// disappearing, so the customer sees that the option exists and is out.
 #[utoipa::path(get, path = "/api/shop/config", tag = "shop",
     responses((status = 200, body = ShopConfig)))]
 pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>, ApiError> {
-    let prices = db::list_mode_prices(&st.pool).await?;
+    let prices = db::list_ribbon_prices(&st.pool).await?;
     let ribbons = db::list_ribbon_stock(&st.pool).await?;
     let body = match st.stripe.as_deref() {
         None => ShopConfig {
@@ -1030,24 +1398,22 @@ pub async fn put_ribbon_stock(
     Ok(Json(db::set_ribbon_stock(&st.pool, ribbon, input.in_stock).await?))
 }
 
-/// Refuse to sell a card that cannot be printed.
+/// Refuse to sell a job that cannot be printed.
 ///
-/// A mode whose ribbon is out of stock is not orderable, however the customer
-/// got to it: a page rendered before the ribbon ran out, or a direct API call.
-/// The UI already renders such a mode disabled — this is the same rule at the
-/// layer that takes the money, which is where it has to hold.
+/// A ribbon that is out of stock is not orderable, however the customer got to
+/// it: a page rendered before the ribbon ran out, or a direct API call. The UI
+/// already renders such a ribbon disabled — this is the same rule at the layer
+/// that takes the money, which is where it has to hold.
 ///
 /// What it deliberately does *not* do is reconcile anything: a prefix already
-/// priced for a mode whose ribbon has since run out is neither repriced,
-/// refunded nor flagged — it simply cannot open a *new* session until the
-/// ribbon is back. Sorting those out is a background, by-hand matter, and the
-/// gate is kept to the one question it can answer cleanly: may this be sold
-/// right now.
-async fn ensure_mode_orderable(pool: &SqlitePool, mode: PrintMode) -> Result<(), ApiError> {
-    let ribbon = mode.ribbon();
+/// priced for a ribbon that has since run out is neither repriced, refunded nor
+/// flagged — it simply cannot open a *new* session until the ribbon is back.
+/// Sorting those out is a background, by-hand matter, and the gate is kept to
+/// the one question it can answer cleanly: may this be sold right now.
+async fn ensure_ribbon_orderable(pool: &SqlitePool, ribbon: Ribbon) -> Result<(), ApiError> {
     if !db::ribbon_in_stock(pool, ribbon).await? {
         return Err(ApiError::Conflict(format!(
-            "print mode '{mode}' is unavailable: the {ribbon} ribbon is out of stock"
+            "the {ribbon} ribbon is out of stock, so nothing can be ordered for it right now"
         )));
     }
     Ok(())
@@ -1056,28 +1422,22 @@ async fn ensure_mode_orderable(pool: &SqlitePool, mode: PrintMode) -> Result<(),
 /// Refuse an order that is missing part of a card, so nothing is sold that
 /// cannot be printed.
 ///
-/// The one case today is `double_sided_color`, whose colour back is uploaded
-/// per card: a prefix can hold cards whose back is still missing, and nothing
-/// downstream would notice until the spooler went looking for the file. Same
-/// place and same reasoning as the ribbon stock check — the layer that takes the
-/// money is where "can this actually be made" has to hold.
+/// A card's back can be an uploaded image or typed markdown, either of which is
+/// filled in *after* the card exists (the dropzone uploads fronts a folder at a
+/// time). A prefix can therefore hold cards whose back is still missing, and
+/// nothing downstream would notice until the spooler went looking for the
+/// raster. Same place and same reasoning as the ribbon stock check — the layer
+/// that takes the money is where "can this actually be made" has to hold.
 ///
-/// Like `ensure_mode_orderable`, it reconciles nothing: a prefix already priced
-/// is not repriced or refunded, it just cannot open a *new* session until the
-/// missing back is uploaded.
-async fn ensure_order_printable(
-    pool: &SqlitePool,
-    prefix: Uuid,
-    mode: PrintMode,
-) -> Result<(), ApiError> {
-    if !mode.allows_back_image() {
-        return Ok(());
-    }
-    let missing = db::cards_missing_back_image(pool, prefix).await?;
+/// Like `ensure_ribbon_orderable`, it reconciles nothing: a prefix already
+/// priced is not repriced or refunded, it just cannot open a *new* session
+/// until the missing back is supplied.
+async fn ensure_order_printable(pool: &SqlitePool, prefix: Uuid) -> Result<(), ApiError> {
+    let missing = db::cards_missing_back(pool, prefix).await?;
     if missing > 0 {
         return Err(ApiError::Conflict(format!(
-            "prefix {prefix} is {mode} and {missing} of its cards have no back image yet; \
-             every card needs one before the order can be printed"
+            "prefix {prefix} has {missing} card(s) whose back is not finished; every card needs \
+             its back image or back text before the order can be printed"
         )));
     }
     Ok(())
@@ -1143,16 +1503,20 @@ pub async fn create_checkout(
         )));
     }
 
-    ensure_mode_orderable(&st.pool, p.print_mode).await?;
-    // A card is only complete once its back side is: in `double_sided_color`
-    // that is an uploaded image, and a card without one would reach the spooler
-    // as a front with a hole where its back should be.
-    ensure_order_printable(&st.pool, prefix, p.print_mode).await?;
+    ensure_ribbon_orderable(&st.pool, p.ribbon).await?;
+    // A card is only complete once its back side is: an uploaded image, or the
+    // text it is rendered from. A card without its material would reach the
+    // spooler as a front with a hole where its back should be.
+    ensure_order_printable(&st.pool, prefix).await?;
 
-    // The price is the mode's, looked up from the database — not a single
-    // environment-wide per-card figure. A mode with no configured price is a
-    // misconfiguration and refuses the checkout rather than pricing at zero.
-    let price_cents = db::mode_price(&st.pool, p.print_mode).await?;
+    // The price is per printed *side*, looked up from the database — not a
+    // single environment-wide figure, and not per card either. A ribbon with no
+    // configured price is a misconfiguration and refuses the checkout rather
+    // than pricing at zero.
+    let price_cents = db::ribbon_price(&st.pool, p.ribbon).await?;
+    // How many panels this order actually burns, which is what is charged:
+    // per printed side on YMCKO, always two per card on YMCKOKO.
+    let sides = db::billed_sides(&st.pool, prefix, p.ribbon).await?;
 
     // Flip to payment_pending BEFORE opening the session, and note the order: a
     // customer can pay the moment they land on Stripe's page, and the webhook
@@ -1164,15 +1528,15 @@ pub async fn create_checkout(
         db::set_status(&st.pool, prefix, PrefixStatus::PaymentPending, None, false).await?;
     }
 
-    // Freeze the mode this order is being charged for, so the spooler prints
-    // what the customer paid for even if the operator changes the mode later.
-    // Done alongside the status flip, before the session opens, so the frozen
-    // mode always matches the price locked into the session.
-    db::set_paid_print_mode(&st.pool, prefix, p.print_mode).await?;
+    // Freeze the ribbon this order is being charged for, so the spooler prints
+    // what the customer paid for even if the operator changes it later. Done
+    // alongside the status flip, before the session opens, so the frozen ribbon
+    // always matches the price locked into the session.
+    db::set_paid_ribbon(&st.pool, prefix, p.ribbon).await?;
 
     let base = public_base_url(&st, &headers);
     let session = match stripe
-        .create_checkout_session(prefix, p.card_count, price_cents, &base)
+        .create_checkout_session(prefix, sides, price_cents, &base)
         .await
     {
         Ok(s) => s,
@@ -1190,7 +1554,7 @@ pub async fn create_checkout(
         }
     };
 
-    tracing::info!(%prefix, session = %session.id, cards = p.card_count,
+    tracing::info!(%prefix, session = %session.id, cards = p.card_count, sides,
         "checkout session created; waiting for the payment webhook");
     Ok(Json(session))
 }
@@ -1344,9 +1708,9 @@ async fn record_payment(
                         card_count: updated.card_count,
                         amount_cents: session.amount_total,
                         currency: session.currency.clone(),
-                        // The mode that was charged, which is what the spooler
-                        // will print.
-                        print_mode: updated.paid_print_mode.or(Some(updated.print_mode)),
+                        // The ribbon that was charged, which is what the
+                        // spooler will print.
+                        ribbon: updated.paid_ribbon.or(Some(updated.ribbon)),
                         customer_email: session.payer_email().map(str::to_string),
                         customer_name: session.payer_name().map(str::to_string),
                     },
@@ -1520,7 +1884,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(get_prefix)
                 .put(put_prefix)
                 .delete(delete_prefix)
-                .patch(patch_prefix_mode),
+                .patch(patch_prefix_ribbon),
         )
         // Kept as an explicit tombstone rather than deleted, so a stale client
         // gets a 410 with a reason instead of a 405 from the static fallback.
@@ -1552,6 +1916,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/prefixes/:prefix/cards/:id/back-image",
             axum::routing::get(get_card_back_image).put(put_card_back_image),
+        )
+        .route(
+            "/api/prefixes/:prefix/cards/:id/display-image",
+            axum::routing::get(get_card_display_image),
+        )
+        .route(
+            "/api/prefixes/:prefix/cards/:id/display-back",
+            axum::routing::get(get_card_display_back),
+        )
+        .route(
+            "/api/prefixes/:prefix/cards/:id/print-raster",
+            axum::routing::get(get_card_print_raster),
+        )
+        .route(
+            "/api/prefixes/:prefix/cards/:id/print-raster/back",
+            axum::routing::get(get_card_print_raster_back),
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/printed",
@@ -1594,6 +1974,7 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::RenderStatus;
     use crate::rate_limit;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::sync::Arc;
@@ -1662,20 +2043,27 @@ mod tests {
         db::get_prefix(pool, uuid).await.unwrap().status
     }
 
-    /// A minimal card: a front image, plus a colour back image if `back` is
-    /// given. The blob paths are never read by these tests, only the metadata.
-    async fn insert_card(pool: &SqlitePool, prefix: Uuid, id: i64, back: Option<&str>) {
+    /// A minimal card: a front image, plus the material for its back when the
+    /// back source needs any. The blob paths are never read by these tests,
+    /// only the metadata.
+    async fn insert_card(pool: &SqlitePool, prefix: Uuid, id: i64, back: BackSource) {
+        let (image, text) = match back {
+            BackSource::Image => (Some("blobs/x-back.png"), None),
+            BackSource::Markdown => (None, Some("# Songs\n")),
+            _ => (None, None),
+        };
         db::upsert_card(
             pool,
             prefix,
             id,
             "c",
             None,
-            None,
+            back,
+            text,
             "blobs/f.png",
             "image/png",
-            back,
-            back.map(|_| "image/png"),
+            image,
+            image.map(|_| "image/png"),
         )
         .await
         .expect("upsert card");
@@ -1933,52 +2321,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkout_refuses_a_mode_whose_ribbon_is_out_of_stock() {
+    async fn checkout_refuses_a_ribbon_that_is_out_of_stock() {
         let pool = test_pool().await;
-        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymcko, false)
+        db::set_ribbon_stock(&pool, Ribbon::Ymcko, false)
             .await
             .unwrap();
 
-        // Both YMCKO modes go: one stock flag, two modes.
-        for mode in [PrintMode::SingleSided, PrintMode::DoubleSidedColor] {
-            let err = ensure_mode_orderable(&pool, mode)
-                .await
-                .expect_err("an out-of-stock ribbon must refuse the sale");
-            assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
-            assert!(err.to_string().contains("ymcko"), "{err}");
-        }
-        // The other ribbon is untouched, so the black-back mode still sells.
-        ensure_mode_orderable(&pool, PrintMode::ColorFrontBlackBack)
+        let err = ensure_ribbon_orderable(&pool, Ribbon::Ymcko)
+            .await
+            .expect_err("an out-of-stock ribbon must refuse the sale");
+        assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
+        assert!(err.to_string().contains("ymcko"), "{err}");
+
+        // The other ribbon is untouched, so a YMCKOKO job still sells.
+        ensure_ribbon_orderable(&pool, Ribbon::Ymckoko)
             .await
             .expect("YMCKOKO is still in stock");
 
         // Restocking reopens the sale, with no state to reset.
-        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymcko, true)
+        db::set_ribbon_stock(&pool, Ribbon::Ymcko, true)
             .await
             .unwrap();
-        ensure_mode_orderable(&pool, PrintMode::DoubleSidedColor)
+        ensure_ribbon_orderable(&pool, Ribbon::Ymcko)
             .await
             .expect("restocked");
     }
 
     #[tokio::test]
-    async fn a_colour_back_image_needs_the_colour_mode_and_a_real_card() {
+    async fn a_back_image_needs_a_ribbon_that_prints_colour_and_a_real_card() {
         let pool = test_pool().await;
 
-        // A mode with no colour back at all: the upload is refused rather than
-        // stored as a blob nothing will ever print.
-        let single = db::create_prefix(&pool, None, Some(PrintMode::SingleSided))
+        // YMCKOKO's back is the black panel, so an uploaded colour image is
+        // refused rather than stored as a blob nothing will ever print.
+        let black = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
             .await
             .unwrap();
-        insert_card(&pool, single.uuid, 1, None).await;
-        let err = ensure_back_image_writable(&pool, single.uuid, 1, false)
+        insert_card(&pool, black.uuid, 1, BackSource::None).await;
+        let err = ensure_back_image_writable(&pool, black.uuid, 1, false)
             .await
-            .expect_err("single_sided has no colour back");
+            .expect_err("YMCKOKO has no colour back");
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
-        assert!(err.to_string().contains("double_sided_color"), "{err}");
+        assert!(err.to_string().contains("ymckoko"), "{err}");
 
-        // The colour mode, but no such card to attach the back to.
-        let colour = db::create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+        // A ribbon that can print colour, but no such card to attach the back to.
+        let colour = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .unwrap();
         let err = ensure_back_image_writable(&pool, colour.uuid, 1, false)
@@ -1987,10 +2373,10 @@ mod tests {
         assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
 
         // With the card there it goes through...
-        insert_card(&pool, colour.uuid, 1, None).await;
+        insert_card(&pool, colour.uuid, 1, BackSource::None).await;
         ensure_back_image_writable(&pool, colour.uuid, 1, false)
             .await
-            .expect("a colour back on a colour-mode card");
+            .expect("a colour back on a YMCKO card");
 
         // ...until the prefix is sealed for the customer. The operator keeps the
         // write while the order is in flight, which is what lets a missing back
@@ -2019,44 +2405,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_order_with_a_card_missing_its_colour_back_is_not_sellable() {
+    async fn an_order_with_a_card_missing_its_back_is_not_sellable() {
         let pool = test_pool().await;
 
-        // The colour mode: one of two cards still has no back image, so the
-        // order cannot be printed and must not be sold.
-        let colour = db::create_prefix(&pool, None, Some(PrintMode::DoubleSidedColor))
+        // One of the cards still has no back image, so the order cannot be
+        // printed and must not be sold.
+        let p = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .unwrap();
-        insert_card(&pool, colour.uuid, 1, Some("blobs/1-back.png")).await;
-        insert_card(&pool, colour.uuid, 2, None).await;
-        let err = ensure_order_printable(&pool, colour.uuid, PrintMode::DoubleSidedColor)
+        insert_card(&pool, p.uuid, 1, BackSource::Image).await;
+        db::upsert_card(
+            &pool,
+            p.uuid,
+            2,
+            "no back yet",
+            None,
+            BackSource::Image,
+            None,
+            "blobs/2.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let err = ensure_order_printable(&pool, p.uuid)
             .await
-            .expect_err("a card is missing its back");
+            .expect_err("a card is missing its back image");
         assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
-        assert!(err.to_string().contains("back image"), "{err}");
+        assert!(err.to_string().contains("1 card"), "{err}");
 
-        // Uploading the missing back opens the sale, with nothing to reset.
-        db::set_card_back_image(&pool, colour.uuid, 2, "blobs/2-back.png", "image/png")
+        // Supplying the missing back opens the sale, with nothing to reset.
+        db::set_card_back_image(&pool, p.uuid, 2, "blobs/2-back.png", "image/png")
             .await
             .unwrap();
-        ensure_order_printable(&pool, colour.uuid, PrintMode::DoubleSidedColor)
+        ensure_order_printable(&pool, p.uuid)
             .await
             .expect("every card is complete");
 
-        // The other two modes have no colour back to be missing: their cards
-        // carry no back image at all and that is the whole card.
-        let single = db::create_prefix(&pool, None, Some(PrintMode::SingleSided))
+        // A markdown back with no text is just as incomplete...
+        db::upsert_card(
+            &pool,
+            p.uuid,
+            3,
+            "blank text",
+            None,
+            BackSource::Markdown,
+            Some("  "),
+            "blobs/3.png",
+            "image/png",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let err = ensure_order_printable(&pool, p.uuid)
             .await
-            .unwrap();
-        insert_card(&pool, single.uuid, 1, None).await;
-        ensure_order_printable(&pool, single.uuid, PrintMode::SingleSided)
+            .expect_err("a markdown back with no text is not a back");
+        assert!(err.to_string().contains("1 card"), "{err}");
+
+        // ...while a single-sided card, a front copy and real markdown need
+        // nothing extra at all.
+        insert_card(&pool, p.uuid, 4, BackSource::Markdown).await;
+        insert_card(&pool, p.uuid, 5, BackSource::Front).await;
+        insert_card(&pool, p.uuid, 6, BackSource::None).await;
+        db::update_card_meta(
+            &pool,
+            p.uuid,
+            3,
+            &CardPatch {
+                back: Some(BackSource::None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        ensure_order_printable(&pool, p.uuid)
             .await
-            .expect("single-sided has no back side");
-        let black = db::create_prefix(&pool, None, None).await.unwrap();
-        insert_card(&pool, black.uuid, 1, None).await;
-        ensure_order_printable(&pool, black.uuid, PrintMode::ColorFrontBlackBack)
-            .await
-            .expect("the black back is text, not an image");
+            .expect("nothing is missing");
     }
 
     #[tokio::test]
@@ -2083,13 +2509,13 @@ mod tests {
             .iter()
             .any(|r| r.ribbon == crate::models::Ribbon::Ymckoko && !r.in_stock));
 
-        // Every mode is still offered — an out-of-stock one is disabled in the
-        // UI, never dropped from the list.
-        assert_eq!(config.prices.len(), 3);
+        // Every ribbon is still offered — an out-of-stock one is disabled in
+        // the UI, never dropped from the list.
+        assert_eq!(config.prices.len(), 2);
         assert!(config
             .prices
             .iter()
-            .all(|p| p.available == (p.print_mode != PrintMode::ColorFrontBlackBack)));
+            .all(|p| p.available == (p.ribbon != Ribbon::Ymckoko)));
     }
 
     #[tokio::test]
@@ -2281,8 +2707,157 @@ mod tests {
 
         assert_eq!(mock.len(), 0, "no email for a payment that cannot attach");
         assert_eq!(
-            anomaly_kinds(&pool).await,
-            vec![NeedsAttentionKind::PaymentForDraft]
-        );
-    }
-}
+                    anomaly_kinds(&pool).await,
+                    vec![NeedsAttentionKind::PaymentForDraft]
+                );
+            }
+
+            #[tokio::test]
+            async fn rerender_produces_display_and_raster_for_a_front() {
+                // A real PNG in memory, written to a temp data dir so the pipeline can
+                // read the original back and write the derived blobs.
+                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let pool = test_pool().await;
+                let p = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
+                    .await
+                    .unwrap();
+
+                // Write a 2:1 PNG as the front original, then create the card pointing
+                // at it.
+                let img = image::RgbImage::from_pixel(200, 100, image::Rgb([200, 100, 50]));
+                let mut out = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut out, image::ImageFormat::Png)
+                    .unwrap();
+                let bytes = out.into_inner();
+                let rel = format!("blobs/{}/1.png", p.uuid);
+                let abs = dir.join(&rel);
+                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                std::fs::write(&abs, &bytes).unwrap();
+
+                db::upsert_card(
+                    &pool,
+                    p.uuid,
+                    1,
+                    "front",
+                    None,
+                    BackSource::None,
+                    None,
+                    &rel,
+                    "image/png",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let st = AppState {
+                    pool: pool.clone(),
+                    data_dir: Arc::new(dir.clone()),
+                    admin_token: None,
+                    sessions: crate::auth::Sessions::new(pool.clone()),
+                    cookie_secure: None,
+                    stripe: None,
+                    notifier: None,
+                    login_limiter: crate::auth::LoginLimiter::default(),
+                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+                };
+
+                let card = rerender_card(&st, p.uuid, 1).await.unwrap();
+                assert_eq!(card.display_front, RenderStatus::Ready);
+                assert_eq!(card.print_front, RenderStatus::Ready);
+                // Single-sided: no back side at all.
+                assert_eq!(card.display_back, None);
+                assert_eq!(card.print_back, None);
+
+                // The derived blobs exist and are the right kinds.
+                let display = std::fs::read(dir.join(format!("blobs/{}/1-front-display.png", p.uuid))).unwrap();
+                assert_eq!(&display[0..8], b"\x89PNG\r\n\x1a\n");
+                let raster = std::fs::read(dir.join(format!("blobs/{}/1-front-print.bmp", p.uuid))).unwrap();
+                assert_eq!(&raster[0..2], b"BM");
+                assert_eq!(raster[28], 24);
+
+                // The endpoints serve them with the right status semantics.
+                let resp = get_card_display_image(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+                let resp = get_card_print_raster(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK);
+                // A back side that does not exist is a 404.
+                let err = get_card_display_back(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn rerender_marks_a_markdown_back_failed_until_a_renderer_lands() {
+                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let pool = test_pool().await;
+                let p = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+                    .await
+                    .unwrap();
+
+                let img = image::RgbImage::from_pixel(200, 100, image::Rgb([10, 20, 30]));
+                let mut out = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut out, image::ImageFormat::Png)
+                    .unwrap();
+                let bytes = out.into_inner();
+                let rel = format!("blobs/{}/1.png", p.uuid);
+                let abs = dir.join(&rel);
+                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                std::fs::write(&abs, &bytes).unwrap();
+
+                db::upsert_card(
+                    &pool,
+                    p.uuid,
+                    1,
+                    "card",
+                    None,
+                    BackSource::Markdown,
+                    Some("# Title"),
+                    &rel,
+                    "image/png",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+                let st = AppState {
+                    pool: pool.clone(),
+                    data_dir: Arc::new(dir.clone()),
+                    admin_token: None,
+                    sessions: crate::auth::Sessions::new(pool.clone()),
+                    cookie_secure: None,
+                    stripe: None,
+                    notifier: None,
+                    login_limiter: crate::auth::LoginLimiter::default(),
+                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+                };
+
+                let card = rerender_card(&st, p.uuid, 1).await.unwrap();
+                // Front renders; the markdown back is a stub until a real
+                // renderer lands.
+                assert_eq!(card.display_front, RenderStatus::Ready);
+                assert_eq!(card.print_front, RenderStatus::Ready);
+                assert_eq!(card.display_back, Some(RenderStatus::Failed));
+                assert_eq!(card.print_back, Some(RenderStatus::Failed));
+
+                // The failed back raster answers 500, not a blank 200.
+                let err = get_card_print_raster_back(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }

@@ -86,11 +86,14 @@ impl Client {
         Self::handle(resp).await
     }
 
-    pub async fn create_prefix(&self, uuid: Option<&str>) -> Result<Value> {
-        let body = match uuid {
-            Some(u) => serde_json::json!({ "uuid": u }),
-            None => serde_json::json!({}),
-        };
+    pub async fn create_prefix(&self, uuid: Option<&str>, ribbon: Option<&str>) -> Result<Value> {
+        let mut body = serde_json::json!({});
+        if let Some(u) = uuid {
+            body["uuid"] = serde_json::json!(u);
+        }
+        if let Some(r) = ribbon {
+            body["ribbon"] = serde_json::json!(r);
+        }
         self.send(
             self.http
                 .post(format!("{}/api/prefixes", self.base))
@@ -162,12 +165,16 @@ impl Client {
 
     /// Upload one card image. `id = Some(_)` uses PUT (create/replace at that
     /// index); `None` lets the server assign the next id via POST.
+    ///
+    /// `back` is the card's back side (none|front|image|markdown); `back_text`
+    /// is the markdown a `markdown` back is rendered from.
     pub async fn upload_card(
         &self,
         prefix: &str,
         file: &Path,
         name: &str,
         serial_number: Option<&str>,
+        back: Option<&str>,
         back_text: Option<&str>,
         id: Option<i64>,
     ) -> Result<Value> {
@@ -190,6 +197,13 @@ impl Client {
         if let Some(s) = serial_number {
             form = form.text("serial_number", s.to_string());
         }
+        // Sending back text without a source means the card's back is that
+        // text: a markdown back, rather than a single-sided card with a field
+        // nothing renders.
+        let back = back.or(back_text.map(|_| "markdown"));
+        if let Some(b) = back {
+            form = form.text("back", b.to_string());
+        }
         if let Some(b) = back_text {
             form = form.text("back_text", b.to_string());
         }
@@ -205,9 +219,9 @@ impl Client {
         self.send(req.multipart(form)).await
     }
 
-    /// Upload (or replace) one card's colour back image, leaving its front
-    /// alone. Only a `double_sided_color` prefix accepts this; the server
-    /// answers 400 in the other two modes.
+    /// Upload (or replace) one card's back image, leaving its front alone, and
+    /// make that image the card's back. Only a ribbon that can print a colour
+    /// back (YMCKO) accepts this; the server answers 400 on YMCKOKO.
     pub async fn upload_back_image(&self, prefix: &str, id: i64, file: &Path) -> Result<Value> {
         let bytes = tokio::fs::read(file)
             .await

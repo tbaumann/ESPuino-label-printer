@@ -20,6 +20,14 @@ pub enum ApiError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// The caller is locked out of a resource that exists — a derived artifact
+    /// (display image / print raster) that is still `pending` because it has
+    /// not been produced yet. The client may retry. Deliberately distinct from
+    /// `Conflict` and `NotFound`: the resource exists by principle, it is just
+    /// not ready.
+    #[error("locked: {0}")]
+    Locked(String),
+
     #[error("forbidden: {0}")]
     Forbidden(String),
 
@@ -59,6 +67,7 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Locked(_) => StatusCode::LOCKED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,

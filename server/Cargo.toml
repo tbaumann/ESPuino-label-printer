@@ -35,3 +35,12 @@ sha2 = "0.10"
 # (server/src/backtext.rs), so the `html`/`getopts` default features are off and
 # the tree stays small.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Image decode/resize/encode for the canonical display image and printer rasters.
+# PNG encoding only (no webp) to keep the dependency tree small.
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "bmp",
+  "gif",
+  "webp",
+] }

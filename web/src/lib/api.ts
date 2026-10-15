@@ -7,15 +7,26 @@ export type PrefixStatus =
   | 'printed'
   | 'cancelled'
 
-export type PrintMode = 'single_sided' | 'double_sided_color' | 'color_front_black_back'
+/**
+ * The ribbon a job is printed with: the one choice per job, because a batch
+ * cannot mix ribbon loads. Everything else is chosen per card.
+ */
+export type Ribbon = 'ymcko' | 'ymckoko'
+
+/**
+ * What a card has on its back side — the per-card single/double-sided choice.
+ * `none` *is* a single-sided card, so there is no second flag to keep in step
+ * with it.
+ */
+export type BackSource = 'none' | 'front' | 'image' | 'markdown'
 
 export interface Prefix {
   uuid: string
   created_at: string
   status: PrefixStatus
   status_changed_at: string | null
-  print_mode: PrintMode
-  paid_print_mode?: PrintMode | null
+  ribbon: Ribbon
+  paid_ribbon?: Ribbon | null
   order_ref: string | null
   card_count: number
 }
@@ -24,30 +35,46 @@ export interface Card {
   id: number
   name: string
   serial_number: string | null
-  /** Markdown for the black-only back. Only `color_front_black_back` has one. */
+  /** What this card's back is. `none` is a single-sided card. */
+  back: BackSource
+  /**
+   * Markdown a `markdown` back is rendered from, in the ribbon's colour depth.
+   * `null` for every other back, and for a markdown card with no text yet.
+   */
   back_text: string | null
   image_content_type: string
   /**
-   * Present only once a colour back image has been uploaded
-   * (`double_sided_color`). The content type is the signal that a back image
-   * exists — the stored path is never serialized. Omitted by the server when
-   * there is none, so a card without a colour back reads as `undefined`.
+   * Present only once a back image has been uploaded for an `image` back. The
+   * content type is the signal that one exists — the stored path is never
+   * serialized. Omitted by the server when there is none, so a card whose back
+   * image is still missing reads as `undefined`.
    */
   back_image_content_type?: string | null
   created_at: string
   updated_at: string
+  /** Server-side render availability: `pending` | `ready` | `failed`. */
+  display_front: 'pending' | 'ready' | 'failed'
+  /** Absent when the mode has no back to render. */
+  display_back?: 'pending' | 'ready' | 'failed'
+  print_front: 'pending' | 'ready' | 'failed'
+  print_back?: 'pending' | 'ready' | 'failed'
 }
 
 /**
- * Whether this card is still missing a side it needs to be printed.
+ * Whether this card is a double-sided one that is still missing the material its
+ * back is made of: an `image` back with no upload, or a `markdown` back with no
+ * text. A single-sided card, and a `front` copy (which needs nothing extra), are
+ * never incomplete.
  *
- * Only `double_sided_color` has a back image, and a card exists from its front
- * alone, so this is what the card row offers an upload for and what the project
- * page counts before it offers to pay — the server refuses such an order too
- * (409), because that is where it must hold.
+ * A card exists from its front alone (the dropzone uploads a folder at a time),
+ * so this is what the card row offers to fill in, and what the project page
+ * counts before it offers to pay — the server refuses such an order too (409),
+ * because that is where it must hold.
  */
-export function needsBackImage(card: Card): boolean {
-  return !card.back_image_content_type
+export function backIncomplete(card: Card): boolean {
+  if (card.back === 'image') return !card.back_image_content_type
+  if (card.back === 'markdown') return !card.back_text || card.back_text.trim() === ''
+  return false
 }
 
 export interface CardIndex {
@@ -58,11 +85,10 @@ export interface CardIndex {
 export interface CardPatch {
   name?: string
   serial_number?: string
+  /** The card's back side: how a card becomes, or stops being, double-sided. */
+  back?: BackSource
   back_text?: string
 }
-
-/** A ribbon the shop prints with. Availability is a property of the ribbon. */
-export type Ribbon = 'ymcko' | 'ymckoko'
 
 /** One ribbon's stock flag, as the shop config serves it. */
 export interface RibbonStock {
@@ -71,12 +97,15 @@ export interface RibbonStock {
 }
 
 /**
- * One print mode as the shop offers it. `available: false` means the mode's
- * ribbon is out of stock: the option is rendered disabled, never dropped, so
- * the customer can see that it exists and is out.
+ * One ribbon as the shop offers it. `available: false` means it is out of
+ * stock: the option is rendered disabled, never dropped, so the customer can
+ * see that it exists and is out.
+ *
+ * `price_cents` is the price of one printed *side* — a card costs one or two of
+ * them, per `billedSides`.
  */
-export interface ModePrice {
-  print_mode: PrintMode
+export interface RibbonPrice {
+  ribbon: Ribbon
   price_cents: number
   available: boolean
 }
@@ -85,35 +114,93 @@ export interface ModePrice {
 export interface ShopConfig {
   enabled: boolean
   currency: string
-  prices: ModePrice[]
-  /** The two stock flags behind `prices[].available` — YMCKO covers both colour modes. */
+  prices: RibbonPrice[]
+  /** The same two stock flags, as they are stored. */
   ribbons: RibbonStock[]
   shipping_cents: number
   countries: string[]
 }
 
 /**
- * Customer-facing names for the print modes, and what each one actually does.
- * One place, so the chooser, the read-only view and (later) the per-mode
- * editor cannot drift apart.
+ * Customer-facing names for the two ribbons, and what each one means for the
+ * back of a card. One place, so the chooser, the card panels and the read-only
+ * preview cannot drift apart.
  */
-export const PRINT_MODES: { mode: PrintMode; label: string; summary: string }[] = [
+export const RIBBONS: { ribbon: Ribbon; label: string; summary: string }[] = [
   {
-    mode: 'color_front_black_back',
-    label: 'Colour front, black back',
-    summary: 'Full-colour front, black-only text on the back. The economic two-sided option.',
+    ribbon: 'ymckoko',
+    label: 'Black back',
+    summary:
+      'Full-colour front, black-only back. The back is text — headings, bold, italic, lists — and every card is billed as a full double-sided one.',
   },
   {
-    mode: 'double_sided_color',
-    label: 'Double-sided colour',
-    summary: 'Full-colour front and an uploaded colour image on the back. Costs two ribbon panels.',
-  },
-  {
-    mode: 'single_sided',
-    label: 'Single-sided',
-    summary: 'Full-colour front, blank back.',
+    ribbon: 'ymcko',
+    label: 'Colour back',
+    summary:
+      'Full-colour front, and a back that may be a second picture, a copy of the front, or text. Billed per printed side.',
   },
 ]
+
+/**
+ * What a card's back can be. The panel offers these in order, and what each one
+ * needs from the customer is the whole of the per-card editor.
+ */
+export const BACK_SOURCES: { source: BackSource; label: string; summary: string }[] = [
+  {
+    source: 'none',
+    label: 'Single-sided',
+    summary: 'Front only, blank back. One ribbon panel per card.',
+  },
+  {
+    source: 'front',
+    label: 'Copy of the front',
+    summary: 'The same picture printed on the back. Costs a second panel.',
+  },
+  {
+    source: 'image',
+    label: 'Second image',
+    summary: 'A picture of its own, uploaded per card.',
+  },
+  {
+    source: 'markdown',
+    label: 'Text',
+    summary: 'A song list and the like, rendered from markdown.',
+  },
+]
+
+/**
+ * Whether a ribbon can print a card whose back is `source`.
+ *
+ * YMCKO gives the back a colour panel set of its own, so anything goes there.
+ * YMCKOKO's back is the second *black* panel: text can be printed on it, but a
+ * picture cannot — so those choices are not offered on that ribbon, and the
+ * server refuses them too.
+ */
+export function ribbonAllowsBack(ribbon: Ribbon, source: BackSource): boolean {
+  if (ribbon === 'ymcko') return true
+  return source === 'none' || source === 'markdown'
+}
+
+/**
+ * The colour depth a back is rendered in — a consequence of the ribbon, not a
+ * choice. Mirror of the server's `Ribbon::back_depth`, so the preview can be
+ * honest about what will be printed.
+ */
+export function backDepth(ribbon: Ribbon): 'color' | 'black' {
+  return ribbon === 'ymcko' ? 'color' : 'black'
+}
+
+/**
+ * Ribbon panels one card is billed for.
+ *
+ * YMCKO bills per printed side: a single-sided card is one panel set, a
+ * double-sided one is two. YMCKOKO always bills a full double-sided card — its
+ * second black panel is consumed either way, so a blank back saves nothing.
+ */
+export function billedSides(ribbon: Ribbon, back: BackSource): number {
+  if (ribbon === 'ymckoko') return 2
+  return back === 'none' ? 1 : 2
+}
 
 /** A Stripe Checkout session, as far as the UI needs to know about it. */
 export interface CheckoutSession {
@@ -192,24 +279,25 @@ export function formatMoney(cents: number, currency: string): string {
 }
 
 export const api = {
-  createPrefix: (uuid?: string): Promise<Prefix> =>
+  createPrefix: (uuid?: string, ribbon?: Ribbon): Promise<Prefix> =>
     req<Prefix>('/api/prefixes', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(uuid ? { uuid } : {}),
+      body: JSON.stringify({ ...(uuid ? { uuid } : {}), ...(ribbon ? { ribbon } : {}) }),
     }),
 
   getPrefix: (p: string): Promise<Prefix> => req<Prefix>(`/api/prefixes/${p}`),
 
   /**
-   * Choose the prefix's print mode. Only allowed while the prefix is still a
-   * draft for the customer — the server answers 409 once it is sealed.
+   * Choose the prefix's ribbon. Only allowed while the prefix is still a draft
+   * for the customer — the server answers 409 once it is sealed, and also 409
+   * if the change would strand a card the new ribbon cannot print.
    */
-  setPrintMode: (p: string, print_mode: PrintMode): Promise<Prefix> =>
+  setRibbon: (p: string, ribbon: Ribbon): Promise<Prefix> =>
     req<Prefix>(`/api/prefixes/${p}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ print_mode }),
+      body: JSON.stringify({ ribbon }),
     }),
 
   listCards: (p: string): Promise<CardIndex> =>
@@ -234,10 +322,18 @@ export const api = {
   },
 
   cardImageUrl: (p: string, id: number): string =>
-    `/api/prefixes/${p}/cards/${id}/image`,
+      `/api/prefixes/${p}/cards/${id}/image`,
+
+    /** The processed front display image (normalized PNG) the UI shows. */
+    cardDisplayUrl: (p: string, id: number): string =>
+      `/api/prefixes/${p}/cards/${id}/display-image`,
+
+    /** The processed back display image (colour or rendered black back). */
+    cardDisplayBackUrl: (p: string, id: number): string =>
+      `/api/prefixes/${p}/cards/${id}/display-back`,
 
   /**
-   * The card's colour back image (`double_sided_color` only).
+   * The card's uploaded back image (an `image` back only).
    *
    * The URL is stable across a re-upload, so pass something that changes —
    * the card's `updated_at` is the honest answer — or the browser will keep
@@ -247,9 +343,9 @@ export const api = {
     `/api/prefixes/${p}/cards/${id}/back-image${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
   /**
-   * Attach or replace one card's colour back image, leaving the front alone.
-   * Only a `double_sided_color` prefix accepts this; the server answers 400 in
-   * the other two modes.
+   * Attach or replace one card's back image, leaving the front alone. This also
+   * makes the card's back an `image` back. Only a YMCKO prefix accepts it — a
+   * YMCKOKO back is the black panel, and the server answers 400 there.
    */
   uploadBackImage: (p: string, id: number, file: File): Promise<Card> => {
     const fd = new FormData()

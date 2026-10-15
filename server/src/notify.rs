@@ -38,7 +38,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::db;
-use crate::models::PrintMode;
+use crate::models::Ribbon;
 
 /// How long to wait on Resend. Bounded so a hung connection cannot hold the
 /// Stripe webhook response open; the send is never allowed to fail the webhook,
@@ -221,9 +221,9 @@ pub struct PaidOrder {
     pub card_count: i64,
     pub amount_cents: Option<i64>,
     pub currency: Option<String>,
-    /// The mode that was charged. The operator needs it to know which ribbon
-    /// this order takes.
-    pub print_mode: Option<PrintMode>,
+    /// The ribbon that was charged — the ribbon load this order takes, which
+    /// is the one thing the operator cannot infer from anything else here.
+    pub ribbon: Option<Ribbon>,
     pub customer_email: Option<String>,
     pub customer_name: Option<String>,
 }
@@ -373,10 +373,10 @@ fn operator_message(order: &PaidOrder, base: &str) -> Message {
         ("Prefix", order.prefix.to_string()),
         ("Cards", order.card_count.to_string()),
         (
-            "Print mode",
+            "Ribbon",
             order
-                .print_mode
-                .map(|m| m.to_string())
+                .ribbon
+                .map(|r| r.to_string())
                 .unwrap_or_else(|| "(not recorded)".to_string()),
         ),
         ("Total", amount(order)),
@@ -633,7 +633,7 @@ pub(crate) mod tests {
             card_count: 3,
             amount_cents: Some(1750),
             currency: Some("eur".into()),
-            print_mode: Some(PrintMode::ColorFrontBlackBack),
+            ribbon: Some(Ribbon::Ymckoko),
             customer_email: Some("ada@example.test".into()),
             customer_name: Some("Ada Lovelace".into()),
         }
@@ -676,7 +676,7 @@ pub(crate) mod tests {
         assert!(operator["text"]
             .as_str()
             .unwrap()
-            .contains("color_front_black_back"));
+            .contains("ymckoko"), "the operator is told which ribbon to load");
     }
 
     #[tokio::test]

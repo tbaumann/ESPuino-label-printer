@@ -1,26 +1,26 @@
 <script lang="ts">
-  import { api, type PrintMode } from './api'
+  import { api, type Ribbon } from './api'
 
   let {
     prefix,
-    mode,
+    ribbon,
     onUploaded,
     disabled = false,
   }: {
     prefix: string
-    /** The prefix's print mode, which decides what a dropped image still needs. */
-    mode?: PrintMode
+    /** The prefix's ribbon, which decides what a card may put on its back. */
+    ribbon?: Ribbon
     onUploaded: () => void | Promise<void>
     disabled?: boolean
   } = $props()
 
-  // This uploads *fronts* — one file, one card. In the colour mode that is not
-  // a finished card, so the hint says where the other side comes from rather
-  // than letting the customer find out at the checkout.
+  // This uploads *fronts* — one file, one card, and a new card starts
+  // single-sided. The back is chosen per card below, so the hint says where a
+  // back comes from rather than letting the customer find out at the checkout.
   const hint = $derived(
-    mode === 'double_sided_color'
-      ? 'uploads each image as a card; the name defaults to the file name. Each card still needs its colour back image — add those on the cards below.'
-      : 'uploads each image as a card; the name defaults to the file name',
+    ribbon === 'ymckoko'
+      ? 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — a back on this ribbon is black-only text, chosen on the card below.'
+      : 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — choose and fill in a back on each card below.',
   )
 
   let over = $state(false)

@@ -1,12 +1,15 @@
 import { Marked } from 'marked'
 import DOMPurify from 'dompurify'
 
-// Render `back_text` (markdown) into the black-only card back.
+// Render `back_text` (markdown) while the customer is typing.
 //
-// This is the SPA half of a two-renderer contract. The server-side renderer
-// the print queue uses (server/src/backtext.rs) MUST produce the same output
-// for the same input — the card the customer approves here is the card that
-// gets printed. Keep the two in lockstep; the subset below is the agreement.
+// This is the *editing* view, not the printed card. What prints is the server's
+// raster, produced from the same markdown by `server/src/render.rs` — which is
+// still a stub for a markdown back, so such a card reports itself not printable
+// rather than coming out with a blank side. Keep the subset below in step with
+// that renderer: it takes the ribbon's colour depth and draws the same small
+// set, and a preview that offered more than the print could produce would be a
+// lie about the card the customer is about to order.
 //
 // Supported subset (everything else degrades to its text content):
 //   - headings: `#`..`######`  -> <h1>..<h6>
@@ -23,16 +26,17 @@ import DOMPurify from 'dompurify'
 //   - raw HTML is dropped whole — tag and text — never passed through, so
 //     nothing in the markdown is ever treated as markup.
 //
-// Parsing is CommonMark only (`gfm: false`), the same options the server
-// renderer uses: tables, `~~strikethrough~~` and bare-URL autolinks are GFM,
-// they are not in the subset, and a preview that renders them would be
-// promising a card the printer cannot produce.
+// Parsing is CommonMark only (`gfm: false`), which is what the server renderer
+// parses too: tables, `~~strikethrough~~` and bare-URL autolinks are GFM, they
+// are not in the subset, and a preview that rendered them would be promising a
+// card the printer cannot produce.
 //
 // The output is sanitised with DOMPurify against an allowlist of exactly the
 // subset tags, so `{@html}` in the component is safe to use on it.
 //
-// The agreement is asserted, not assumed: the same inputs are rendered through
-// both pipelines in the smoke test (`web/test/smoke.mjs`, scenario B2).
+// The subset is asserted, not assumed: the smoke test renders this markdown
+// through the preview and checks each refusal (`web/test/smoke.mjs`, scenario
+// B2).
 
 const ALLOWED_TAGS = [
   'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -73,8 +77,8 @@ export function renderBackText(markdown: string): string {
 }
 
 /**
- * Whether the markdown asks for an image, which the black-only back refuses
- * outright (the whole construct is dropped, alt text included).
+ * Whether the markdown asks for an image, which the renderer refuses outright
+ * (the whole construct is dropped, alt text included).
  *
  * This is a courtesy for the editor, not part of the two-renderer contract: it
  * only decides whether to *say* that an image was dropped, so a customer aiming

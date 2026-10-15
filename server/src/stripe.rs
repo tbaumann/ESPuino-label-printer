@@ -38,9 +38,10 @@ const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 /// What the shop charges, and how the order is priced.
 ///
 /// Amounts are in the currency's *minor* unit (cents), the way Stripe wants
-/// them, so `500` with `eur` is €5.00. Per-mode card prices live in the
-/// database (`mode_prices`), not here — this struct only carries the
-/// shop-wide, deployment-level settings that are not per-mode.
+/// them, so `500` with `eur` is €5.00. Per-ribbon prices — the price of one
+/// printed *side* — live in the database (`ribbon_prices`), not here; this
+/// struct only carries the shop-wide, deployment-level settings that are not
+/// per-ribbon.
 #[derive(Debug, Clone)]
 pub struct Pricing {
     pub currency: String,
@@ -51,10 +52,11 @@ pub struct Pricing {
 }
 
 impl Pricing {
-    /// Order total in cents. Only used to render a price before paying — the
+    /// Order total in cents, from the price of one printed side and how many
+    /// sides the order burns. Only used to render a price before paying — the
     /// authoritative figure is the one Stripe computes and reports back.
-    pub fn total_cents(&self, price_cents: i64, card_count: i64) -> i64 {
-        price_cents.max(0) * card_count.max(0) + self.shipping_cents.max(0)
+    pub fn total_cents(&self, side_price_cents: i64, sides: i64) -> i64 {
+        side_price_cents.max(0) * sides.max(0) + self.shipping_cents.max(0)
     }
 }
 
@@ -219,10 +221,15 @@ impl Stripe {
     /// `base_url` is where Stripe sends the customer back to; it is used
     /// verbatim for both the success and the cancel URL, with `?paid=1`
     /// appended to the success one purely so the UI can say "processing".
+    /// `sides` is how many ribbon panels the order burns — the session's line
+    /// item quantity — and `price_cents` the price of one of them. Pricing per
+    /// side rather than per card is what lets a YMCKO order mix single- and
+    /// double-sided cards, and what makes a YMCKOKO card cost its two panels
+    /// whether or not its back is printed.
     pub async fn create_checkout_session(
         &self,
         prefix: Uuid,
-        card_count: i64,
+        sides: i64,
         price_cents: i64,
         base_url: &str,
     ) -> Result<CheckoutSession, ApiError> {
@@ -254,7 +261,7 @@ impl Stripe {
             ));
         }
 
-        form.push(("line_items[0][quantity]".into(), card_count.to_string()));
+        form.push(("line_items[0][quantity]".into(), sides.to_string()));
         form.push((
             "line_items[0][price_data][currency]".into(),
             p.currency.clone(),
@@ -265,7 +272,7 @@ impl Stripe {
         ));
         form.push((
             "line_items[0][price_data][product_data][name]".into(),
-            "RFID/NFC card label".into(),
+            "RFID/NFC card label (printed side)".into(),
         ));
 
         for (i, country) in p.countries.iter().enumerate() {
@@ -736,7 +743,7 @@ mod tests {
             shipping_cents: 250,
             countries: vec!["DE".into()],
         };
-        assert_eq!(p.total_cents(500, 3), 1750);
+        assert_eq!(p.total_cents(500, 3), 1750); // three printed sides
         assert_eq!(p.total_cents(500, 0), 250);
         assert_eq!(p.total_cents(500, -5), 250);
 

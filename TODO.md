@@ -18,34 +18,26 @@ and `get_card_image`.
 
 ## Markdown in the back text
 
-Decided and built: `back_text` is markdown, rendered into the black-only card
-back. The editor and the renderer are a solved problem — the SPA uses `marked`
-plus `DOMPurify` (`web/src/lib/backText.ts`), no hand-rolled parser.
+`back_text` is markdown, and it is rendered into a card's back. Markdown is just
+another back *source* (`back_source = 'markdown'`): the ribbon decides the colour
+depth, and the renderer produces the raster the spooler prints.
 
-  - Sanitised on render: the output is run through DOMPurify against an
-    allowlist of exactly the subset tags, so `{@html}` in the component is safe.
-    No raw HTML passthrough — a `<script>` in the markdown is stripped.
-  - **Two renderers have to agree**, or the guarantee is worse than no preview:
-    the SPA preview the customer approves, and the server-side renderer the
-    print queue uses. Same subset, or the card comes out different from what was
-    ordered. The subset contract lives in the doc comment of
-    `web/src/lib/backText.ts` (SPA, marked + DOMPurify) and `server/src/backtext.rs`
-    (print queue, pulldown-cmark + our own writer); the smoke test renders the
-    same markdown through both and asserts the print queue's rendering is the one
-    previewed. `PrintQueueCard.back_html` is that render — the spooler prints it
-    instead of re-rendering the markdown itself. Both sides parse **CommonMark
-    only** (`gfm: false` in the SPA, `Options::empty()` on the server) and drop
-    raw HTML **whole, tag and text**. Those were the two divergences left after
-    the first cut — `~~x~~` previewed as "x" and printed as "~~x~~", and an HTML
-    block showed text in the preview that the print dropped. Found by rendering
-    the same 46-input set (tight/loose lists, hard and soft breaks, inline code,
-    quotes, rules, raw HTML, GFM constructs) through both pipelines and comparing
-    the canonical DOM, rather than only the agreed-subset cases.
-  - The medium is 1-bit black: no colour, no greys. Images in the markdown are
-    **refused outright** (the whole construct is dropped, alt text included).
-    The supported subset is small: headings, bold, italic and lists. Links are
-    just text on a card — rendered as their text, never an `<a>`, so a
-    `javascript:` href is inert.
+  - The SPA renders it live while typing (`web/src/lib/backText.ts`, `marked` plus
+    DOMPurify against an allowlist of exactly the subset), so the customer can see
+    what they wrote. That pane is the **editing view only**: the print queue
+    carries no HTML any more, and the spooler prints the server's raster.
+  - The server-side renderer is the only thing that decides what prints, and it is
+    still a **stub** — `render::render_back_markdown_stub` reports `failed` with
+    its reason, so a markdown-backed card is visibly not printable rather than
+    coming out with a blank side. A real renderer (an external markdown→image
+    binary such as Markie) lands behind the same signature, which already takes
+    the ribbon's `BackDepth`.
+  - The subset is small: headings, bold, italic and lists. Links are just text on
+    a card, never an `<a>`, so a `javascript:` href is inert; raw HTML is dropped
+    whole, tag and text. Images are **refused outright** — the whole construct is
+    dropped, alt text included — and the editor says so rather than leaving a gap
+    where the artwork was. CommonMark only on both sides: no GFM tables,
+    strikethrough or autolinks.
 
 `name` and `serial_number` stay plain text.
 
@@ -176,39 +168,62 @@ unpaid. Without this, the first declined card becomes a support ticket.
   tax. Fine while the Kleinunternehmer thresholds apply; Stripe Tax (0.45 EUR per
   transaction on the API integration) is the drop-in if that changes.
 
-## Print options per prefix
+## Print options: one ribbon per job, one back per card
 
-Each prefix picks one print mode, and the mode changes everything downstream: the
-price, which inputs the customer gets, how both sides are rendered, and which
-ribbon the spooler needs. Three modes:
+**Done.** Two layers, because they are two different decisions, made by different
+people at different moments:
 
-  - **single-sided** — full-colour front, blank back. The budget option.
-  - **double-sided colour** — full-colour front and back. Expensive: two YMCKO
-    panel sets per card, so it drains stock twice as fast.
-  - **colour front, black back** — full-colour front, black-only back. The
-    economic two-sided option, and what is implemented today via `back_text`.
+  - the **ribbon** is per *job* — `prefixes.ribbon`, `ymcko` or `ymckoko`. It is
+    the one thing that cannot be mixed in a batch, because it is a physical
+    ribbon load;
+  - the **back** is per *card* — `cards.back_source`, one of `none` (a
+    single-sided card), `front` (the front image printed again), `image` (a
+    second uploaded picture) or `markdown` (text).
 
-Availability is a property of the **ribbon**, not of the mode. Two are in stock:
+The ribbon bounds the card's choice, because it fixes the colour depth: YMCKO's
+back is a colour panel set of its own, so it prints any of the four, while
+YMCKOKO's back is the second black panel and can only print `none` or `markdown`.
+A picture back on YMCKOKO is refused by the API with `400`, not silently
+reprinted as something else. Colour depth is therefore never a third thing to
+store — `Ribbon::back_depth()` derives it, and markdown is just another image
+source whose depth the ribbon picks.
 
-  - **YMCKO** — full colour, plus a black panel and overlay.
-  - **YMCKOKO** — YMCKO plus a second black panel for the back.
+Availability is a property of the **ribbon**: two stock flags in `ribbon_stock`
+(YMCKO, YMCKOKO, both seeded in stock), flipped with the operator token via
+`PUT /api/shop/ribbons/{ribbon}`. The shop config serves both flags and each
+ribbon's derived `available`. The customer UI keeps an unavailable ribbon in the
+list and renders it disabled, so it is visibly *out* rather than gone, and the
+checkout refuses it with `409` — the same rule at the layer that takes the money,
+because a flag that only greys out a radio button still sells a card that cannot
+be printed. A prefix already priced for a ribbon that has since run out is
+deliberately **not** reconciled: no reprice, no refund, no notice, it just cannot
+open a new session until the ribbon is back — by-hand work if it ever happens.
 
-and the modes map onto them:
+Pricing is per printed **side** (`ribbon_prices`, one price per ribbon, seeded at
+500 cents each): YMCKO bills one side for a single-sided card and two for a
+double-sided one; YMCKOKO always bills two, because its second black panel is
+spent whether or not the back is printed. The ribbon is snapshotted onto the
+prefix (`paid_ribbon`) when the checkout opens, so the spooler prints what was
+paid for even if the operator changes it later. `PATCH /api/prefixes/{prefix}`
+refuses with `409` a ribbon change that would strand a card — a YMCKOKO prefix
+cannot print a colour back.
 
-  - single-sided → YMCKO
-  - double-sided colour → YMCKO, consuming two panel sets per card
-  - colour front, black back → YMCKOKO
+Rendering is one panel per card (`web/src/lib/CardRow.svelte`), offering the
+sources the ribbon allows and the input each one needs: nothing for `none` and
+`front`, a file input for `image`, the markdown textarea for `markdown`. The
+shared header (name, delete, debounced save) lives in `cards/CardFields.svelte`.
+The 1-bit pane for a markdown back is honest about the medium — paper white, pure
+black, no greys, no theme colours — and the editor *says* an image will not be
+printed rather than leaving a gap where the artwork was. Smoke scenario I covers
+all of it.
 
-So single-sided and double-sided colour go out of stock *together*, while the
-black-back mode is independent. Stock is two flags, not three: a mode is gated on
-its ribbon, availability is not intrinsic to the mode.
-
-Open question, low priority, deliberately not wired up: on YMCKO, single-sided and
-double-sided colour are technically mixable inside one print job, so the mode *could*
-be per card instead of per prefix. Only that pair could ever mix — YMCKOKO cannot
-share a job with them, which is the constraint that matters — and per-card mode
-turns one project price into a per-card sum for little gain. Left at per prefix
-unless there turns out to be a reason otherwise.
+A card with an `image` back and no picture yet is *incomplete*, which is why
+`back_image` is not required at creation: the dropzone uploads fronts one file at
+a time, so requiring both sides in one request would have made double-sided cards
+impossible to upload into. `PUT .../cards/{id}/back-image` sets the back alone
+(and makes that image the card's back), the row and the project page show how many
+cards are still missing their material, and the checkout answers `409` — the same
+layer that refuses an out-of-stock ribbon, and for the same reason.
 
 A half-panel option was considered and is **dropped — do not re-propose it**. Two
 reasons, recorded so the idea does not creep back:
@@ -217,62 +232,13 @@ reasons, recorded so the idea does not creep back:
     this shop needs: half-panel YMC with a full-panel K, optionally plus a
     full-panel K backside. Those exist for ID-card systems where only a photo is
     colour and everything else is black. They cannot produce a full-colour front,
-    which is the one thing every mode here requires.
+    which is the one thing every card here requires.
   - The panel splits **vertically** (along the width), not horizontally as an
     earlier note here assumed. Moot now, but that is what the error was.
 
 Both of those point the same way: confirm the ribbon SKU is buyable before designing
-a mode around it. That is exactly how the half-panel option got in here, and it is
+a card around it. That is exactly how the half-panel option got in here, and it is
 the cheapest mistake to avoid.
-
-What has to change:
-
-  - **Data model.** A `print_mode` on the prefix, defaulting to the black-back mode
-    so existing rows keep their meaning. A *colour* back needs a back image, which
-    does not exist today — a card carries exactly one image plus `back_text`. So
-    either a second image column or an images table keyed by side. The black back
-    stays text-only (`back_text`, markdown), so that mode needs no image path at
-    all. `back_text` means nothing in the other two modes and should be rejected or
-    ignored rather than silently stored.
-  - **Pricing in the database, not the environment.** One `STRIPE_PER_CARD_CENTS`
-    prices every card today. This needs a per-mode price (with currency) that the
-    shop config serves and the checkout sums over the cards' modes — so the mode
-    has to be frozen for the customer exactly when the cards are (see "The
-    customer's write window"), and the spooler must read the mode that was *paid
-    for*, not the current one.
-  - **Availability, per ribbon, visible rather than hidden.** **Done.** Two stock
-    flags in `ribbon_stock` (YMCKO, YMCKOKO, both seeded in stock), flipped with
-    the operator token via `PUT /api/shop/ribbons/{ribbon}`. The shop config
-    serves both flags and each mode's derived `available`, so single-sided and
-    double-sided colour disappear together while black-back is independent. The
-    customer UI keeps the unavailable option in the list and renders it disabled,
-    so double-sided is visibly *out* rather than gone. The checkout refuses an
-    out-of-stock mode with 409 — the same rule at the layer that takes the money,
-    because a flag that only greys out a radio button still sells a card that
-    cannot be printed. A prefix already priced for a mode whose ribbon has since
-    run out is deliberately **not** reconciled: no reprice, no refund, no notice,
-    it just cannot open a new session until the ribbon is back — by-hand work if
-    it ever happens.
-  - **Rendering.** **Done.** One component per mode in `web/src/lib/cards/`
-    (`SingleSidedCard`, `ColorBackCard`, `BlackBackCard`), picked by `CardRow`,
-    with the shared front preview, name, serial, delete and debounced save in
-    `cards/CardFields.svelte`. The inputs follow the mode: no back field at all
-    for single-sided, a file input for a colour back, the markdown textarea for a
-    black back. The black-back pane is 1-bit honest — paper white, pure black,
-    no greys, no theme colours — and since the renderer refuses images outright,
-    the editor *says* an image will not be printed instead of leaving a gap where
-    the artwork was. Smoke scenario I asserts all three, and that the colour row
-    uploads through its own input.
-
-    That needed one API change the uploads forced: `back_image` is no longer
-    **required** at card creation. The dropzone uploads fronts one file at a
-    time, so requiring both sides in one request would have made the colour mode
-    impossible to upload into. A card is instead *incomplete* without its back
-    image, which is tracked as one property (`back_image_content_type IS NULL`)
-    and refused where it matters: `PUT .../cards/{id}/back-image` sets the back
-    alone, the row and the project page show how many cards are still missing
-    one, and the checkout answers `409` — the same layer that refuses a mode
-    whose ribbon is out of stock, and for the same reason.
 
 Rasters: **size to the driver's own internal bitmap**, not to a figure derived from
 the card dimensions and dpi. Overscan is deliberate and wanted — printing past the
@@ -315,11 +281,10 @@ To settle when it is built:
   `LoginLimiter` (5 misses / 15 min → 15 min lockout, in-memory) gates both the
   login endpoint and the bearer path in `auth::resolve`; a locked-out key
   answers 429. Keyed on `X-Forwarded-For`/`X-Real-Ip`.
-- Server-side render of the black-only card back. **Done** —
-  `server/src/backtext.rs` (pulldown-cmark) renders `back_text` into the same
-  sanitised subset the SPA preview shows, and the print queue carries it as
-  `PrintQueueCard.back_html`, per print mode (only `color_front_black_back` has
-  a black back, so it is `None` everywhere else). Rasterising that HTML to the
-  printer's 1-bit K plane is still the spooler's job.
+- Server-side render of the markdown back. **Superseded** — `server/src/backtext.rs`
+  (markdown to sanitised HTML for the print queue) is gone: the spooler prints a
+  raster, not HTML, so the server renders through `server/src/render.rs` and the
+  queue carries no `back_html`. The renderer itself is still the stub described
+  under "Markdown in the back text".
 - Admin sessions live in memory, so a restart logs the operator out. Fine for
   now; move to a table if that becomes annoying.

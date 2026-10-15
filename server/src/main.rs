@@ -1,10 +1,10 @@
 mod auth;
-mod backtext;
 mod db;
 mod error;
 mod models;
 mod notify;
 mod rate_limit;
+mod render;
 mod routes;
 mod stripe;
 
@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Request;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use sqlx::SqlitePool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -109,9 +113,13 @@ impl utoipa::Modify for SecurityAddon {
         routes::post_card,
         routes::get_card,
         routes::get_card_image,
+        routes::get_card_display_image,
+        routes::get_card_display_back,
+        routes::get_card_print_raster,
+        routes::get_card_print_raster_back,
         routes::put_card_back_image,
-                routes::patch_card,
-                routes::delete_card,
+        routes::patch_card,
+        routes::delete_card,
                 routes::get_print_queue,
                 routes::mark_card_printed,
                 routes::admin_login,
@@ -132,6 +140,7 @@ impl utoipa::Modify for SecurityAddon {
                 models::CardIndex,
                 models::CardInput,
                 models::CardPatch,
+                models::BackSource,
                 models::PrintQueue,
                 models::PrintQueueCard,
                 models::AdminLogin,
@@ -139,7 +148,7 @@ impl utoipa::Modify for SecurityAddon {
         models::NeedsAttentionItem,
         models::NeedsAttentionKind,
         models::ShopConfig,
-        models::ModePrice,
+        models::RibbonPrice,
         models::Ribbon,
         models::RibbonStock,
         models::RibbonStockPatch,
@@ -219,7 +228,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Static SPA (Svelte build). Served from disk so the frontend can be
     // rebuilt without recompiling the server. Unknown paths fall back to
-    // index.html for client-side routing.
+    // index.html for client-side routing, and `static_cache_policy` decides what
+    // a browser may keep of it — the defaults are wrong for a store path.
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "server/static".to_string());
     let index_html = PathBuf::from(&static_dir).join("index.html");
     if !index_html.exists() {
@@ -233,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(routes::router(state))
         .fallback_service(ServeDir::new(&static_dir).fallback(ServeFile::new(index_html)))
+        .layer(middleware::from_fn(static_cache_policy))
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = bind.parse()?;
@@ -240,4 +251,63 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// What a browser may keep of the served frontend.
+///
+/// The defaults are wrong here because nothing is served from a working copy.
+/// Every file in a Nix store path carries the *same* mtime, so tower-http's
+/// `Last-Modified` is a constant: a browser that has `index.html` cached
+/// revalidates, is told `304 Not Modified`, and keeps the previous shell — and
+/// with it the previous asset hashes, i.e. the previous UI, however often the
+/// frontend is rebuilt and however often `nix run` is restarted. That is exactly
+/// what "the web UI is not in sync" looks like.
+///
+/// So: the shell and the files beside it are handed out uncacheable, and their
+/// conditional headers are dropped before anything can answer them from a
+/// timestamp that never moves. The content-hashed assets are safe to keep for
+/// good — a rebuilt asset is a new name — and a hashed asset that is *missing* is
+/// a 404 rather than the shell, so a tab holding an old hash fails loudly instead
+/// of running `index.html` as if it were a module.
+async fn static_cache_policy(mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    let asset = path.starts_with("/assets/");
+    // The API answers with what it has just written, and sets its own headers.
+    let api = path.starts_with("/api") || path.starts_with("/swagger-ui");
+
+    if !asset && !api {
+        // Nothing served from here can answer these truthfully.
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+    }
+
+    let mut res = next.run(req).await;
+
+    if asset {
+        // `ServeDir`'s fallback is the shell, which is never what a caller after
+        // an asset wants to be handed.
+        let html = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"));
+        if html || !res.status().is_success() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        // The name carries the hash; the timestamp says nothing.
+        res.headers_mut().remove(header::LAST_MODIFIED);
+        return res;
+    }
+
+    if !api {
+        res.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        res.headers_mut().remove(header::LAST_MODIFIED);
+        res.headers_mut().remove(header::ETAG);
+    }
+    res
 }

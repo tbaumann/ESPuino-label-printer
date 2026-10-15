@@ -59,11 +59,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PrefixCmd {
-    /// Create a prefix, optionally choosing its uuid.
+    /// Create a prefix, optionally choosing its uuid and ribbon.
     Create {
         /// Explicit uuid; omitted = server assigns one.
         #[arg(long)]
         uuid: Option<String>,
+        /// The ribbon this job prints with — the one choice per job, because a
+        /// batch cannot mix ribbon loads (ymcko|ymckoko).
+        #[arg(long, value_name = "RIBBON")]
+        ribbon: Option<String>,
     },
     /// List all prefixes, optionally filtered by status.
     List {
@@ -94,7 +98,8 @@ enum CardCmd {
     Get { prefix: String, id: i64 },
     /// Delete a card and its image.
     Delete { prefix: String, id: i64 },
-    /// Upload or replace a card's colour back image (double_sided_color only).
+    /// Upload or replace a card's back image, which also makes the card's back
+    /// an `image` back. Only a YMCKO job can print a colour back.
     BackImage {
         prefix: String,
         id: i64,
@@ -118,9 +123,13 @@ struct UploadArgs {
     /// Optional serial number.
     #[arg(long)]
     serial_number: Option<String>,
-    /// Optional black-only back text (song list, etc.). Only valid in a
-    /// color_front_black_back prefix; a double_sided_color one takes its back
-    /// as an image (`card back-image`).
+    /// What the card's back is (none|front|image|markdown). Omitted = none, a
+    /// single-sided card; sending a --back-text implies markdown.
+    #[arg(long, value_name = "BACK")]
+    back: Option<String>,
+    /// Back text (markdown: song list, etc.) for a markdown back. Only printed
+    /// on a `markdown` back — an `image` back takes its picture through
+    /// `card back-image` instead.
     #[arg(long)]
     back_text: Option<String>,
 }
@@ -147,7 +156,10 @@ struct BatchArgs {
     /// Zero-padded width of the numeric part of the serial number.
     #[arg(long, default_value_t = 3)]
     serial_width: usize,
-    /// Back-panel text applied to every card.
+    /// What every card's back is (none|front|image|markdown).
+    #[arg(long, value_name = "BACK")]
+    back: Option<String>,
+    /// Back text (markdown) applied to every card.
     #[arg(long)]
     back_text: Option<String>,
     /// Show what would be uploaded without sending anything.
@@ -163,7 +175,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Prefix { cmd } => match cmd {
-            PrefixCmd::Create { uuid } => emit(client.create_prefix(uuid.as_deref()).await?, quiet),
+            PrefixCmd::Create { uuid, ribbon } => emit(
+                client
+                    .create_prefix(uuid.as_deref(), ribbon.as_deref())
+                    .await?,
+                quiet,
+            ),
             PrefixCmd::List { status } => {
                 emit(client.list_prefixes(status.as_deref()).await?, quiet)
             }
@@ -207,6 +224,7 @@ async fn main() -> Result<()> {
                     &a.file,
                     &name,
                     a.serial_number.as_deref(),
+                    a.back.as_deref(),
                     a.back_text.as_deref(),
                     a.id,
                 )
@@ -255,6 +273,7 @@ async fn run_batch(client: &Client, a: BatchArgs, quiet: bool) -> Result<()> {
                 path,
                 &name,
                 serial.as_deref(),
+                a.back.as_deref(),
                 a.back_text.as_deref(),
                 id,
             )

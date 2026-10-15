@@ -128,7 +128,7 @@
       {:else}
         <div class="cards">
           {#each cards as card (card.id)}
-            <CardRow prefix={uuid} {card} mode={prefix.print_mode} writable={false} readonly />
+            <CardRow prefix={uuid} {card} ribbon={prefix.ribbon} writable={false} readonly />
           {/each}
         </div>
       {/if}
