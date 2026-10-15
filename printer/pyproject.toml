@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esplp-print"
+version = "0.1.0"
+description = "Local print spooler for the ESPuino Label Printer (Evolis card printer)"
+requires-python = ">=3.10"
+# The SDK wheel bundles its own per-platform native lib and loads it via
+# ctypes, so it is a real, non-optional runtime dependency here — the spooler's
+# whole job is talking to the printer.
+dependencies = ["Evolis-SDK>=9.4"]
+
+[project.scripts]
+esplp-print = "esplp_print.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["esplp_print*"]
