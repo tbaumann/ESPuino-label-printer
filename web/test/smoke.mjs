@@ -284,7 +284,7 @@ console.log('\nB. project page renders a card')
   // The preview shows the *processed* image the server derived, not the raw
   // upload — one renderer owns what a card looks like.
   check('front preview points at the display-image endpoint',
-    w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-image"]`) !== null)
+    w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-image"]`) !== null)
   check('renders a back preview pane', !!w.document.querySelector('.preview.back'))
   check('the back choice is marked on the card',
     w.document.querySelector('.back-choice.selected strong')?.textContent?.trim() === 'Text')
@@ -456,7 +456,7 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const t2 = w2.document.body.textContent ?? ''
   check('print preview renders the card', !!w2.document.querySelector('.card.preview-only'))
   check('preview shows the front image',
-    !!w2.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-image"]`))
+    !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-image"]`))
   check('preview shows the back text', t2.includes('01 Admin Song'))
   check('preview shows the name as text', t2.includes('Admin Preview Card'))
   check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
@@ -785,12 +785,18 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       !!(await api(`/api/prefixes/${prefix}/cards/1`)).back_image_content_type,
     )
     check('the server stored the back image', stored)
+    const backImgSrc = () =>
+      w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`)
+        ?.getAttribute('src') ?? ''
     check(
       'the uploaded back is previewed',
-      await waitFor(
-        () =>
-          !!w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
-      ),
+      await waitFor(() => !!backImgSrc()),
+      backImgSrc(),
+    )
+    check(
+      'and its URL is versioned, so a re-render is a new URL rather than a cached one',
+      /\?v=/.test(backImgSrc()),
+      backImgSrc(),
     )
     check('the card is no longer reported as incomplete',
       await waitFor(() => !/without a finished back/.test(w.document.body.textContent ?? '')))
@@ -850,6 +856,38 @@ console.log('\nI. one panel, the same back choices on either ribbon')
         !!back.back_image_content_type &&
         (await rasterBits(prefix)) === 24,
       `back=${back.back} bits=${await rasterBits(prefix)}`)
+
+    // The preview has to follow those bytes. A browser keeps whatever URL it was
+    // given, so the row must hand it a new one when the render changes — this is
+    // what repaints the back pane on a ribbon switch instead of leaving the pane
+    // showing the previous depth, which is the bug the version is here for.
+    const wp = await mount(`/p/${prefix}`, { bust: 'i4' })
+    const backSrc = () =>
+      wp.document.querySelector('.preview.back .backart')?.getAttribute('src') ?? ''
+    const beforeSrc = backSrc()
+    check('the back preview URL is versioned against the render', /\?v=/.test(beforeSrc), beforeSrc)
+
+    const blackRadio = [...wp.document.querySelectorAll('.mode input')].find(
+      (i) => i.value === 'ymckoko',
+    )
+    check('the ribbon chooser offers the black-panel ribbon', !!blackRadio)
+    blackRadio.checked = true
+    blackRadio.dispatchEvent(new wp.Event('change', { bubbles: true }))
+    check('switching the ribbon repaints the preview, by URL',
+      await waitFor(() => /\?v=/.test(backSrc()) && backSrc() !== beforeSrc),
+      `${beforeSrc} -> ${backSrc()}`)
+
+    // And the artifact itself can say "still current" instead of being trusted:
+    // every derived artifact carries a validator the browser can revalidate on.
+    const art = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display-back`)
+    const etag = art.headers.get('etag')
+    check('an artifact carries an ETag and must be revalidated',
+      !!etag && art.headers.get('cache-control') === 'no-cache',
+      `${etag} / ${art.headers.get('cache-control')}`)
+    const cond = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display-back`, {
+      headers: { 'if-none-match': etag },
+    })
+    check('a matching If-None-Match answers 304', cond.status === 304, String(cond.status))
   }
 
   // --- a black-panel ribbon: the same choices, rendered in 1 bit ----------
@@ -889,7 +927,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     const wPic = await mount(`/p/${prefix}`, { bust: 'i3b' })
     check('the black-and-white back is previewed in the pane',
       !!wPic.document.querySelector(
-        `img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
+        `img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`),
     )
     check('the pane says the picture prints in black and white',
       /black and white/.test(wPic.document.body.textContent ?? ''),
@@ -967,7 +1005,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       'the dropped picture is previewed in the pane',
       await waitFor(
         () =>
-          !!w.document.querySelector(`img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
+          !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`),
       ),
     )
   }

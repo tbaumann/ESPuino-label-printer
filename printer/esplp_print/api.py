@@ -76,8 +76,10 @@ class Client:
 
     def list_prefixes(self, status: str | None = None) -> list[dict[str, Any]]:
         """List all prefixes (admin). `status` optionally filters by lifecycle
-        status. Each entry carries `ribbon`, `paid_ribbon`, `status` and
-        `unprinted_count`, which is what the batch mode filters on."""
+        status. Each entry carries `ribbon`, `status` and `unprinted_count`,
+        which is what the batch mode filters on: the server prints what `ribbon`
+        says, and there is no second ribbon to consider.
+        """
         path = "/api/prefixes"
         if status:
             path += f"?status={status}"

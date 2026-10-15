@@ -17,14 +17,10 @@ LOG = {"GET": [], "POST": [], "PATCH": []}
 # Prefixes for the batch mode: two ymcko jobs (one paid, one queued), one
 # ymckoko job (should be excluded when filtering ymcko), one draft (excluded).
 PREFIXES = [
-    {"uuid": "A", "status": "paid", "ribbon": "ymcko", "paid_ribbon": None,
-     "unprinted_count": 2},
-    {"uuid": "B", "status": "queued", "ribbon": "ymcko", "paid_ribbon": None,
-     "unprinted_count": 1},
-    {"uuid": "C", "status": "paid", "ribbon": "ymckoko", "paid_ribbon": None,
-     "unprinted_count": 3},
-    {"uuid": "D", "status": "draft", "ribbon": "ymcko", "paid_ribbon": None,
-     "unprinted_count": 0},
+    {"uuid": "A", "status": "paid", "ribbon": "ymcko", "unprinted_count": 2},
+    {"uuid": "B", "status": "queued", "ribbon": "ymcko", "unprinted_count": 1},
+    {"uuid": "C", "status": "paid", "ribbon": "ymckoko", "unprinted_count": 3},
+    {"uuid": "D", "status": "draft", "ribbon": "ymcko", "unprinted_count": 0},
 ]
 QUEUE = {
     "prefix": "P",
@@ -162,13 +158,13 @@ prefixes = c.list_prefixes()
 check("list_prefixes returns all", len(prefixes) == 4)
 jobs = [
     p for p in prefixes
-    if mm._effective_ribbon(p) == "ymcko" and p.get("status") in mm.PRINTABLE_STATUSES
+    if mm._ribbon(p) == "ymcko" and p.get("status") in mm.PRINTABLE_STATUSES
 ]
 check("batch ymcko picks A,B (not C ymckoko, not D draft)",
       [p["uuid"] for p in jobs] == ["A", "B"])
 jobs_ck = [
     p for p in prefixes
-    if mm._effective_ribbon(p) == "ymckoko" and p.get("status") in mm.PRINTABLE_STATUSES
+    if mm._ribbon(p) == "ymckoko" and p.get("status") in mm.PRINTABLE_STATUSES
 ]
 check("batch ymckoko picks C", [p["uuid"] for p in jobs_ck] == ["C"])
 

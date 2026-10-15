@@ -26,7 +26,6 @@ export interface Prefix {
   status: PrefixStatus
   status_changed_at: string | null
   ribbon: Ribbon
-  paid_ribbon?: Ribbon | null
   order_ref: string | null
   card_count: number
 }
@@ -351,13 +350,26 @@ export const api = {
   cardImageUrl: (p: string, id: number): string =>
       `/api/prefixes/${p}/cards/${id}/image`,
 
-    /** The processed front display image (normalized PNG) the UI shows. */
-    cardDisplayUrl: (p: string, id: number): string =>
-      `/api/prefixes/${p}/cards/${id}/display-image`,
+    /**
+     * The processed front display image (normalized PNG) the UI shows.
+     *
+     * Pass a `version` (the card's `updated_at`) so a re-uploaded front is a new
+     * URL rather than the one the browser already has cached.
+     */
+    cardDisplayUrl: (p: string, id: number, version?: string): string =>
+      `/api/prefixes/${p}/cards/${id}/display-image${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
-    /** The processed back display image (colour or rendered black back). */
-    cardDisplayBackUrl: (p: string, id: number): string =>
-      `/api/prefixes/${p}/cards/${id}/display-back`,
+    /**
+     * The processed back display image: the picture on a colour back, the
+     * black-and-white reduction of it on a black-panel ribbon.
+     *
+     * Pass a `version` — the card's `updated_at` *and* the prefix's ribbon, because
+     * the back is re-rendered when either changes and `updated_at` has
+     * second-granularity, so two renders in the same second would otherwise share
+     * a URL and leave the browser showing the other one.
+     */
+    cardDisplayBackUrl: (p: string, id: number, version?: string): string =>
+      `/api/prefixes/${p}/cards/${id}/display-back${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
   /**
    * The card's uploaded back image (an `image` back only).

@@ -602,6 +602,52 @@ if EMAILS_ON:
         f"recorded {len(recorded_emails())} in {MOCK_RESEND_OUT}",
     )
 
+# --- 5c. a paid order's ribbon is a production decision ---------------------
+# Nothing is pinned at payment: the charge was settled when the session opened,
+# and which load goes in the printer afterwards is the prefix's `ribbon`. Moving
+# it re-renders the backs, and the queue the spooler reads follows it, so the
+# depth it advertises and the raster it is handed cannot disagree.
+print("\n5c. the ribbon of a paid order")
+ops_token = os.environ.get("ADMIN_TOKEN")
+if not ops_token:
+    print("  note no ADMIN_TOKEN set, so the paid-ribbon checks are skipped")
+    print(
+        "       (start the server with ADMIN_TOKEN=secret and export the same "
+        "value to cover them)"
+    )
+else:
+    ops = {"authorization": f"Bearer {ops_token}"}
+    queue = json_request("GET", f"/api/prefixes/{prefix}/print-queue", headers=ops)[1]
+    check(
+        "the paid order prints on the ribbon it was created with — ymckoko",
+        queue.get("ribbon") == "ymckoko",
+        str(queue.get("ribbon")),
+    )
+    check(
+        "so the queue says its backs are the black ones",
+        queue["cards"][0].get("back") == "black",
+        str(queue["cards"][0].get("back")),
+    )
+    status, _ = json_request(
+        "PATCH", f"/api/prefixes/{prefix}", {"ribbon": "ymcko"}, headers=ops
+    )
+    check("an operator can move a paid order to the other ribbon", status == 200, str(status))
+    queue = json_request("GET", f"/api/prefixes/{prefix}/print-queue", headers=ops)[1]
+    check(
+        "the queue follows the new ribbon — ymcko",
+        queue.get("ribbon") == "ymcko",
+        str(queue.get("ribbon")),
+    )
+    check(
+        "and reports colour backs now, not black",
+        queue["cards"][0].get("back") == "color",
+        str(queue["cards"][0].get("back")),
+    )
+    check(
+        "the prefix's stored ribbon is the one that prints",
+        json_request("GET", f"/api/prefixes/{prefix}", headers=ops)[1].get("ribbon") == "ymcko",
+    )
+
 # --- 6. events that must be handled or ignored safely -----------------------
 print("\n6. events we ignore")
 status, _ = deliver(payment_event(prefix=prefix, payment_status="unpaid"))

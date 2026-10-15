@@ -199,6 +199,16 @@ exception is a markdown back's pane, which lays `back_text` out client-side for
 editing; what the spooler prints is the server's raster either way, so no
 preview is the source of truth for print.
 
+A derived artifact's *path* never changes while its *bytes* can (a re-upload, a
+back-source change, a ribbon switch that moves the back between colour and
+1-bit), so it is served with an `ETag` and `Cache-Control: no-cache`: a stale
+copy is revalidated — `304` when it is still current — rather than reused blind.
+The SPA additionally versions the URL it puts in an `<img>` (off the card's
+`updated_at`, plus the ribbon for a back), because a browser given the same URL
+twice will not ask again at all: that version is what repaints a back pane after
+a ribbon switch. The print rasters carry the same validators; the spooler
+fetches them fresh and ignores both.
+
 ### Admin UI (`/admin`)
 
 The same SPA on an operator route. `/admin` asks for the token, trades it for
@@ -331,6 +341,7 @@ Stripe signs them:
 python3 scripts/mock_stripe.py 12111 &
 python3 scripts/mock_resend.py 12112 &
 DATA_DIR=/tmp/esplp-stripe STRIPE_SECRET_KEY=sk_test_x \
+  ADMIN_TOKEN=secret \
   STRIPE_WEBHOOK_SECRET=whsec_test_secret STRIPE_API_BASE=http://127.0.0.1:12111 \
   PUBLIC_BASE_URL=http://127.0.0.1:8080 \
   STRIPE_SHIPPING_CENTS=250 \
@@ -392,6 +403,7 @@ that a *replayed* webhook delivery sends no second email.
 | `DATABASE_URL` | `sqlite://$DATA_DIR/cards.db`  | sqlx SQLite URL                      |
 | `RUST_LOG`     | `info,tower_http=info`         | tracing filter                       |
 | `STATIC_DIR`   | `server/static`                | built SPA to serve at `/`            |
+| `PRINT_RASTER_WIDTH` / `PRINT_RASTER_HEIGHT` | `2032` / `1296` | the printer's internal bitmap, in pixels — read once at startup, and what every print raster and back preview is rendered at (600-dpi Primacy default; overscan past the card outline is deliberate) |
 | `ADMIN_TOKEN`  | *(unset)*                      | operator bearer token; unset switches the admin API off |
 | `SESSION_COOKIE_SECURE` | *(unset)*             | force the `Secure` flag on the admin session cookie; unset = infer from `X-Forwarded-Proto` |
 | `STRIPE_SECRET_KEY` | *(unset)*                 | Stripe API key; unset switches checkout and the webhook off (`503`) |
@@ -430,16 +442,22 @@ data/
   `PATCH /api/prefixes/{prefix}` while the prefix is still writable. The switch
   is always lossless: no card is tied to the ribbon except in how it is
   rendered, so the route re-renders the prefix's derived artifacts from the
-  stored originals and nothing else changes.
+  stored originals and nothing else changes. It re-renders *every* back side in
+  the new depth — colour to black and back — and the print queue reports the new
+  ribbon on the next read, because there is one ribbon and this is it. Paying
+  does not pin it: the charge is taken and recorded when the checkout opens, and
+  which load goes in the printer afterwards is a production decision, not a
+  repricing.
 - **Pricing** — one price per ribbon in the database (`ribbon_prices`, seeded at
   500 cents each), not the environment, and the *unit* that price is for differs
   per ribbon (`unit` in the shop config, `Ribbon::billing_unit`): YMCKO prices a
   printed *side* (one for a single-sided card, two for a double-sided one),
   YMCKOKO prices a whole *card* whatever its back is, because its panel set is
   spent whether or not the second black panel is used. `Ribbon::billed_units`
-  applies the rule at the checkout. When a checkout opens, the ribbon is
-  snapshotted onto the prefix (`paid_ribbon`), so the spooler prints what the
-  customer paid for even if the operator later changes it.
+  applies the rule at the checkout. The charge is settled there, when the
+  checkout session opens; what a job is later produced on is the prefix's
+  `ribbon` and nothing else, so an operator changing it is making a production
+  decision, not a repricing.
 - **Ribbon availability** — two stock flags in the database (`ribbon_stock`,
   `ymcko` and `ymckoko`, both seeded in stock), flipped through
   `PUT /api/shop/ribbons/{ribbon}`. The shop config serves both flags and, per

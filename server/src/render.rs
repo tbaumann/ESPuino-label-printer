@@ -46,6 +46,7 @@ pub const DISPLAY_WIDTH: u32 = 856;
 pub const DISPLAY_HEIGHT: u32 = 540;
 
 /// Printer raster size, from config or the 600-dpi Primacy default.
+#[derive(Debug, Clone, Copy)]
 pub struct RasterSize {
     pub width: u32,
     pub height: u32,

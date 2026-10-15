@@ -34,6 +34,11 @@ const CHECKOUT_WINDOW: Duration = Duration::from_secs(60);
 pub struct AppState {
     pub pool: SqlitePool,
     pub data_dir: Arc<PathBuf>,
+    /// The printer's internal bitmap, read from `PRINT_RASTER_WIDTH`/`HEIGHT` at
+    /// startup. Config, resolved once — not a per-render environment lookup, so a
+    /// test (or a future per-printer setting) can hand the renderer a size
+    /// without the process environment standing in for a parameter.
+    pub raster: render::RasterSize,
     /// Bearer token granting operator rights. `None` disables the admin API.
     pub admin_token: Option<Arc<str>>,
     /// Live admin UI logins (the session cookie), persisted in the database.
@@ -219,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool: pool.clone(),
         data_dir: Arc::new(data_dir),
+        raster: render::RasterSize::from_env(),
         admin_token,
         sessions: auth::Sessions::new(pool),
         login_limiter: auth::LoginLimiter::default(),

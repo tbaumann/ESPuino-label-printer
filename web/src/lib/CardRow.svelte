@@ -208,7 +208,7 @@
   <div class="image-row">
     <div class="side">
       <div class="preview">
-        <img src={api.cardDisplayUrl(prefix, card.id)} alt={`front of ${card.name}`} />
+        <img src={api.cardDisplayUrl(prefix, card.id, card.updated_at)} alt={`front of ${card.name}`} />
       </div>
       <div class="caption muted">front · full colour</div>
     </div>
@@ -237,7 +237,7 @@
               {#if hasBackImage}
                 <img
                   class="backart"
-                  src={api.cardDisplayBackUrl(prefix, card.id)}
+                  src={api.cardDisplayBackUrl(prefix, card.id, `${card.updated_at}-${ribbon}`)}
                   alt={`back of ${card.name}`}
                 />
               {:else}
@@ -254,7 +254,7 @@
                    artwork. -->
               <img
                 class="backart"
-                src={api.cardDisplayUrl(prefix, card.id)}
+                src={api.cardDisplayUrl(prefix, card.id, card.updated_at)}
                 alt={`back of ${card.name}, the same as its front`}
               />
             {/if}

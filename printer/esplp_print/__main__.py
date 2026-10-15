@@ -105,11 +105,14 @@ def _is_printed(card: dict[str, Any]) -> bool:
     return card.get("printed_at") is not None
 
 
-def _effective_ribbon(prefix: dict[str, Any]) -> str | None:
-    """The ribbon a prefix is actually printed with: the one that was paid for
-    (`paid_ribbon`), falling back to the prefix's current ribbon. Mirrors the
-    server's print-queue logic."""
-    return prefix.get("paid_ribbon") or prefix.get("ribbon")
+def _ribbon(prefix: dict[str, Any]) -> str | None:
+    """The ribbon a prefix prints with: its own `ribbon`.
+
+    The server's queue prints (and renders) from this same field, so the batch
+    filter must read it too or a job would be picked up that is not meant for the
+    loaded ribbon.
+    """
+    return prefix.get("ribbon")
 
 
 def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
@@ -269,7 +272,7 @@ def run_batch(client: Client, args: argparse.Namespace) -> int:
     jobs = [
         p
         for p in prefixes
-        if _effective_ribbon(p) == ribbon
+        if _ribbon(p) == ribbon
         and p.get("status") in PRINTABLE_STATUSES
     ]
     if not jobs:

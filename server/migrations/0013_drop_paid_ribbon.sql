@@ -1,0 +1,12 @@
+-- `paid_ribbon` was the ribbon a charge was computed from, snapshotted at
+-- checkout so the spooler would print "what the customer paid for" even if the
+-- operator changed the prefix's ribbon afterwards.
+--
+-- It was a second source of truth for a fact the prefix already carries, and it
+-- was invisible: nothing in the UI showed it, and the only way to change a paid
+-- prefix's ribbon was a hand-rolled API call. What it bought was an override
+-- that made the print queue advertise one colour depth while the renderer
+-- produced the other. Which load goes in the printer is a production decision
+-- (the prefix's `ribbon`, which re-renders the back sides when it changes); the
+-- money was settled when the checkout opened, and its record lives in Stripe.
+ALTER TABLE prefixes DROP COLUMN paid_ribbon;

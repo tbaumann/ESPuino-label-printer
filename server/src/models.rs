@@ -254,14 +254,9 @@ pub struct Prefix {
     pub status_changed_at: Option<String>,
     /// The ribbon this order is printed with — the one choice that has to be
     /// made per job, because a batch cannot mix ribbon loads. Defaults to
-    /// `ymckoko`.
+    /// `ymckoko`. Changing it re-renders the cards' back sides; it is the only
+    /// thing that decides what the printer is fed.
     pub ribbon: Ribbon,
-    /// The ribbon that was actually charged, snapshotted when the checkout
-    /// session was created. The spooler prints this, not `ribbon`, so an
-    /// operator changing the ribbon after payment cannot change what gets
-    /// printed. `None` for prefixes never priced through checkout.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paid_ribbon: Option<Ribbon>,
     /// External shop/order reference, typically set when the order is paid.
     pub order_ref: Option<String>,
     /// Number of cards currently stored under this prefix.
@@ -388,9 +383,10 @@ pub struct PrintQueueCard {
 pub struct PrintQueue {
     pub prefix: Uuid,
     pub status: PrefixStatus,
-    /// The ribbon the spooler must print with: the one that was paid for
-    /// (`paid_ribbon`), falling back to the prefix's current ribbon for
-    /// prefixes never priced through checkout.
+    /// The ribbon the spooler must print with: the prefix's own `ribbon`. Not a
+    /// snapshot of what was charged — a ribbon change is a production decision
+    /// (which load goes in the printer, and therefore the colour depth of every
+    /// back), so the queue and the renderer follow it.
     pub ribbon: Ribbon,
     pub cards: Vec<PrintQueueCard>,
     pub unprinted_count: i64,

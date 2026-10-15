@@ -290,11 +290,16 @@ async fn rerender_card(
     id: i64,
 ) -> Result<crate::models::Card, ApiError> {
     use crate::models::RenderStatus;
-    use crate::render::{RenderResult, RasterSize};
+    use crate::render::RenderResult;
 
+    // The prefix's ribbon decides the depth every back side is rendered in. It
+    // is the same ribbon the print queue advertises to the spooler — the queue's
+    // `back` is what tells the spooler whether to call `set_image_buffer` or
+    // `set_black_buffer`, so a renderer that disagreed would hand a 24-bit
+    // raster to the black-buffer call.
     let ribbon = db::get_prefix(&st.pool, prefix).await?.ribbon;
     let card = db::get_card(&st.pool, prefix, id).await?;
-    let raster = RasterSize::from_env();
+    let raster = st.raster;
 
     // Read a card's original blob (front or back image) from disk. A missing
     // file is the one case where the whole render must not fail: it is how a
@@ -682,8 +687,20 @@ pub async fn get_card_back_image(
 ///
 /// `status` is the card's render status for this artifact; `rel` is the blob
 /// path (only read when `ready`).
+///
+/// Every ready artifact carries an `ETag` (a hash of the bytes) and
+/// `Cache-Control: no-cache`, and a request that presents a matching
+/// `If-None-Match` gets a `304` instead. The URL of an artifact never changes —
+/// it is `/cards/{id}/display-back`, not a versioned path — but its *content*
+/// does, whenever the card is re-rendered: a re-upload, a back-source change, or
+/// a ribbon switch that moves the back between colour and 1-bit. Without a
+/// validator a browser is free to keep showing the old picture after any of
+/// those, which is exactly the bug this prevents; with one, a stale copy is
+/// revalidated (cheaply) instead of trusted. Clients that want a hard guarantee
+/// can version the URL themselves — the SPA does, off the card's `updated_at`.
 fn serve_artifact(
     st: &AppState,
+    req: &HeaderMap,
     status: Option<crate::models::RenderStatus>,
     rel: &str,
     content_type: &'static str,
@@ -702,16 +719,46 @@ fn serve_artifact(
         Some(RenderStatus::Ready) => {
             let bytes = std::fs::read(st.data_dir.join(rel))
                 .map_err(|_| ApiError::NotFound(format!("artifact {rel} missing from disk")))?;
+            let etag = artifact_etag(&bytes);
+            if req
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(',').any(|tag| {
+                        let tag = tag.trim();
+                        tag == etag || tag.trim_start_matches("W/") == etag
+                    })
+                })
+            {
+                return Ok((
+                    StatusCode::NOT_MODIFIED,
+                    [(header::ETAG, etag)],
+                )
+                    .into_response());
+            }
             Ok((
                 [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    (header::CONTENT_TYPE, content_type.to_string()),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    // Revalidate before reuse: the bytes for this path can
+                    // change without the path changing.
+                    (header::CACHE_CONTROL, "no-cache".to_string()),
+                    (header::ETAG, etag),
                 ],
                 bytes,
             )
                 .into_response())
         }
     }
+}
+
+/// A cheap, strong-enough validator for one derived artifact: its length plus a
+/// hash of its bytes. Two renders that produce the same picture share it, which
+/// is the point — a re-render with unchanged output costs a `304`.
+fn artifact_etag(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    format!("\"{:x}-{}\"", digest, bytes.len())
 }
 
 /// Fetch a card's front display image (the normalized PNG the frontend shows).
@@ -725,12 +772,14 @@ fn serve_artifact(
     ))]
 pub async fn get_card_display_image(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     serve_artifact(
         &st,
+        &headers,
         Some(card.display_front),
         &format!("blobs/{prefix}/{id}-front-display.png"),
         "image/png",
@@ -748,12 +797,14 @@ pub async fn get_card_display_image(
     ))]
 pub async fn get_card_display_back(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     serve_artifact(
         &st,
+        &headers,
         card.display_back,
         &format!("blobs/{prefix}/{id}-back-display.png"),
         "image/png",
@@ -772,12 +823,14 @@ pub async fn get_card_display_back(
     ))]
 pub async fn get_card_print_raster(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     serve_artifact(
         &st,
+        &headers,
         Some(card.print_front),
         &format!("blobs/{prefix}/{id}-front-print.bmp"),
         "image/bmp",
@@ -795,12 +848,14 @@ pub async fn get_card_print_raster(
     ))]
 pub async fn get_card_print_raster_back(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let card = db::get_card(&st.pool, prefix, id).await?;
     serve_artifact(
         &st,
+        &headers,
         card.print_back,
         &format!("blobs/{prefix}/{id}-back-print.bmp"),
         "image/bmp",
@@ -900,14 +955,12 @@ pub async fn put_card_back_image(
 /// Change a prefix's ribbon while it is still writable.
 ///
 /// Always allowed, and always lossless: nothing about a card is tied to the
-/// ribbon except *how it is rendered*, so the switch cannot strand a card. What
-/// it does change is the colour depth of every back side, so the prefix's
-/// derived artifacts are re-rendered from the stored originals — the back
-/// previews repaint in the new depth, and the print rasters are regenerated in
-/// the new format. The card data itself is untouched, and no original blob is
-/// rewritten.
-///
-/// Re-applying the current ribbon is a no-op: no re-render, no write.
+/// ribbon except *how it is rendered*, so the switch cannot strand a card. Every
+/// back side is then re-rendered in the new depth — colour to black and back —
+/// and the print queue reports the new ribbon on the next read, because there is
+/// one ribbon and this is it. Whether the prefix has been paid for is irrelevant:
+/// the charge is already taken and recorded, and which load goes in the printer
+/// is a production decision, not a repricing.
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body = PrefixRibbonPatch,
@@ -931,8 +984,9 @@ pub async fn patch_prefix_ribbon(
         return Ok(Json(current)); // idempotent: nothing to render or write
     }
     let updated = db::set_prefix_ribbon(&st.pool, prefix, input.ribbon).await?;
-    // The rasters (and the depth-accurate back previews) are derived from the
-    // stored originals, so switching ribbon is a re-render, not a data change.
+    // Every derived artifact comes from the stored originals, so this is a
+    // re-render, never a data change: the cards keep their bytes and get a new
+    // colour depth.
     for card in db::list_cards(&st.pool, prefix).await? {
         rerender_card(&st, prefix, card.id).await?;
     }
@@ -1566,12 +1620,6 @@ pub async fn create_checkout(
         db::set_status(&st.pool, prefix, PrefixStatus::PaymentPending, None, false).await?;
     }
 
-    // Freeze the ribbon this order is being charged for, so the spooler prints
-    // what the customer paid for even if the operator changes it later. Done
-    // alongside the status flip, before the session opens, so the frozen ribbon
-    // always matches the price locked into the session.
-    db::set_paid_ribbon(&st.pool, prefix, p.ribbon).await?;
-
     let base = public_base_url(&st, &headers);
     let session = match stripe
         .create_checkout_session(prefix, units, price_cents, p.ribbon.billing_unit(), &base)
@@ -1746,9 +1794,9 @@ async fn record_payment(
                         card_count: updated.card_count,
                         amount_cents: session.amount_total,
                         currency: session.currency.clone(),
-                        // The ribbon that was charged, which is what the
-                        // spooler will print.
-                        ribbon: updated.paid_ribbon.or(Some(updated.ribbon)),
+                        // The ribbon this order prints with: the prefix's own,
+                        // which is what the printer is fed.
+                        ribbon: Some(updated.ribbon),
                         customer_email: session.payer_email().map(str::to_string),
                         customer_name: session.payer_name().map(str::to_string),
                     },
@@ -2348,10 +2396,19 @@ mod tests {
         assert!(anomaly_kinds(&pool).await.is_empty());
     }
 
+    /// The printer bitmap the tests render at. Small on purpose: the default is
+    /// the 600-dpi 2032x1296, and an unoptimised resize to that per card is what
+    /// makes the suite slow, not what it is testing.
+    const TEST_RASTER: crate::render::RasterSize = crate::render::RasterSize {
+        width: 400,
+        height: 256,
+    };
+
     fn state_with(limiter: rate_limit::RateLimiter, pool: SqlitePool) -> AppState {
         AppState {
             pool: pool.clone(),
             data_dir: Arc::new(PathBuf::new()),
+            raster: TEST_RASTER,
             admin_token: None,
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
@@ -2879,6 +2936,7 @@ mod tests {
                 let st = AppState {
                     pool: pool.clone(),
                     data_dir: Arc::new(dir.clone()),
+                    raster: TEST_RASTER,
                     admin_token: None,
                     sessions: crate::auth::Sessions::new(pool.clone()),
                     cookie_secure: None,
@@ -2903,21 +2961,163 @@ mod tests {
                 assert_eq!(raster[28], 24);
 
                 // The endpoints serve them with the right status semantics.
-                let resp = get_card_display_image(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                let resp = get_card_display_image(
+                    State(st.clone()),
+                    HeaderMap::new(),
+                    Path((p.uuid.to_string(), 1)),
+                )
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), axum::http::StatusCode::OK);
-                let resp = get_card_print_raster(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                let resp = get_card_print_raster(
+                    State(st.clone()),
+                    HeaderMap::new(),
+                    Path((p.uuid.to_string(), 1)),
+                )
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), axum::http::StatusCode::OK);
                 // A back side that does not exist is a 404.
-                let err = get_card_display_back(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                let err = get_card_display_back(
+                    State(st.clone()),
+                    HeaderMap::new(),
+                    Path((p.uuid.to_string(), 1)),
+                )
                     .await
                     .unwrap_err();
                 assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
 
                 let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A prefix with one picture-backed card, rendered, on a real temp data dir.
+            /// Returns the state, the prefix and the temporary directory (so the caller
+            /// can read the blobs it wrote).
+            async fn rendered_picture_back(ribbon: Ribbon) -> (AppState, Uuid, PathBuf) {
+                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let pool = test_pool().await;
+                let p = db::create_prefix(&pool, None, Some(ribbon)).await.unwrap();
+
+                let write_png = |name: &str, w: u32, h: u32, v: u8| {
+                    let img = image::RgbImage::from_pixel(w, h, image::Rgb([v, v, v]));
+                    let mut out = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgb8(img)
+                        .write_to(&mut out, image::ImageFormat::Png)
+                        .unwrap();
+                    let rel = format!("blobs/{}/{name}", p.uuid);
+                    let abs = dir.join(&rel);
+                    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                    std::fs::write(&abs, out.into_inner()).unwrap();
+                    rel
+                };
+                let front = write_png("1.png", 200, 126, 200);
+                let back = write_png("1-back.png", 100, 100, 16);
+
+                db::upsert_card(
+                    &pool,
+                    p.uuid,
+                    1,
+                    "picture back",
+                    None,
+                    BackSource::Image,
+                    None,
+                    &front,
+                    "image/png",
+                    Some(&back),
+                    Some("image/png"),
+                )
+                .await
+                .unwrap();
+                let st = AppState {
+                    pool: pool.clone(),
+                    data_dir: Arc::new(dir.clone()),
+                    raster: TEST_RASTER,
+                    admin_token: None,
+                    sessions: crate::auth::Sessions::new(pool.clone()),
+                    cookie_secure: None,
+                    stripe: None,
+                    notifier: None,
+                    login_limiter: crate::auth::LoginLimiter::default(),
+                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+                };
+                (st, p.uuid, dir)
+            }
+
+            /// The bit depth of a rendered back raster on disk.
+            fn back_raster_bits(dir: &PathBuf, prefix: Uuid) -> u16 {
+                let raw = std::fs::read(dir.join(format!("blobs/{prefix}/1-back-print.bmp"))).unwrap();
+                assert_eq!(&raw[0..2], b"BM");
+                u16::from_le_bytes([raw[28], raw[29]])
+            }
+
+            /// One ribbon, and the renderer and the print queue both read it. The
+            /// queue's `back` is what decides whether the spooler calls
+            /// `set_image_buffer` or `set_black_buffer`, so a raster rendered at the
+            /// other depth would be fed to the wrong call — and a *paid* prefix is no
+            /// exception: the charge is history, the ribbon is a production decision.
+            #[tokio::test]
+            async fn the_back_raster_follows_the_prefix_s_ribbon_after_a_switch() {
+                let (st, prefix, dir) = rendered_picture_back(Ribbon::Ymcko).await;
+                rerender_card(&st, prefix, 1).await.unwrap();
+                assert_eq!(back_raster_bits(&dir, prefix), 24, "a colour back");
+                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+                assert_eq!(queue.ribbon, Ribbon::Ymcko);
+
+                // A ribbon switch: the rasters are re-rendered, and the queue reports
+                // the same thing the raster is.
+                let updated = db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymckoko)
+                    .await
+                    .unwrap();
+                assert_eq!(updated.ribbon, Ribbon::Ymckoko);
+                rerender_card(&st, prefix, 1).await.unwrap();
+                assert_eq!(back_raster_bits(&dir, prefix), 1, "re-rendered in 1 bit");
+                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+                assert_eq!(queue.ribbon, Ribbon::Ymckoko);
+                assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Black);
+
+                // And back again, so the depth is a function of `ribbon` and nothing
+                // else.
+                db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymcko).await.unwrap();
+                rerender_card(&st, prefix, 1).await.unwrap();
+                assert_eq!(back_raster_bits(&dir, prefix), 24);
+                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+                assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Color);
+            }
+
+            /// An artifact's path never changes but its bytes do, so it has to carry a
+            /// validator: a browser that keeps the old URL must be able to be told
+            /// "still current" or "here is the new one" rather than trusting its copy.
+            #[tokio::test]
+            async fn artifacts_carry_an_etag_and_answer_if_none_match() {
+                let (st, prefix, _dir) = rendered_picture_back(Ribbon::Ymcko).await;
+                rerender_card(&st, prefix, 1).await.unwrap();
+                let (p, id) = (prefix.to_string(), 1i64);
+
+                let res = get_card_display_image(State(st.clone()), HeaderMap::new(), Path((p.clone(), id)))
+                    .await
+                    .expect("the front display image");
+                assert_eq!(res.status(), StatusCode::OK);
+                let etag = res
+                    .headers()
+                    .get(header::ETAG)
+                    .expect("an ETag")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                assert_eq!(
+                    res.headers().get(header::CACHE_CONTROL).unwrap(),
+                    "no-cache",
+                    "a cached copy must be revalidated, not reused blind"
+                );
+
+                // The same validator comes back as a 304 with no body.
+                let mut req = HeaderMap::new();
+                req.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+                let res = get_card_display_image(State(st), req, Path((p, id)))
+                    .await
+                    .expect("the conditional request");
+                assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
             }
 
             #[tokio::test]
@@ -2959,6 +3159,7 @@ mod tests {
                 let st = AppState {
                     pool: pool.clone(),
                     data_dir: Arc::new(dir.clone()),
+                    raster: TEST_RASTER,
                     admin_token: None,
                     sessions: crate::auth::Sessions::new(pool.clone()),
                     cookie_secure: None,
@@ -2977,7 +3178,11 @@ mod tests {
                 assert_eq!(card.print_back, Some(RenderStatus::Failed));
 
                 // The failed back raster answers 500, not a blank 200.
-                let err = get_card_print_raster_back(State(st.clone()), Path((p.uuid.to_string(), 1)))
+                let err = get_card_print_raster_back(
+                    State(st.clone()),
+                    HeaderMap::new(),
+                    Path((p.uuid.to_string(), 1)),
+                )
                     .await
                     .unwrap_err();
                 assert!(matches!(err, ApiError::Internal(_)), "{err:?}");

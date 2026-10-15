@@ -37,7 +37,7 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.ribbon, p.paid_ribbon,
+        p.order_ref, p.ribbon,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count
  FROM prefixes p";
 
@@ -45,7 +45,7 @@ const PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_cha
 /// the print queue UI can tell a `printing` prefix that is a resume (still has
 /// unprinted cards) from one that is done.
 const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.status_changed_at,
-        p.order_ref, p.ribbon, p.paid_ribbon,
+        p.order_ref, p.ribbon,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid) AS card_count,
         (SELECT COUNT(*) FROM cards c WHERE c.prefix_uuid = p.uuid AND c.printed_at IS NULL)
             AS unprinted_count
@@ -58,14 +58,6 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let ribbon_raw: String = row.get("ribbon");
     let ribbon = Ribbon::parse(&ribbon_raw)
         .ok_or_else(|| ApiError::Internal(format!("unknown prefix ribbon '{ribbon_raw}'")))?;
-    let paid_raw: Option<String> = row.get("paid_ribbon");
-    let paid_ribbon = match paid_raw.as_deref() {
-        None => None,
-        Some(s) => Some(
-            Ribbon::parse(s)
-                .ok_or_else(|| ApiError::Internal(format!("unknown prefix paid_ribbon '{s}'")))?,
-        ),
-    };
     Ok(Prefix {
         uuid: Uuid::parse_str(row.get::<String, _>("uuid").as_str())
             .map_err(|e| ApiError::Internal(e.to_string()))?,
@@ -73,7 +65,6 @@ fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
         status,
         status_changed_at: row.get("status_changed_at"),
         ribbon,
-        paid_ribbon,
         order_ref: row.get("order_ref"),
         card_count: row.get("card_count"),
         // The public view never carries operator-only print state.
@@ -267,21 +258,6 @@ pub async fn set_ribbon_price(
         unit: ribbon.billing_unit().to_string(),
         available: ribbon_in_stock(pool, ribbon).await?,
     })
-}
-
-/// Freeze the ribbon a prefix was charged for, so the spooler prints what the
-/// customer paid for even if the operator later changes the prefix's ribbon.
-pub async fn set_paid_ribbon(
-    pool: &SqlitePool,
-    uuid: Uuid,
-    ribbon: Ribbon,
-) -> Result<(), ApiError> {
-    sqlx::query("UPDATE prefixes SET paid_ribbon = ?2 WHERE uuid = ?1")
-        .bind(uuid.to_string())
-        .bind(ribbon.as_str())
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 /// Create a prefix at a customer-chosen uuid, or return the existing one if it
@@ -855,11 +831,10 @@ pub async fn mark_card_printed(pool: &SqlitePool, prefix: Uuid, id: i64) -> Resu
 /// half-finished order that can be picked up where it left off.
 pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, ApiError> {
     let p = get_prefix(pool, prefix).await?;
-    // The spooler prints the ribbon that was paid for, not the prefix's current
-    // one — an operator changing it after payment must not change what gets
-    // printed. Prefixes never priced through checkout fall back to the current
-    // ribbon.
-    let ribbon = p.paid_ribbon.unwrap_or(p.ribbon);
+    // The prefix's own ribbon decides what prints — which load goes in the
+    // printer, and therefore the colour depth of every back. There is exactly
+    // one source for it, and the renderer reads the same one.
+    let ribbon = p.ribbon;
     let rows = sqlx::query(
         "SELECT id, name, printed_at, back_source, back_text, back_image_content_type,
                 front_raster_status, back_raster_status
@@ -1292,7 +1267,6 @@ mod tests {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
         assert_eq!(p.ribbon, Ribbon::Ymckoko);
-        assert_eq!(p.paid_ribbon, None);
     }
 
     #[tokio::test]
@@ -1903,33 +1877,6 @@ mod tests {
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert_eq!(q.cards[0].back, BackAvailability::None);
         assert!(q.cards[0].printable);
-    }
-
-    #[tokio::test]
-    async fn paid_ribbon_is_snapshotted_and_used_by_the_print_queue() {
-        let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
-            .await
-            .expect("create");
-        // A prefix never priced through checkout has no paid ribbon; the queue
-        // falls back to the current one.
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.ribbon, Ribbon::Ymckoko);
-
-        // Freeze the ribbon as if a checkout had priced it.
-        set_paid_ribbon(&pool, p.uuid, Ribbon::Ymcko)
-            .await
-            .expect("freeze");
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.ribbon, Ribbon::Ymcko);
-
-        // Even if the operator later changes the prefix's ribbon, the queue
-        // still reports the paid-for one.
-        set_prefix_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
-            .await
-            .expect("operator changes ribbon");
-        let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.ribbon, Ribbon::Ymcko);
     }
 
     #[tokio::test]
