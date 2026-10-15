@@ -231,12 +231,35 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
 
 
 def run_batch(client: Client, args: argparse.Namespace) -> int:
-    """Print every prefix that needs `args.ribbon`, one after another.
+    """Print every prefix that needs a ribbon, one after another.
 
-    Lists all prefixes, keeps those whose effective ribbon matches and whose
-    status is a print job, then prints each. Between jobs it pauses and asks the
-    operator to empty the output tray, naming the prefix that was just printed.
+    The ribbon is `args.ribbon` when given, otherwise read from the printer
+    (the operator has already loaded it). Lists all prefixes, keeps those whose
+    effective ribbon matches and whose status is a print job, then prints each.
+    Between jobs it pauses and asks the operator to empty the output tray,
+    naming the prefix that was just printed.
     """
+    ribbon = args.ribbon
+    if ribbon is None:
+        # Autodetect from the loaded ribbon. A dry run still opens the printer
+        # (it must exercise the same path), so this works in both modes.
+        try:
+            with Printer(args.ip) as printer:
+                printer.require_ready()
+                loaded = printer.ribbon_status()
+        except PrinterError as e:
+            print(f"error: cannot read ribbon from printer: {e}", file=sys.stderr)
+            return 1
+        if loaded.ribbon == "unknown":
+            print(
+                "error: printer reports an unrecognised ribbon; pass --ribbon "
+                "explicitly",
+                file=sys.stderr,
+            )
+            return 1
+        ribbon = loaded.ribbon
+        print(f"[ribbon] autodetected '{ribbon}' from the printer")
+
     try:
         prefixes = client.list_prefixes()
     except ApiError as e:
@@ -246,18 +269,18 @@ def run_batch(client: Client, args: argparse.Namespace) -> int:
     jobs = [
         p
         for p in prefixes
-        if _effective_ribbon(p) == args.ribbon
+        if _effective_ribbon(p) == ribbon
         and p.get("status") in PRINTABLE_STATUSES
     ]
     if not jobs:
         print(
-            f"no prefixes to print for ribbon '{args.ribbon}' "
+            f"no prefixes to print for ribbon '{ribbon}' "
             f"(of {len(prefixes)} total)"
         )
         return 0
 
     print(
-        f"batch: {len(jobs)} prefix(es) for ribbon '{args.ribbon}': "
+        f"batch: {len(jobs)} prefix(es) for ribbon '{ribbon}': "
         + ", ".join(p["uuid"] for p in jobs)
     )
 
@@ -338,7 +361,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ribbon",
         default=None,
-        help="ribbon to filter on in --batch mode (ymcko|ymckoko)",
+        help="ribbon to filter on in --batch mode (ymcko|ymckoko); "
+        "defaults to the ribbon loaded in the printer",
     )
     p.add_argument(
         "--ip",
@@ -369,9 +393,6 @@ def main(argv: list[str] | None = None) -> int:
         print("error: --token (or ESPLP_TOKEN) is required to print", file=sys.stderr)
         return 2
     if args.batch:
-        if not args.ribbon:
-            print("error: --batch requires --ribbon (ymcko|ymckoko)", file=sys.stderr)
-            return 2
         if args.prefix:
             print("error: --prefix and --batch are mutually exclusive", file=sys.stderr)
             return 2
