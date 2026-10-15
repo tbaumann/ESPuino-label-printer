@@ -127,6 +127,10 @@ def run(args: argparse.Namespace) -> int:
             f"nothing to print (queue of {len(cards)} cards, "
             f"{len(not_printable)} not printable)"
         )
+        # A rerun after the final card was already printed still closes the
+        # prefix out: every card is printed, so flush to `printed`.
+        if not args.dry_run and not not_printable:
+            _mark_printed(client, args.prefix)
         return 0
 
     verb = "would print" if args.dry_run else "printing"
@@ -197,10 +201,10 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"done: {len(todo)} card(s) {'inspected' if args.dry_run else 'printed'}")
 
-    # The whole run succeeded: flush the work list to `printed`. Skip a prefix
-    # that was left in a state the transition does not allow (e.g. a draft left
-    # over from a test) — that is an operator decision, not something to paper
-    # over, but it must not look like a spooler failure either.
+    # The whole run succeeded: flush the work list to `printed`. The server
+    # forces any transition for the admin token, so this works whatever state
+    # the prefix was in before (paid, queued, printing, even a leftover draft)
+    # — anything fully printed becomes `printed`.
     if not args.dry_run and not not_printable:
         _mark_printed(client, args.prefix)
     return 0
@@ -208,37 +212,30 @@ def run(args: argparse.Namespace) -> int:
 
 def _maybe_mark_printing(client: Client, prefix: str, status: Any) -> None:
     """Advance a `queued` prefix to `printing` before the run, so the server's
-    `resume` logic (printing + still-unprinted) reflects this is an in-progress
-    order. No-op for any other status — the transition is queued→printing only.
-    """
+    `resume` logic (printing + still-unprinted) reflects an in-progress order.
+    No-op for any other status — the transition is queued→printing only."""
     if status != "queued":
         return
-    _set_status_tolerant(client, prefix, "printing", "queued -> printing")
+    _mark_status(client, prefix, "printing")
 
 
 def _mark_printed(client: Client, prefix: str) -> None:
-    """Flip the prefix to `printed` once every card is printed. Tolerates the
-    409 an already-`printed` prefix or a non-printable-status state would give
-    (idempotent / operator's call), and any transient API failure."""
-    _set_status_tolerant(client, prefix, "printed", "-> printed")
+    """Flip the prefix to `printed` once every card is printed. Admin-forced, so
+    it always succeeds from any state; a failure is a real error worth surfacing.
+    Re-applying an already-`printed` status is a no-op server-side."""
+    _mark_status(client, prefix, "printed")
 
 
-def _set_status_tolerant(client: Client, prefix: str, status: str, desc: str) -> None:
+def _mark_status(client: Client, prefix: str, status: str) -> None:
     try:
         client.set_prefix_status(prefix, status)
         print(f"[status] prefix marked {status}")
     except ApiError as e:
-        if e.status == 409:
-            print(
-                f"[status] note: prefix could not be marked {status} "
-                f"({desc} not a valid transition from its current state): {e}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"[status] warning: failed to mark prefix {status}: {e}",
-                file=sys.stderr,
-            )
+        print(
+            f"[status] ERROR: failed to mark prefix {status}: {e}",
+            file=sys.stderr,
+        )
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:

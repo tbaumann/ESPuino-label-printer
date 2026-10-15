@@ -128,6 +128,17 @@ check("KO->unknown", _family_of_sdk_name("KO") == "unknown")
 c.set_prefix_status("P", "printed")
 check("set_prefix_status PATCH", LOG["PATCH"][-1] == "/api/prefixes/P/status")
 
+# 7. spooler helpers: _mark_printed flushes via its own client; _maybe_mark_printing
+#    only advances queued -> printing (idempotent no-op for other states).
+import esplp_print.__main__ as mm
+mm._mark_printed(c, "P")
+check("helper _mark_printed sends printed", LOG["PATCH"][-1] == "/api/prefixes/P/status")
+mm._maybe_mark_printing(c, "P", "printing")
+check("helper _maybe_mark_printing no-op on non-queued", LOG["PATCH"][-1] == "/api/prefixes/P/status")
+before = len(LOG["PATCH"])
+mm._maybe_mark_printing(c, "P", "queued")
+check("helper _maybe_mark_printing advances queued", len(LOG["PATCH"]) == before + 1)
+
 srv.shutdown()
 print("RESULT:", "OK" if ok else "FAILED")
 sys.exit(0 if ok else 1)
