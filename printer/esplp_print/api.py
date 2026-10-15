@@ -4,16 +4,15 @@ Uses only the standard library (urllib), because the spooler already depends on
 the vendor SDK and should not drag in an HTTP framework. `requests` would be
 another native dep for no gain on this thin surface.
 
-Admin endpoints (print-queue, mark-printed) need the operator bearer token;
-the raster endpoints are readable by anyone holding the prefix uuid, but we
-send the token anyway (the server ignores it there — same convention as every
-other customer-level call).
+Admin endpoints (print-queue, mark-printed, list-prefixes, set-status) need the
+operator bearer token; the raster endpoints are readable by anyone holding the
+prefix uuid, but we send the token anyway (the server ignores it there — same
+convention as every other customer-level call).
 """
 
 from __future__ import annotations
 
 import json
-import ssl
 import urllib.error
 import urllib.request
 from typing import Any
@@ -55,11 +54,8 @@ class Client:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        # The default SSL context does full verification; a self-hosted server
-        # behind a self-signed cert would need a configured context, but we do
-        # not add an insecure escape hatch here.
         try:
-            with urllib.request.urlopen(req) as resp:  # noqa: S310  (http allowed, not held-open)
+            with urllib.request.urlopen(req) as resp:  # noqa: S310
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
@@ -77,6 +73,15 @@ class Client:
 
     def get_print_queue(self, prefix: str) -> dict[str, Any]:
         return self._json("GET", f"/api/prefixes/{prefix}/print-queue")
+
+    def list_prefixes(self, status: str | None = None) -> list[dict[str, Any]]:
+        """List all prefixes (admin). `status` optionally filters by lifecycle
+        status. Each entry carries `ribbon`, `paid_ribbon`, `status` and
+        `unprinted_count`, which is what the batch mode filters on."""
+        path = "/api/prefixes"
+        if status:
+            path += f"?status={status}"
+        return self._json("GET", path)
 
     def fetch_bytes(self, path: str) -> tuple[int, bytes]:
         """GET raw bytes (a raster). Returns (status, body) without raising, so

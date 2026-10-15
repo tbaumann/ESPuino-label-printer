@@ -1,8 +1,9 @@
 """Smoke test of the spooler's API layer against a mock server.
 
-Exercises Client.get_print_queue / fetch_bytes / mark_printed and the spooler's
-queue->todo selection, WITHOUT a printer (stops at the printer check). Run from
-the Nix-built env so `esplp_print` impolrs from the store.
+Exercises Client.get_print_queue / fetch_bytes / mark_printed / list_prefixes /
+set_prefix_status and the spooler's queue->todo selection and batch filtering,
+WITHOUT a printer (stops at the printer check). Run from the Nix-built env so
+`esplp_print` imports from the store.
 """
 import sys
 import threading
@@ -12,7 +13,19 @@ import socketserver
 
 from esplp_print.api import Client
 
-LOG = {"GET": [], "POST": []}
+LOG = {"GET": [], "POST": [], "PATCH": []}
+# Prefixes for the batch mode: two ymcko jobs (one paid, one queued), one
+# ymckoko job (should be excluded when filtering ymcko), one draft (excluded).
+PREFIXES = [
+    {"uuid": "A", "status": "paid", "ribbon": "ymcko", "paid_ribbon": None,
+     "unprinted_count": 2},
+    {"uuid": "B", "status": "queued", "ribbon": "ymcko", "paid_ribbon": None,
+     "unprinted_count": 1},
+    {"uuid": "C", "status": "paid", "ribbon": "ymckoko", "paid_ribbon": None,
+     "unprinted_count": 3},
+    {"uuid": "D", "status": "draft", "ribbon": "ymcko", "paid_ribbon": None,
+     "unprinted_count": 0},
+]
 QUEUE = {
     "prefix": "P",
     "status": "queued",
@@ -47,7 +60,12 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         LOG["GET"].append(self.path)
-        if self.path.endswith("/print-queue"):
+        if self.path == "/api/prefixes":
+            self._send(200, PREFIXES)
+        elif self.path.startswith("/api/prefixes?status="):
+            status = self.path.split("=", 1)[1]
+            self._send(200, [p for p in PREFIXES if p["status"] == status])
+        elif self.path.endswith("/print-queue"):
             self._send(200, QUEUE)
         elif "print-raster" in self.path:
             # accept any raster path; return tiny fake BMP header for 1x1
@@ -68,7 +86,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self._send(200, {"id": int(self.path.rstrip("/").split("/")[-2])})
 
     def do_PATCH(self):
-        LOG.setdefault("PATCH", []).append(self.path)
+        LOG["PATCH"].append(self.path)
         self._send(200, {"uuid": "P", "status": "printed"})
 
 
@@ -138,6 +156,21 @@ check("helper _maybe_mark_printing no-op on non-queued", LOG["PATCH"][-1] == "/a
 before = len(LOG["PATCH"])
 mm._maybe_mark_printing(c, "P", "queued")
 check("helper _maybe_mark_printing advances queued", len(LOG["PATCH"]) == before + 1)
+
+# 8. batch: list prefixes, filter by effective ribbon + printable status.
+prefixes = c.list_prefixes()
+check("list_prefixes returns all", len(prefixes) == 4)
+jobs = [
+    p for p in prefixes
+    if mm._effective_ribbon(p) == "ymcko" and p.get("status") in mm.PRINTABLE_STATUSES
+]
+check("batch ymcko picks A,B (not C ymckoko, not D draft)",
+      [p["uuid"] for p in jobs] == ["A", "B"])
+jobs_ck = [
+    p for p in prefixes
+    if mm._effective_ribbon(p) == "ymckoko" and p.get("status") in mm.PRINTABLE_STATUSES
+]
+check("batch ymckoko picks C", [p["uuid"] for p in jobs_ck] == ["C"])
 
 srv.shutdown()
 print("RESULT:", "OK" if ok else "FAILED")

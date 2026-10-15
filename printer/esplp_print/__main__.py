@@ -9,6 +9,10 @@ belong to the operator/backend; this tool only prints and marks.
 check the ribbon, fetch every raster — except the two irreversible actions: it
 does not send a print job and does not mark any card printed.
 
+`--batch` prints every prefix that needs a given ribbon, one after another. The
+operator loads that ribbon once, and between jobs the tool pauses and asks them
+to empty the output tray before the next prefix starts.
+
 Exit codes:
   0  complete (all unprinted printable cards printed, or a dry run)
   1  an error stopped the run (cards before it were printed and marked; rerun
@@ -34,6 +38,11 @@ from .printer import (
 
 RASTER_FRONT = "/api/prefixes/{prefix}/cards/{id}/print-raster"
 RASTER_BACK = "/api/prefixes/{prefix}/cards/{id}/print-raster/back"
+
+# Lifecycle statuses that represent work waiting to be printed. A batch run
+# picks prefixes in these states; everything else (draft, cancelled, printed)
+# is not a print job.
+PRINTABLE_STATUSES = {"paid", "queued", "printing"}
 
 
 def _raster(client: Client, path: str, desc: str) -> bytes:
@@ -96,10 +105,21 @@ def _is_printed(card: dict[str, Any]) -> bool:
     return card.get("printed_at") is not None
 
 
-def run(args: argparse.Namespace) -> int:
-    client = Client(args.server, args.token)
+def _effective_ribbon(prefix: dict[str, Any]) -> str | None:
+    """The ribbon a prefix is actually printed with: the one that was paid for
+    (`paid_ribbon`), falling back to the prefix's current ribbon. Mirrors the
+    server's print-queue logic."""
+    return prefix.get("paid_ribbon") or prefix.get("ribbon")
+
+
+def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
+    """Print one prefix's unprinted cards. Returns 0 on success, 1 on failure.
+
+    Opens the printer itself (so batch mode can call it per prefix and keep the
+    connection fresh between jobs). A dry run never sends jobs or marks cards.
+    """
     try:
-        queue = client.get_print_queue(args.prefix)
+        queue = client.get_print_queue(prefix)
     except ApiError as e:
         print(f"error: fetching print queue: {e}", file=sys.stderr)
         return 1
@@ -107,7 +127,7 @@ def run(args: argparse.Namespace) -> int:
     ribbon = queue.get("ribbon")
     cards = queue.get("cards", [])
     print(
-        f"prefix {args.prefix}: status={queue.get('status')} ribbon={ribbon} "
+        f"prefix {prefix}: status={queue.get('status')} ribbon={ribbon} "
         f"unprinted={queue.get('unprinted_count')} billed_sides={queue.get('billed_sides')}"
     )
 
@@ -130,7 +150,7 @@ def run(args: argparse.Namespace) -> int:
         # A rerun after the final card was already printed still closes the
         # prefix out: every card is printed, so flush to `printed`.
         if not args.dry_run and not not_printable:
-            _mark_printed(client, args.prefix)
+            _mark_printed(client, prefix)
         return 0
 
     verb = "would print" if args.dry_run else "printing"
@@ -141,7 +161,7 @@ def run(args: argparse.Namespace) -> int:
 
     # A dry run never changes status.
     if not args.dry_run:
-        _maybe_mark_printing(client, args.prefix, queue.get("status"))
+        _maybe_mark_printing(client, prefix, queue.get("status"))
 
     # Open the printer and check the ribbon in BOTH modes — a dry run must
     # exercise the same path, so a run that prints is already proven to connect.
@@ -166,14 +186,14 @@ def run(args: argparse.Namespace) -> int:
             try:
                 front = _raster(
                     client,
-                    RASTER_FRONT.format(prefix=args.prefix, id=cid),
+                    RASTER_FRONT.format(prefix=prefix, id=cid),
                     f"front raster of card {cid}",
                 )
                 back_bmp = None
                 if back in (BACK_COLOR, BACK_BLACK):
                     back_bmp = _raster(
                         client,
-                        RASTER_BACK.format(prefix=args.prefix, id=cid),
+                        RASTER_BACK.format(prefix=prefix, id=cid),
                         f"back raster of card {cid}",
                     )
                 if args.dry_run:
@@ -189,7 +209,7 @@ def run(args: argparse.Namespace) -> int:
                 # The print call returned OK: the card is ejected to the hopper.
                 # Mark it NOW so a crash cannot reprint it, and so a parallel
                 # run does not pull it. The server endpoint is idempotent.
-                client.mark_printed(args.prefix, cid)
+                client.mark_printed(prefix, cid)
                 print(f"  -> card {cid} printed and marked", flush=True)
             except (PrinterError, ApiError, RuntimeError) as e:
                 print(f"error: card {cid} failed: {e}", file=sys.stderr)
@@ -206,7 +226,63 @@ def run(args: argparse.Namespace) -> int:
     # the prefix was in before (paid, queued, printing, even a leftover draft)
     # — anything fully printed becomes `printed`.
     if not args.dry_run and not not_printable:
-        _mark_printed(client, args.prefix)
+        _mark_printed(client, prefix)
+    return 0
+
+
+def run_batch(client: Client, args: argparse.Namespace) -> int:
+    """Print every prefix that needs `args.ribbon`, one after another.
+
+    Lists all prefixes, keeps those whose effective ribbon matches and whose
+    status is a print job, then prints each. Between jobs it pauses and asks the
+    operator to empty the output tray, naming the prefix that was just printed.
+    """
+    try:
+        prefixes = client.list_prefixes()
+    except ApiError as e:
+        print(f"error: listing prefixes: {e}", file=sys.stderr)
+        return 1
+
+    jobs = [
+        p
+        for p in prefixes
+        if _effective_ribbon(p) == args.ribbon
+        and p.get("status") in PRINTABLE_STATUSES
+    ]
+    if not jobs:
+        print(
+            f"no prefixes to print for ribbon '{args.ribbon}' "
+            f"(of {len(prefixes)} total)"
+        )
+        return 0
+
+    print(
+        f"batch: {len(jobs)} prefix(es) for ribbon '{args.ribbon}': "
+        + ", ".join(p["uuid"] for p in jobs)
+    )
+
+    for i, p in enumerate(jobs, 1):
+        prefix = p["uuid"]
+        print(f"\n=== job {i}/{len(jobs)}: prefix {prefix} ===")
+        rc = print_prefix(client, args, prefix)
+        if rc != 0:
+            print(
+                f"batch stopped at prefix {prefix} (job {i}/{len(jobs)}); "
+                "fix and rerun to continue",
+                file=sys.stderr,
+            )
+            return rc
+        # Pause before the next job so the operator can empty the tray. The
+        # message names the prefix just printed, so they know which cards are
+        # in the hopper.
+        if i < len(jobs):
+            nxt = jobs[i]["uuid"]
+            input(
+                f"\nEmpty the output tray (prefix {prefix} printed). "
+                f"Press Enter to print prefix {nxt}... "
+            )
+
+    print(f"\nbatch done: {len(jobs)} prefix(es) printed")
     return 0
 
 
@@ -249,7 +325,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="operator bearer token (or set ESPLP_TOKEN)",
     )
-    p.add_argument("--prefix", required=True, help="prefix uuid to print")
+    p.add_argument(
+        "--prefix",
+        default=None,
+        help="prefix uuid to print (omit with --batch)",
+    )
+    p.add_argument(
+        "--batch",
+        action="store_true",
+        help="print every prefix that needs --ribbon, one after another",
+    )
+    p.add_argument(
+        "--ribbon",
+        default=None,
+        help="ribbon to filter on in --batch mode (ymcko|ymckoko)",
+    )
     p.add_argument(
         "--ip",
         required=True,
@@ -275,11 +365,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.token:
         args.token = os.environ.get("ESPLP_TOKEN")
     if not args.token and not args.dry_run:
-        # print-queue and mark-printed are admin-only; so is the queue fetch.
+        # print-queue, list-prefixes and mark-printed are admin-only.
         print("error: --token (or ESPLP_TOKEN) is required to print", file=sys.stderr)
         return 2
+    if args.batch:
+        if not args.ribbon:
+            print("error: --batch requires --ribbon (ymcko|ymckoko)", file=sys.stderr)
+            return 2
+        if args.prefix:
+            print("error: --prefix and --batch are mutually exclusive", file=sys.stderr)
+            return 2
+    elif not args.prefix:
+        print("error: --prefix is required (or use --batch)", file=sys.stderr)
+        return 2
+
+    client = Client(args.server, args.token)
     try:
-        return run(args)
+        if args.batch:
+            return run_batch(client, args)
+        return print_prefix(client, args, args.prefix)
     except ApiError as e:
         print(f"error: API: {e}", file=sys.stderr)
         return 1
