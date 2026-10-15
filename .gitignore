@@ -11,3 +11,4 @@ server/static/
 .env
 # nix build symlinks (result, result-1, ...)
 result*
+.worktrees/
