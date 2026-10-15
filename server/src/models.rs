@@ -188,22 +188,13 @@ impl Ribbon {
         })
     }
 
-    /// Whether this ribbon can print a card whose back is `back`.
-    ///
-    /// YMCKO gives the back its own YMC panel set, so any source works there.
-    /// YMCKOKO's back is the second *black* panel: text can be printed on it,
-    /// but a colour image — or a copy of the colour front — cannot, so those
-    /// combinations are refused rather than silently printed as something else.
-    pub fn allows_back(self, back: BackSource) -> bool {
-        match self {
-            Self::Ymcko => true,
-            Self::Ymckoko => matches!(back, BackSource::None | BackSource::Markdown),
-        }
-    }
-
     /// The colour depth a back side is rendered in. A consequence of the ribbon,
-    /// never a separate choice — the same markdown back is a 24-bit raster on
-    /// YMCKO and a 1-bit one on YMCKOKO.
+    /// never a separate choice — the same back is a 24-bit raster on YMCKO and a
+    /// 1-bit one on YMCKOKO.
+    ///
+    /// Every back source is allowed on either ribbon. What the ribbon changes is
+    /// only how the print data is generated; a picture on the second black panel
+    /// is a poor choice, not an illegal one, so it is the customer's to make.
     pub fn back_depth(self) -> BackDepth {
         match self {
             Self::Ymcko => BackDepth::Color,
@@ -211,16 +202,28 @@ impl Ribbon {
         }
     }
 
-    /// How many ribbon panels one card on this ribbon is billed for.
+    /// What one unit of this ribbon's price *is*, for the customer-facing price
+    /// display and the Stripe line item: one printed side (YMCKO) or one whole
+    /// card (YMCKOKO).
+    pub fn billing_unit(self) -> &'static str {
+        match self {
+            Self::Ymcko => "side",
+            Self::Ymckoko => "card",
+        }
+    }
+
+    /// How many billing units one card on this ribbon costs, given its back.
     ///
-    /// YMCKO bills per printed side: a single-sided card is one panel set, a
-    /// double-sided one is two. YMCKOKO always bills a full double-sided card,
-    /// because the second black panel is consumed either way — a blank back
-    /// saves nothing, so there is nothing to charge differently for.
-    pub fn billed_sides(self, back: BackSource) -> i64 {
+    /// The unit differs per ribbon ([`Self::billing_unit`]), so this is the
+    /// multiplier applied to that ribbon's own price — not a count of panels.
+    /// YMCKO bills per printed side: a single-sided card is one, a double-sided
+    /// one two. YMCKOKO bills per *card*, whatever its back: its panel set is
+    /// spent whether or not the second black panel is used, so there is nothing
+    /// for a blank back to save.
+    pub fn billed_units(self, back: BackSource) -> i64 {
         match self {
             Self::Ymcko => 1 + i64::from(back.is_double_sided()),
-            Self::Ymckoko => 2,
+            Self::Ymckoko => 1,
         }
     }
 }
@@ -365,9 +368,10 @@ pub struct PrintQueueCard {
     /// `color`, or `black` — whichever the ribbon's colour depth makes it. The
     /// spooler fetches `print-raster/back` exactly when this is not `none`.
     pub back: BackAvailability,
-    /// Ribbon panels this card is billed for, so the spooler's accounting
-    /// matches the checkout's without re-deriving the rule.
-    pub billed_sides: i64,
+    /// Billing units this card costs on its ribbon, so the spooler's accounting
+    /// matches the checkout's without re-deriving the rule. A unit is one
+    /// printed side or one whole card, whichever the ribbon prices by.
+    pub billed_units: i64,
     /// Whether every raster this card needs to print is `ready`. The spooler
     /// prints only `printable` cards; a card with a `pending` or `failed`
     /// raster is reported here rather than silently printed from the original.
@@ -390,9 +394,9 @@ pub struct PrintQueue {
     pub ribbon: Ribbon,
     pub cards: Vec<PrintQueueCard>,
     pub unprinted_count: i64,
-    /// Total ribbon panels the whole queue is billed for — the sum of the
-    /// cards' `billed_sides`.
-    pub billed_sides: i64,
+    /// Total billing units the whole queue is billed for — the sum of the
+    /// cards' `billed_units`, in the ribbon's own unit (sides or cards).
+    pub billed_units: i64,
     pub resume: bool,
 }
 
@@ -409,9 +413,10 @@ pub struct CardIndex {
 ///
 /// `back` is the per-card single/double-sided choice. `back_text` is only
 /// meaningful for a `markdown` back and is refused otherwise; a `back_image`
-/// file part is only valid when the prefix's ribbon can print a colour back.
-/// The handler rejects a back field that does not fit rather than silently
-/// storing it.
+/// file part is the `image` back's material. Every back source is allowed on
+/// either ribbon — the ribbon only decides how the back is rendered — so the
+/// handler rejects a form that contradicts itself, not a back the ribbon
+/// "cannot print".
 ///
 /// `back_image` is optional even for an `image` back: cards are created by the
 /// folder-at-a-time front-image upload, and the per-card back is filled in
@@ -478,15 +483,19 @@ pub struct AdminSession {
     pub authenticated: bool,
 }
 
-/// One ribbon as the shop offers it: the price of one printed side on it, and
+/// One ribbon as the shop offers it: the price of one billing unit on it, and
 /// whether it can be ordered right now.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RibbonPrice {
     pub ribbon: Ribbon,
-    /// Price of one printed *side* on this ribbon, in the currency's minor unit
-    /// (cents). A card is billed [`Ribbon::billed_sides`] of these: one or two
-    /// on YMCKO, always two on YMCKOKO.
+    /// Price of one billing unit on this ribbon, in the currency's minor unit
+    /// (cents). What that unit is differs per ribbon ([`Ribbon::billing_unit`]):
+    /// one printed side on YMCKO — a card costs [`Ribbon::billed_units`] of them
+    /// — or one whole card on YMCKOKO, whatever the card's back is.
     pub price_cents: i64,
+    /// The unit `price_cents` is for: `side` or `card`. Served so the price can
+    /// be shown honestly ("€2.50 per card") instead of the UI guessing.
+    pub unit: String,
     /// Whether the ribbon is in stock. An unavailable ribbon is still served,
     /// and rendered disabled rather than dropped, so the customer can see that
     /// the option exists and is out.
@@ -506,6 +515,18 @@ pub struct RibbonStockPatch {
     pub in_stock: bool,
 }
 
+/// Operator input for setting one ribbon's price.
+///
+/// The unit is the ribbon's own ([`Ribbon::billing_unit`]) and is not part of
+/// the request: a price is only ever "one unit on this ribbon", so asking the
+/// operator to restate the unit would let the two disagree.
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+pub struct RibbonPricePatch {
+    /// Price of one billing unit, in the currency's minor unit (cents).
+    /// Negatives are refused; zero is allowed but pointless.
+    pub price_cents: i64,
+}
+
 /// Public shop configuration, so the customer UI can show a price and a Pay
 /// button — or hide both — without the browser knowing anything secret.
 ///
@@ -516,8 +537,9 @@ pub struct ShopConfig {
     pub enabled: bool,
     /// ISO 4217 code, lower case as Stripe wants it.
     pub currency: String,
-    /// The price of one printed side per ribbon, in the currency's minor unit
-    /// (cents), each carrying whether that ribbon can be ordered right now.
+    /// The price of one billing unit per ribbon, in the currency's minor unit
+    /// (cents), each carrying what its unit is and whether that ribbon can be
+    /// ordered right now.
     pub prices: Vec<RibbonPrice>,
     /// The same two stock flags, served as they are stored, so the UI can show
     /// ribbon availability without deriving it from a price.

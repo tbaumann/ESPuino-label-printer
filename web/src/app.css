@@ -641,6 +641,37 @@ select:focus {
   box-shadow: var(--shadow);
 }
 
+/* One editable shop row (a ribbon's price and stock). Same card as a prefix
+   row, but its own class so the two never get counted as each other. */
+.srow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.srow .money {
+  width: 7ch;
+  text-align: right;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text);
+}
+
 .prow a {
   color: var(--accent);
   text-decoration: none;

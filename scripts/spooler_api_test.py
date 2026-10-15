@@ -31,17 +31,17 @@ QUEUE = {
     "status": "queued",
     "ribbon": "ymckoko",
     "unprinted_count": 2,
-    "billed_sides": 4,
+    "billed_units": 2,
     "resume": False,
     "cards": [
         {"id": 1, "name": "Conni", "printed_at": None, "back": "black",
-         "billed_sides": 2, "printable": True},
+         "billed_units": 1, "printable": True},
         {"id": 2, "name": "Bob", "printed_at": None, "back": "none",
-         "billed_sides": 2, "printable": True},
+         "billed_units": 1, "printable": True},
         {"id": 3, "name": "Ana", "printed_at": "2026-10-15T..", "back": "none",
-         "billed_sides": 2, "printable": True},
+         "billed_units": 1, "printable": True},
         {"id": 4, "name": "Unprintable", "printed_at": None, "back": "none",
-         "billed_sides": 2, "printable": False},
+         "billed_units": 1, "printable": False},
     ],
 }
 

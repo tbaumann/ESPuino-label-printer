@@ -49,6 +49,15 @@ PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", BASE)
 # The customer's address comes from the Stripe session, which this test builds
 # itself, so the expectation is a constant rather than the server's environment.
 CUSTOMER_EMAIL = "ada@example.test"
+# What section 3's order costs, and therefore what Stripe reports back and the
+# order confirmation states: two cards on the default YMCKOKO ribbon — that
+# ribbon prices a whole card, so that is two units, not four printed sides —
+# plus the flat shipping. Derived once so the amount assertions cannot drift
+# from the session they describe.
+ORDER_UNIT_CENTS = 500
+ORDER_UNITS = 2
+SHIPPING_CENTS = 250
+ORDER_AMOUNT_TOTAL = ORDER_UNITS * ORDER_UNIT_CENTS + SHIPPING_CENTS
 # The order emails are only sent when the server was given both a key and a
 # from-address; without them the checks are skipped with a note, the same way
 # the smoke test skips its Pay scenario when payment is not configured.
@@ -134,7 +143,7 @@ def payment_event(
     payment_status: str = "paid",
     use_metadata: bool = False,
     customer_email: Any = CUSTOMER_EMAIL,
-    amount_total: int = 4 * 500 + 250,
+    amount_total: int = ORDER_AMOUNT_TOTAL,
     currency: str = "eur",
 ) -> dict:
     obj: dict = {"id": session, "object": "checkout.session", "payment_status": payment_status}
@@ -144,8 +153,9 @@ def payment_event(
         else:
             obj["client_reference_id"] = prefix
     # What section 3's session is priced at — two cards on the default YMCKOKO
-    # ribbon is four printed sides, plus shipping. Stripe always reports both the
-    # amount and the currency, and the order confirmation states the amount.
+    # ribbon is two *cards* (that ribbon prices per card), plus shipping. Stripe
+    # always reports both the amount and the currency, and the order confirmation
+    # states the amount.
     obj["amount_total"] = amount_total
     obj["currency"] = currency
     if customer_email is not None:
@@ -232,14 +242,20 @@ check("payment reports as enabled", config.get("enabled") is True, str(config))
 check("currency is eur", config.get("currency") == "eur", str(config.get("currency")))
 prices = {p.get("ribbon"): p.get("price_cents") for p in config.get("prices", [])}
 check(
-    "one price per ribbon, the price of one printed side",
+    "one price per ribbon, the price of one billing unit",
     set(prices) == {"ymcko", "ymckoko"},
     str(prices),
 )
 check(
-    "a printed side on the default ribbon is 500",
+    "one card/printed side on the default ribbon is 500",
     prices.get("ymckoko") == 500,
     str(prices),
+)
+units = {p.get("ribbon"): p.get("unit") for p in config.get("prices", [])}
+check(
+    "each price says what its unit is: a side on YMCKO, a card on YMCKOKO",
+    units == {"ymcko": "side", "ymckoko": "card"},
+    str(units),
 )
 check("shipping is 250", config.get("shipping_cents") == 250, str(config.get("shipping_cents")))
 check("shipping countries include DE", "DE" in config.get("countries", []), str(config.get("countries")))
@@ -278,8 +294,8 @@ session = session or {}
 check("checkout returns 200", status == 200, f"{status} {session}")
 check("it returns a checkout URL", bool(session.get("url")), str(session))
 check(
-    "the amount is 4 printed sides plus shipping",
-    session.get("amount_total") == 4 * 500 + 250,
+    "the amount is 2 cards plus shipping",
+    session.get("amount_total") == 2 * 500 + 250,
     str(session.get("amount_total")),
 )
 check(
@@ -343,18 +359,24 @@ else:
         field("metadata[prefix]") == prefix,
         str(field("metadata[prefix]")),
     )
-    # Two cards on the default YMCKOKO ribbon: it always burns a full
-    # double-sided card, so the order is billed for 4 printed sides however its
-    # backs are filled in.
+    # Two cards on the default YMCKOKO ribbon. That ribbon prices a whole card,
+    # so the order is two units however its backs are filled in — one per card,
+    # not two per card as the old always-two rule charged.
     check(
-        "quantity is the number of printed sides",
-        field("line_items[0][quantity]") == "4",
+        "quantity is the number of cards on this ribbon",
+        field("line_items[0][quantity]") == "2",
         str(field("line_items[0][quantity]")),
     )
     check(
-        "unit_amount is the price of one printed side",
+        "unit_amount is the price of one card",
         field("line_items[0][price_data][unit_amount]") == "500",
         str(field("line_items[0][price_data][unit_amount]")),
+    )
+    check(
+        "the line item names the unit that was bought",
+        field("line_items[0][price_data][product_data][name]")
+        == "RFID/NFC card label (card)",
+        str(field("line_items[0][price_data][product_data][name]")),
     )
     check("currency is eur", field("line_items[0][price_data][currency]") == "eur")
     check(
@@ -402,6 +424,60 @@ else:
         ("payment_method_configuration" in fields)
         == bool(os.environ.get("STRIPE_PAYMENT_METHOD_CONFIGURATION")),
         str(fields.get("payment_method_configuration")),
+    )
+
+# --- 3b. the other ribbon prices per side ----------------------------------
+# Same price entry, applied differently: YMCKO's unit is one printed side, so a
+# single double-sided card is two units at the same 500 — the reverse of the
+# YMCKOKO case above, where two cards are two units.
+print("\n3b. a YMCKO order prices per printed side")
+if os.path.exists(MOCK_OUT):
+    os.truncate(MOCK_OUT, 0)
+
+side_prefix = new_prefix(cards=1)
+status, _ = json_request(
+    "PATCH",
+    f"/api/prefixes/{side_prefix}",
+    {"ribbon": "ymcko"},
+)
+check("a draft prefix can be moved to the colour ribbon", status == 200, str(status))
+code, card = json_request(
+    "PATCH", f"/api/prefixes/{side_prefix}/cards/1", {"back": "front"}
+)
+check("its card is made double-sided", code == 200 and card.get("back") == "front", str(card))
+
+status, session = json_request("POST", f"/api/prefixes/{side_prefix}/checkout")
+session = session or {}
+check("checkout returns 200", status == 200, f"{status} {session}")
+check(
+    "one double-sided card on YMCKO is two printed sides plus shipping",
+    session.get("amount_total") == 2 * 500 + 250,
+    str(session.get("amount_total")),
+)
+
+side_forms = recorded_forms()
+if not side_forms:
+    check("the YMCKO request-shape checks could run", False, f"nothing in {MOCK_OUT}")
+else:
+    side_fields: dict[str, str] = {}
+    for pair in side_forms[-1]["body"].split("&"):
+        key, _, value = pair.partition("=")
+        side_fields[key] = urllib.parse.unquote_plus(value)
+    check(
+        "quantity is the printed sides (two for a double-sided card)",
+        side_fields.get("line_items[0][quantity]") == "2",
+        str(side_fields.get("line_items[0][quantity]")),
+    )
+    check(
+        "unit_amount is still the price of one unit",
+        side_fields.get("line_items[0][price_data][unit_amount]") == "500",
+        str(side_fields.get("line_items[0][price_data][unit_amount]")),
+    )
+    check(
+        "and the line item says 'printed side', not 'card'",
+        side_fields.get("line_items[0][price_data][product_data][name]")
+        == "RFID/NFC card label (side)",
+        str(side_fields.get("line_items[0][price_data][product_data][name]")),
     )
 
 # --- 4. webhook signatures --------------------------------------------------
@@ -501,7 +577,7 @@ else:
         )
         check(
             "it states the amount that was paid",
-            "22.50 EUR" in (customer.get("text") or ""),
+            f"{ORDER_AMOUNT_TOTAL / 100:.2f} EUR" in (customer.get("text") or ""),
             str(customer.get("text"))[:200],
         )
         if OPERATOR_EMAIL:

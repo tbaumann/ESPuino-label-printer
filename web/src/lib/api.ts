@@ -101,12 +101,17 @@ export interface RibbonStock {
  * stock: the option is rendered disabled, never dropped, so the customer can
  * see that it exists and is out.
  *
- * `price_cents` is the price of one printed *side* — a card costs one or two of
- * them, per `billedSides`.
+ * `price_cents` is the price of one billing *unit*, and `unit` says what that
+ * is: `side` (YMCKO, a card costs one or two of them — `billedUnits`) or `card`
+ * (YMCKOKO, one per card whatever its back is). The two ribbons therefore price
+ * the same order differently, which is why the unit is served rather than
+ * assumed.
  */
 export interface RibbonPrice {
   ribbon: Ribbon
   price_cents: number
+  /** What `price_cents` buys: one printed side, or one whole card. */
+  unit: 'side' | 'card'
   available: boolean
 }
 
@@ -131,13 +136,13 @@ export const RIBBONS: { ribbon: Ribbon; label: string; summary: string }[] = [
     ribbon: 'ymckoko',
     label: 'Black back',
     summary:
-      'Full-colour front, black-only back. The back is text — headings, bold, italic, lists — and every card is billed as a full double-sided one.',
+      'Full-colour front, black-and-white back. Any back a card can have prints there in black only — text is what it is good at. Billed per card.',
   },
   {
     ribbon: 'ymcko',
     label: 'Colour back',
     summary:
-      'Full-colour front, and a back that may be a second picture, a copy of the front, or text. Billed per printed side.',
+      'Full-colour front, and a back in full colour: a second picture, a copy of the front, or text. Billed per printed side.',
   },
 ]
 
@@ -169,36 +174,35 @@ export const BACK_SOURCES: { source: BackSource; label: string; summary: string 
 ]
 
 /**
- * Whether a ribbon can print a card whose back is `source`.
- *
- * YMCKO gives the back a colour panel set of its own, so anything goes there.
- * YMCKOKO's back is the second *black* panel: text can be printed on it, but a
- * picture cannot — so those choices are not offered on that ribbon, and the
- * server refuses them too.
+ * What the two ribbons mean for a card's back, in one line each, so the card
+ * rows and the ribbon chooser cannot describe the same choice differently.
  */
-export function ribbonAllowsBack(ribbon: Ribbon, source: BackSource): boolean {
-  if (ribbon === 'ymcko') return true
-  return source === 'none' || source === 'markdown'
+export const DEPTH_NOTE: Record<'color' | 'black', string> = {
+  color: 'printed in full colour',
+  black: 'printed in black only — a picture becomes black and white',
 }
 
 /**
  * The colour depth a back is rendered in — a consequence of the ribbon, not a
- * choice. Mirror of the server's `Ribbon::back_depth`, so the preview can be
- * honest about what will be printed.
+ * choice, and the *only* thing the ribbon decides about a back. Mirror of the
+ * server's `Ribbon::back_depth`, so the preview can be honest about what will be
+ * printed: every back source is offered on either ribbon.
  */
 export function backDepth(ribbon: Ribbon): 'color' | 'black' {
   return ribbon === 'ymcko' ? 'color' : 'black'
 }
 
 /**
- * Ribbon panels one card is billed for.
+ * Billing units one card costs on a ribbon — the multiplier applied to that
+ * ribbon's own price.
  *
- * YMCKO bills per printed side: a single-sided card is one panel set, a
- * double-sided one is two. YMCKOKO always bills a full double-sided card — its
- * second black panel is consumed either way, so a blank back saves nothing.
+ * YMCKO bills per printed side: a single-sided card is one, a double-sided one
+ * two. YMCKOKO bills per card, whatever its back is: its panel set is spent
+ * whether or not the second black panel is used, so a blank back saves nothing.
+ * Mirror of the server's `Ribbon::billed_units`, which is what actually charges.
  */
-export function billedSides(ribbon: Ribbon, back: BackSource): number {
-  if (ribbon === 'ymckoko') return 2
+export function billedUnits(ribbon: Ribbon, back: BackSource): number {
+  if (ribbon === 'ymckoko') return 1
   return back === 'none' ? 1 : 2
 }
 
@@ -278,6 +282,25 @@ export function formatMoney(cents: number, currency: string): string {
   }
 }
 
+/**
+ * Parse a typed amount ("5", "5,50", "€5.50") into minor units, or `null` if it
+ * is not a number. One decimal separator, either the dot or the comma; a
+ * thousands separator is not understood, which is the honest limitation of
+ * letting someone type money into a text box.
+ */
+export function parseMoney(input: string): number | null {
+  const cleaned = input.trim().replace(/[^\d.,-]/g, '').replace(',', '.')
+  if (!cleaned || !/^-?\d*\.?\d*$/.test(cleaned)) return null
+  const n = Number(cleaned)
+  if (!Number.isFinite(n) || n < 0) return null
+  return Math.round(n * 100)
+}
+
+/** The plain figure for a money input box: `500` → `"5.00"`. */
+export function moneyInput(cents: number): string {
+  return (cents / 100).toFixed(2)
+}
+
 export const api = {
   createPrefix: (uuid?: string, ribbon?: Ribbon): Promise<Prefix> =>
     req<Prefix>('/api/prefixes', {
@@ -290,8 +313,12 @@ export const api = {
 
   /**
    * Choose the prefix's ribbon. Only allowed while the prefix is still a draft
-   * for the customer — the server answers 409 once it is sealed, and also 409
-   * if the change would strand a card the new ribbon cannot print.
+   * for the customer — the server answers 409 once it is sealed.
+   *
+   * The change is lossless: nothing about a card is tied to the ribbon except
+   * how it is rendered, so the server re-renders the derived artifacts (back
+   * previews and print rasters) from the stored originals and returns the
+   * prefix. Re-read the cards afterwards, because those previews changed.
    */
   setRibbon: (p: string, ribbon: Ribbon): Promise<Prefix> =>
     req<Prefix>(`/api/prefixes/${p}`, {
@@ -344,8 +371,8 @@ export const api = {
 
   /**
    * Attach or replace one card's back image, leaving the front alone. This also
-   * makes the card's back an `image` back. Only a YMCKO prefix accepts it — a
-   * YMCKOKO back is the black panel, and the server answers 400 there.
+   * makes the card's back an `image` back. Either ribbon accepts it: on a
+   * black-panel ribbon the picture is rendered in black and white.
    */
   uploadBackImage: (p: string, id: number, file: File): Promise<Card> => {
     const fd = new FormData()
@@ -422,6 +449,37 @@ export const adminApi = {
   /** Deletes the prefix, every card and every blob under it. */
   deletePrefix: (p: string): Promise<void> =>
     req<void>(`/api/prefixes/${p}`, { method: 'DELETE' }),
+
+  /**
+   * The shop's prices and stock, so the operator can edit them. The same public
+   * endpoint the customer page reads — nothing in it is secret, and the writes
+   * are what need the operator.
+   */
+  shopConfig: (): Promise<ShopConfig> => req<ShopConfig>('/api/shop/config'),
+
+  /**
+   * Set one ribbon's price, in minor units, for the ribbon's own billing unit
+   * (one printed side on YMCKO, one whole card on YMCKOKO — `RibbonPrice.unit`).
+   * Returns what was stored, so the caller need not re-derive it.
+   */
+  setRibbonPrice: (ribbon: Ribbon, priceCents: number): Promise<RibbonPrice> =>
+    req<RibbonPrice>(`/api/shop/ribbons/${ribbon}/price`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ price_cents: priceCents }),
+    }),
+
+  /**
+   * Take a ribbon out of the shop, or put it back. This is the "the ribbon ran
+   * out" switch: every mode that prints with it goes unavailable immediately,
+   * and the checkout refuses it.
+   */
+  setRibbonStock: (ribbon: Ribbon, inStock: boolean): Promise<RibbonStock> =>
+    req<RibbonStock>(`/api/shop/ribbons/${ribbon}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ in_stock: inStock }),
+    }),
 }
 
 /** Remembered projects, so the auto-created landing page isn't a dead end. */

@@ -128,7 +128,7 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
     cards = queue.get("cards", [])
     print(
         f"prefix {prefix}: status={queue.get('status')} ribbon={ribbon} "
-        f"unprinted={queue.get('unprinted_count')} billed_sides={queue.get('billed_sides')}"
+        f"unprinted={queue.get('unprinted_count')} billed_units={queue.get('billed_units')}"
     )
 
     todo = [c for c in cards if not _is_printed(c) and c.get("printable")]

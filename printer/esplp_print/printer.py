@@ -8,13 +8,17 @@ Supported connection strings (passed straight through as `--ip`, which the user
 gives as `socket://192.168.2.101?type=evolis`): see the SDK's own
 `Connection.open`. Everything here takes a single `ip` string.
 
-Ribbons: the server speaks two families — `ymcko` (full-colour front, and a
-colour back when the card is double-sided) and `ymckoko` (full-colour front,
-black-only back). The SDK's `RibbonType` enum has no single member named for
-each; it lists YMCKO variants and YMCKOK / YMCKOKOS variants. The ribbon check
-here is a **sanity check only** (skippable), so it compares the *family* by name
-prefix rather than pinning a specific enum member that a given printer's
-firmware might report differently.
+Ribbons: the server speaks two families — `ymcko` (full-colour front and back)
+and `ymckoko` (full-colour front, second black panel for the back). The SDK's
+`RibbonType` enum has no single member named for each; it lists YMCKO variants
+and YMCKOK / YMCKOKOS variants. The ribbon check here is a **sanity check only**
+(skippable), so it compares the *family* by name prefix rather than pinning a
+specific enum member that a given printer's firmware might report differently.
+
+The printer does not care what a back is *made of*, only what depth its raster
+is: both ribbons print the same set of card backs, and the server's raster is
+what differs — a 24-bit colour BMP on YMCKO, a 1-bit one on YMCKOKO. Whichever
+it sends is fed verbatim (see `print_card`).
 """
 
 from __future__ import annotations
@@ -138,9 +142,10 @@ class Printer:
 
         `back` is the queue's per-card back availability (`none|color|black`);
         `back_bmp` is the raster for that back, or None for a single-sided card.
-        The right SDK call depends on the back *material*: a colour back is a
-        24-bit image (`set_image_buffer`), a black back is 1-bit
-        (`set_black_buffer`). Both must be BMP bytes, the server's raster verbatim.
+        The right SDK call depends on the raster's depth, which is the ribbon's
+        (the server says which in `back`): a colour back is a 24-bit image
+        (`set_image_buffer`), a black back is 1-bit (`set_black_buffer`). Both
+        must be BMP bytes, the server's raster verbatim.
 
         `init()` is called first and is load-bearing: a `PrintSession` does not
         create a context by itself, and the underlying printer context survives

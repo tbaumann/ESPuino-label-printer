@@ -2,8 +2,8 @@
   import {
     api,
     backDepth,
-    ribbonAllowsBack,
     BACK_SOURCES,
+    DEPTH_NOTE,
     type BackSource,
     type Card,
     type CardPatch,
@@ -15,11 +15,11 @@
   // One card: its header, its two sides, and the back choice that decides what
   // the second one is.
   //
-  // The *job* fixes the ribbon, and the ribbon fixes what a back can be: YMCKO's
-  // back is a colour panel set (any source), YMCKOKO's is the second black panel
-  // (text only). Within that, the card's back is its own choice — nothing at all
-  // (a single-sided card), a copy of the front, a second uploaded picture, or
-  // markdown.
+  // The card's back is entirely its own choice — nothing at all (a single-sided
+  // card), a copy of the front, a second uploaded picture, or markdown. The
+  // *ribbon* changes nothing about the choice; it decides only the colour depth
+  // the chosen back is rendered in, which the preview shows and the caption
+  // says.
   //
   // Two controls, deliberately apart: which back the card *has* is chosen in the
   // editor beside the pane (it is the same choice for every card, so it belongs
@@ -49,11 +49,9 @@
     onCardUpdated?: (card: Card) => void
   } = $props()
 
-  // The choices this ribbon can print, in the order the shop lists them. An
-  // ineligible one is not shown at all: unlike an out-of-stock ribbon (which is
-  // shown greyed so the customer knows it exists), a back this ribbon physically
-  // cannot make is not an offer that is temporarily out of stock.
-  const choices = $derived(BACK_SOURCES.filter((c) => ribbonAllowsBack(ribbon, c.source)))
+  // Every back source, in the order the shop lists them — the same four
+  // whatever the ribbon is.
+  const choices = BACK_SOURCES
 
   // The colour depth the server will render a back in. A property of the
   // ribbon, so the preview can be honest about it.
@@ -98,12 +96,11 @@
   // preview, and the two are kept in step by `backText.ts`.
   const backHtml = $derived(backText ? renderBackText(backText) : '')
 
-  // Not a rendering rule, a courtesy: on a black-only back the renderer drops an
-  // image whole, so the author is told instead of left wondering where their
-  // artwork went. On a colour back there is nothing to warn about.
-  const imageRefused = $derived(
-    back === 'markdown' && depth === 'black' && hasImageSyntax(backText),
-  )
+  // Not a rendering rule, a courtesy: the markdown back renderer drops an image
+  // construct whole, so the author is told instead of left wondering where their
+  // artwork went. (The same courtesy as the black-and-white note on an `image`
+  // back: a choice can be a poor one without being refused.)
+  const imageRefused = $derived(back === 'markdown' && hasImageSyntax(backText))
 
   /** Apply a card patch, keeping the local state in step with the response. */
   async function apply(patch: CardPatch) {
@@ -198,14 +195,10 @@
   /** The caption under the back pane: what will actually be printed there. */
   const backCaption = $derived(
     back === 'front'
-      ? depth === 'color'
-        ? 'back · the front, printed again in full colour'
-        : 'back · the front, printed again'
+      ? `back · the front again, ${DEPTH_NOTE[depth]}`
       : back === 'markdown'
-        ? depth === 'color'
-          ? 'back · colour'
-          : 'back · black only (1 bit)'
-        : 'back · full colour',
+        ? `back · text, ${DEPTH_NOTE[depth]}`
+        : `back · the picture, ${DEPTH_NOTE[depth]}`,
   )
 </script>
 
@@ -345,17 +338,22 @@
           </div>
           {#if imageRefused}
             <div class="hint warn">
-              This text contains image markup, which the black-only back cannot
-              print — the whole <code>![…]</code> construct is dropped, alt text
-              included. Choose “Second image”, or move the card to a colour-back
-              project, for a picture.
+              This text contains image markup, which the text back never prints —
+              the whole <code>![…]</code> construct is dropped, alt text included.
+              Choose “Second image” if the card should carry a picture.
             </div>
           {/if}
         {:else if back === 'image'}
           <div class="hint muted">
-            Printed on the back in full colour. Every double-sided card needs one
-            before the project can be paid for — choose it in the pane, or drop a
-            picture on the pane.
+            {#if depth === 'color'}
+              Printed on the back in full colour.
+            {:else}
+              Printed on the back in black and white — this project's ribbon has no
+              colour panel for the back, so the picture is reduced to pure black
+              and white. A colour-back project keeps it in colour.
+            {/if}
+            Every double-sided card needs one before the project can be paid for —
+            choose it in the pane, or drop a picture on the pane.
           </div>
         {:else if back === 'front'}
           <div class="hint muted">

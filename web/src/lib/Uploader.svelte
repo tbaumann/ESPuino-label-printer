@@ -8,7 +8,7 @@
     disabled = false,
   }: {
     prefix: string
-    /** The prefix's ribbon, which decides what a card may put on its back. */
+    /** The prefix's ribbon, which decides how a card's back is printed. */
     ribbon?: Ribbon
     onUploaded: () => void | Promise<void>
     disabled?: boolean
@@ -19,7 +19,7 @@
   // back comes from rather than letting the customer find out at the checkout.
   const hint = $derived(
     ribbon === 'ymckoko'
-      ? 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — a back on this ribbon is black-only text, chosen on the card below.'
+      ? 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — a back on this project prints in black and white, chosen on the card below.'
       : 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — choose and fill in a back on each card below.',
   )
 

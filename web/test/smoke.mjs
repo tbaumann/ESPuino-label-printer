@@ -48,6 +48,17 @@ function check(name, cond, detail = '') {
   console.log(`  ${mark} ${name}${detail ? ` — ${detail}` : ''}`)
 }
 
+/** The bit depth of a card's back print raster, straight off the endpoint the
+ * spooler reads — the one thing the ribbon is allowed to change about a card.
+ * Returns the HTTP status as a string when the raster is not ready. */
+async function rasterBits(prefix, id = 1) {
+  const res = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/${id}/print-raster/back`)
+  if (!res.ok) return `HTTP ${res.status}`
+  const buf = Buffer.from(await res.arrayBuffer())
+  // biBitCount in the BITMAPINFOHEADER at offset 28.
+  return buf.readUInt16LE(28)
+}
+
 /** Canonical structural form of an HTML fragment: tags by name, text with
  * whitespace collapsed. Insignificant whitespace between tags is dropped, so
  * the SPA renderer and the server renderer are compared on the tag structure
@@ -346,8 +357,8 @@ console.log('\nB. project page renders a card')
       JSON.stringify(queue.cards[0]))
     check('the queue reports the ribbon to load', queue.ribbon === 'ymckoko',
       String(queue.ribbon))
-    check('a YMCKOKO card is billed as a full double-sided one',
-      queue.cards[0]?.billed_sides === 2, String(queue.cards[0]?.billed_sides))
+    check('a YMCKOKO card is billed as one card, whatever its back',
+      queue.cards[0]?.billed_units === 1, String(queue.cards[0]?.billed_units))
   }
 
   // ---- scenario C: the auth boundary, then a frozen project ---------------
@@ -453,6 +464,21 @@ console.log('\nF. admin: list, status change, print preview, delete')
   check('preview offers no way to add cards', !/drop some images|upload/i.test(t2))
   check('has a prefix delete button', !!w2.document.querySelector('button.danger'))
 
+  // A card carried over from an earlier run, marked printed. Queuing the prefix
+  // has to clear that mark — `queued` is the reprint lever, not a resume.
+  const queueOf = () =>
+    realFetch(`${BASE}/api/prefixes/${prefix}/print-queue`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    }).then((r) => r.json())
+  const marked = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/printed`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  check('a card can be marked printed', marked.status === 200, String(marked.status))
+  check('the queue reports it printed',
+    await waitFor(async () => (await queueOf()).unprinted_count === 0),
+    JSON.stringify((await queueOf()).unprinted_count))
+
   // The detail form also carries the order reference.
   const st = w2.document.querySelector('#admin-status')
   st.value = 'queued'
@@ -466,6 +492,28 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const after2 = await api(`/api/prefixes/${prefix}`)
   check('status set from the detail page', after2.status === 'queued', after2.status)
   check('order reference saved alongside it', after2.order_ref === 'ADM-9', String(after2.order_ref))
+  // ...and the card that was marked printed is back in the run.
+  const q = await queueOf()
+  check('queuing cleared the card\'s printed mark',
+    q.cards[0]?.printed_at === null && q.unprinted_count === 1,
+    JSON.stringify(q.cards[0]))
+  check('a fresh queue is not a resume', q.resume === false, String(q.resume))
+
+  // Re-applying `queued` is not a transition, so a mark set since then survives
+  // it: a retried callback must not silently reprint a whole order.
+  await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/printed`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const again = await realFetch(`${BASE}/api/prefixes/${prefix}/status`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+    body: JSON.stringify({ status: 'queued' }),
+  })
+  check('re-applying queued is accepted', again.status === 200, String(again.status))
+  check('and clears nothing, because it is not a transition',
+    await waitFor(async () => (await queueOf()).unprinted_count === 0),
+    JSON.stringify((await queueOf()).unprinted_count))
 
   // Delete the prefix, from the detail page.
   w2.document.querySelector('button.danger').click()
@@ -515,11 +563,13 @@ console.log('\nG. pay button')
       text.slice(0, 160),
     )
     check('there is no submit button', !/Submit/.test(text), text.slice(0, 200))
-    // The default ribbon is YMCKOKO, which bills every card as a full
-    // double-sided one: 2 sides at 500 + 250 shipping = 1250 minor units. Match
-    // the digits, not the currency formatting, which depends on the host locale.
-    check('the total is shown', /12[.,]50/.test(text), text.slice(0, 300))
-    check('the total counts printed sides, not cards', /2 printed sides/.test(text), text.slice(0, 300))
+    // The default ribbon is YMCKOKO, whose price is per *card*: one card at 500
+    // + 250 shipping = 750 minor units. Charging it as two printed sides (as the
+    // old always-two rule did) would double it. Match the digits, not the
+    // currency formatting, which depends on the host locale.
+    check('the total is shown', /7[.,]50/.test(text), text.slice(0, 300))
+    check('the price is per card on a black-back ribbon, not per side',
+      /1 card ×/.test(text), text.slice(0, 300))
 
     const before = seen.length
     const payButton = [...w.document.querySelectorAll('button')].find((b) =>
@@ -642,11 +692,11 @@ console.log('\nH. ribbon availability: disabled, not absent')
 }
 
 // ---- scenario I: the per-card back choice ----------------------------------
-// The job fixes the ribbon; the *card* chooses what its back is, and the ribbon
-// bounds the choices: YMCKO's back is a colour panel set (any source), YMCKOKO's
-// is the second black panel (text only). One panel offers those choices and the
-// input each one needs — the colour depth is the ribbon's, never a third choice.
-console.log('\nI. one panel, the back choices the ribbon allows')
+// The job chooses the ribbon; the *card* chooses what its back is — and the two
+// are independent: the same four sources are offered on either ribbon, and the
+// only thing the ribbon changes is the colour depth the back is rendered in
+// (asserted below from the raster bytes themselves, not from a flag).
+console.log('\nI. one panel, the same back choices on either ribbon')
 {
   cookieJar = ''
 
@@ -694,7 +744,7 @@ console.log('\nI. one panel, the back choices the ribbon allows')
       !!w.document.querySelector('.side.editor .back-choices input[value="image"]'),
     )
     check(
-      'every back the colour ribbon can print is offered',
+      'all four back sources are offered',
       ['none', 'front', 'image', 'markdown'].every((s) => !!choice(w, s)),
       [...w.document.querySelectorAll('.back-choice input')].map((i) => i.value).join(','),
     )
@@ -755,26 +805,95 @@ console.log('\nI. one panel, the back choices the ribbon allows')
       !/without a finished back/.test(w.document.body.textContent ?? ''))
   }
 
-  // --- a black-panel ribbon: text is the only back it can print -----------
+  // --- switching the ribbon is seamless and lossless ----------------------
+  // The point of the unification: nothing about a card is tied to the ribbon,
+  // so the switch only re-renders. The card keeps every byte of its data — its
+  // back, its picture — and what changes is the depth of the raster the spooler
+  // fetches.
+  {
+    const prefix = await makePrefix('ymcko')
+    await addCard(prefix)
+    const fd = new NodeFormData()
+    fd.append('back_image', new NodeBlob([PNG], { type: 'image/png' }), 'back.png')
+    await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/back-image`, {
+      method: 'PUT',
+      body: fd,
+    })
+
+    const before = await api(`/api/prefixes/${prefix}/cards/1`)
+    check('a picture back on a colour ribbon rasterises in 24-bit',
+      (await rasterBits(prefix)) === 24, String(await rasterBits(prefix)))
+
+    const switchTo = async (ribbon) =>
+      (
+        await realFetch(`${BASE}/api/prefixes/${prefix}`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ribbon }),
+        })
+      ).status
+
+    check('switching to the black-panel ribbon is accepted',
+      (await switchTo('ymckoko')) === 200)
+    const after = await api(`/api/prefixes/${prefix}/cards/1`)
+    check('the card keeps its back source and its picture',
+      after.back === before.back &&
+        !!after.back_image_content_type === !!before.back_image_content_type,
+      `${before.back} -> ${after.back}`)
+    check('the same picture is re-rendered as a 1-bit raster',
+      (await rasterBits(prefix)) === 1, String(await rasterBits(prefix)))
+
+    check('switching back is accepted too', (await switchTo('ymcko')) === 200)
+    const back = await api(`/api/prefixes/${prefix}/cards/1`)
+    check('still nothing lost, and the raster is 24-bit again',
+      back.back === before.back &&
+        !!back.back_image_content_type &&
+        (await rasterBits(prefix)) === 24,
+      `back=${back.back} bits=${await rasterBits(prefix)}`)
+  }
+
+  // --- a black-panel ribbon: the same choices, rendered in 1 bit ----------
+  // The unification, asserted end to end: a YMCKOKO project offers every back,
+  // the server stores a picture back on it, and what differs is the raster the
+  // spooler fetches — 1 bit here, 24-bit on a colour-back project.
   {
     const prefix = await makePrefix('ymckoko')
     await addCard(prefix)
     const w = await mount(`/p/${prefix}`, { bust: 'i3' })
     const offered = [...w.document.querySelectorAll('.back-choice input')].map((i) => i.value)
-    check('a black-panel ribbon offers no picture back',
-      !offered.includes('image') && !offered.includes('front'), offered.join(','))
-    check('it offers single-sided and text',
-      offered.includes('none') && offered.includes('markdown'), offered.join(','))
+    check('a black-panel ribbon offers the same four backs',
+      offered.join(',') === 'none,front,image,markdown', offered.join(','))
 
-    // The server holds the same rule, not just the panel that renders it: a
-    // picture back cannot be stored on this ribbon at all.
-    const refused = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1`, {
+    // No guard server-side either: a picture back is stored, and reduced to
+    // black and white when it is rendered.
+    const accepted = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ back: 'image' }),
     })
-    check('the server refuses a picture back on a black-panel ribbon',
-      refused.status === 400, String(refused.status))
+    check('the server accepts a picture back on a black-panel ribbon',
+      accepted.status === 200, String(accepted.status))
+
+    const backFd = new NodeFormData()
+    backFd.append('back_image', new NodeBlob([PNG], { type: 'image/png' }), 'back.png')
+    const uploaded = await realFetch(
+      `${BASE}/api/prefixes/${prefix}/cards/1/back-image`,
+      { method: 'PUT', body: backFd },
+    )
+    check('the server stores it', uploaded.status === 200, String(uploaded.status))
+    check('an uploaded picture back rasterises to 1 bit on this ribbon',
+      (await rasterBits(prefix)) === 1, String(await rasterBits(prefix)))
+
+    // The pane still shows the picture — the server's depth-accurate preview,
+    // which for this ribbon is the black-and-white reduction.
+    const wPic = await mount(`/p/${prefix}`, { bust: 'i3b' })
+    check('the black-and-white back is previewed in the pane',
+      !!wPic.document.querySelector(
+        `img[src="/api/prefixes/${prefix}/cards/1/display-back"]`),
+    )
+    check('the pane says the picture prints in black and white',
+      /black and white/.test(wPic.document.body.textContent ?? ''),
+      (wPic.document.body.textContent ?? '').slice(0, 200))
 
     pick(w, 'markdown')
     const ta = await waitForEl(w.document, 'textarea#back-1')
@@ -802,16 +921,16 @@ console.log('\nI. one panel, the back choices the ribbon allows')
 
     const pane = w.document.querySelector('.preview.back.black-only')
     const t = w.document.body.textContent ?? ''
-    check('the back renders its 1-bit pane', !!pane)
-    check('the pane is labelled black only', /black only \(1 bit\)/i.test(t))
-    // A text back needs no picture, so its pane is not a drop area — and on this
-    // ribbon a picture back cannot be printed at all.
+    check('the back renders its text pane', !!pane)
+    check('the pane is captioned as black only',
+      /printed in black only/i.test(t), t.slice(0, 200))
+    // A text back needs no picture, so its pane is not a drop area.
     check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
-    check('no image is rendered on the black back', !/<img\b/.test(pane?.innerHTML ?? ''))
-    // The medium refuses a picture, so the editor says so instead of leaving a
-    // gap where the customer's artwork would have been.
+    check('no image is rendered on the text back', !/<img\b/.test(pane?.innerHTML ?? ''))
+    // The renderer drops an image construct whole, so the editor says so
+    // instead of leaving a gap where the customer's artwork would have been.
     check('the editor says image markup is not printed',
-      /image markup/i.test(t) && /cannot\s+print/i.test(t))
+      /image markup/i.test(t) && /never\s+prints/i.test(t))
     // A markdown back with text is complete: the page stops counting it as
     // unfinished once that card's write has landed.
     check('a text back is complete with no upload at all',
@@ -852,6 +971,150 @@ console.log('\nI. one panel, the back choices the ribbon allows')
       ),
     )
   }
+}
+
+// ---- scenario J: the admin edits prices and stock -------------------------
+// Both are database state with a write path of their own, so the panel is
+// driven for real: type a price, save it, read it back off the public shop
+// config; take a ribbon out of stock, watch the customer page lose the option.
+console.log('\nJ. admin: ribbon prices and stock')
+{
+  cookieJar = ''
+
+  const w = await mount('/admin', { bust: 'j1' })
+  const tok = w.document.querySelector('#admin-token')
+  tok.value = TOKEN
+  tok.dispatchEvent(new w.Event('input', { bubbles: true }))
+  await settle(150)
+  w.document.querySelector('form').dispatchEvent(
+    new w.Event('submit', { bubbles: true, cancelable: true }),
+  )
+  await settle(1500)
+
+  // What the shop looked like before this scenario touched it, so it can be put
+  // back exactly: a rerun against a persistent server must start where the first
+  // one did.
+  const shop0 = await realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
+  const original = Object.fromEntries(shop0.prices.map((p) => [p.ribbon, p.price_cents]))
+
+  const priceBox = (ribbon) => w.document.querySelector(`input#price-${ribbon}`)
+  const saveButton = (ribbon) =>
+    [...w.document.querySelectorAll('.srow')]
+      .find((r) => r.querySelector(`#price-${ribbon}`))
+      ?.querySelector('button')
+  const stockBox = (ribbon) => w.document.querySelector(`input#stock-${ribbon}`)
+  const shop = async () => realFetch(`${BASE}/api/shop/config`).then((r) => r.json())
+  const priceOf = async (ribbon) =>
+    (await shop()).prices.find((p) => p.ribbon === ribbon)
+
+  check('the shop panel renders one row per ribbon',
+    w.document.querySelectorAll('.srow').length === 2,
+    String(w.document.querySelectorAll('.srow').length))
+  check('each row shows its unit', /per printed side|per card/.test(
+    w.document.body.textContent ?? ''))
+  check('both price boxes are seeded from the server',
+    priceBox('ymcko')?.value === '5.00' && priceBox('ymckoko')?.value === '5.00',
+    `${priceBox('ymcko')?.value} / ${priceBox('ymckoko')?.value}`)
+  check('an unchanged price cannot be re-saved', saveButton('ymcko')?.disabled === true)
+
+  // A real edit: the box, then Save, then the server.
+  priceBox('ymckoko').value = '7.20'
+  priceBox('ymckoko').dispatchEvent(new w.Event('input', { bubbles: true }))
+  await settle(150)
+  check('editing a price enables its Save button', saveButton('ymckoko')?.disabled === false)
+  saveButton('ymckoko').click()
+  check('the new price is stored', await waitFor(async () =>
+    (await priceOf('ymckoko'))?.price_cents === 720),
+  String((await priceOf('ymckoko'))?.price_cents))
+  check('the stored unit is the ribbon\'s, not guessed',
+    (await priceOf('ymckoko'))?.unit === 'card', String((await priceOf('ymckoko'))?.unit))
+  check('the button says it saved', await waitFor(() => /Saved/.test(
+    saveButton('ymckoko')?.textContent ?? '')))
+  check('the other ribbon was left alone', (await priceOf('ymcko'))?.price_cents === 500)
+
+  // The customer pays the new price: one card on YMCKOKO, plus shipping.
+  //
+  // The customer calls go out unauthenticated — the admin session cookie would
+  // make them cookie-authenticated, and the test's own api() helper does not
+  // send the CSRF header that then becomes mandatory. Keep it aside and put it
+  // back for the rest of the panel's writes.
+  const adminCookie = cookieJar
+  cookieJar = ''
+  const prefix = (
+    await api('/api/prefixes', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+  ).uuid
+  const fd = new NodeFormData()
+  fd.append('name', 'Repriced Card')
+  fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'repriced.png')
+  await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+  const wc = await mount(`/p/${prefix}`, { bust: 'j2' })
+  await settle(1400)
+  check('the customer sees the new price', /7[.,]20/.test(wc.document.body.textContent ?? ''),
+    (wc.document.body.textContent ?? '').slice(0, 260))
+
+  cookieJar = adminCookie
+
+  // Garbage in the box is refused in the UI, and nothing is written.
+  const before = (await priceOf('ymcko')).price_cents
+  priceBox('ymcko').value = 'five'
+  priceBox('ymcko').dispatchEvent(new w.Event('input', { bubbles: true }))
+  await settle(150)
+  saveButton('ymcko').click()
+  await settle(600)
+  check('a price that is not a number is refused before it is sent',
+    /not a price/i.test(w.document.body.textContent ?? ''))
+  check('and nothing was written', (await priceOf('ymcko')).price_cents === before)
+
+  // The comma is what a German keyboard produces, so it has to work.
+  priceBox('ymcko').value = '6,50'
+  priceBox('ymcko').dispatchEvent(new w.Event('input', { bubbles: true }))
+  await settle(150)
+  saveButton('ymcko').click()
+  check('a comma decimal separator is understood',
+    await waitFor(async () => (await priceOf('ymcko')).price_cents === 650),
+    String((await priceOf('ymcko')).price_cents))
+
+  // Stock: uncheck, and the customer's chooser greys that ribbon out.
+  stockBox('ymcko').checked = false
+  stockBox('ymcko').dispatchEvent(new w.Event('change', { bubbles: true }))
+  await settle(1200)
+  check('the flag is stored', await waitFor(async () =>
+    (await shop()).prices.find((p) => p.ribbon === 'ymcko').available === false))
+  check('the panel says it is out of stock',
+    /out of stock/i.test(w.document.body.textContent ?? ''))
+  const wc2 = await mount('/p/' + prefix, { bust: 'j3' })
+  await settle(1400)
+  const byRibbon = (win, ribbon) =>
+    [...win.document.querySelectorAll('.mode')].find((el) =>
+      el.querySelector(`input[value="${ribbon}"]`))
+  check('the customer cannot pick the out-of-stock ribbon',
+    byRibbon(wc2, 'ymcko')?.querySelector('input')?.disabled === true)
+  check('but it is still offered, not removed',
+    wc2.document.querySelectorAll('.mode').length === 2)
+
+  // Put both ribbons back exactly as they were found.
+  const writePrice = async (ribbon, cents) => {
+    const box = priceBox(ribbon)
+    box.value = (cents / 100).toFixed(2)
+    box.dispatchEvent(new w.Event('input', { bubbles: true }))
+    await settle(150)
+    saveButton(ribbon).click()
+    return waitFor(async () => (await priceOf(ribbon)).price_cents === cents)
+  }
+  check('restoring a price through the same box works too',
+    await writePrice('ymckoko', original.ymckoko),
+    String((await priceOf('ymckoko')).price_cents))
+  await writePrice('ymcko', original.ymcko)
+  stockBox('ymcko').checked = true
+  stockBox('ymcko').dispatchEvent(new w.Event('change', { bubbles: true }))
+  await settle(1200)
+  check('the shop is back to how it was found',
+    (await shop()).prices.every((p) => p.available && p.price_cents === original[p.ribbon]),
+    JSON.stringify((await shop()).prices))
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);

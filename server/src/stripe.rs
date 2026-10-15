@@ -39,9 +39,9 @@ const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 ///
 /// Amounts are in the currency's *minor* unit (cents), the way Stripe wants
 /// them, so `500` with `eur` is €5.00. Per-ribbon prices — the price of one
-/// printed *side* — live in the database (`ribbon_prices`), not here; this
-/// struct only carries the shop-wide, deployment-level settings that are not
-/// per-ribbon.
+/// billing unit, a printed side or a whole card depending on the ribbon — live
+/// in the database (`ribbon_prices`), not here; this struct only carries the
+/// shop-wide, deployment-level settings that are not per-ribbon.
 #[derive(Debug, Clone)]
 pub struct Pricing {
     pub currency: String,
@@ -52,11 +52,11 @@ pub struct Pricing {
 }
 
 impl Pricing {
-    /// Order total in cents, from the price of one printed side and how many
-    /// sides the order burns. Only used to render a price before paying — the
+    /// Order total in cents, from the price of one billing unit and how many
+    /// units the order costs. Only used to render a price before paying — the
     /// authoritative figure is the one Stripe computes and reports back.
-    pub fn total_cents(&self, side_price_cents: i64, sides: i64) -> i64 {
-        side_price_cents.max(0) * sides.max(0) + self.shipping_cents.max(0)
+    pub fn total_cents(&self, unit_price_cents: i64, units: i64) -> i64 {
+        unit_price_cents.max(0) * units.max(0) + self.shipping_cents.max(0)
     }
 }
 
@@ -221,16 +221,18 @@ impl Stripe {
     /// `base_url` is where Stripe sends the customer back to; it is used
     /// verbatim for both the success and the cancel URL, with `?paid=1`
     /// appended to the success one purely so the UI can say "processing".
-    /// `sides` is how many ribbon panels the order burns — the session's line
-    /// item quantity — and `price_cents` the price of one of them. Pricing per
-    /// side rather than per card is what lets a YMCKO order mix single- and
-    /// double-sided cards, and what makes a YMCKOKO card cost its two panels
-    /// whether or not its back is printed.
+    /// `units` is how many billing units the order costs — the session's line
+    /// item quantity — and `price_cents` the price of one of them. What a unit
+    /// *is* differs per ribbon, so `unit` names it for the line item: one
+    /// printed side on YMCKO (which is what lets such an order mix single- and
+    /// double-sided cards), or one whole card on YMCKOKO (whose panel set is
+    /// spent whether or not the second black panel is used).
     pub async fn create_checkout_session(
         &self,
         prefix: Uuid,
-        sides: i64,
+        units: i64,
         price_cents: i64,
+        unit: &str,
         base_url: &str,
     ) -> Result<CheckoutSession, ApiError> {
         let page = format!("{base_url}/p/{prefix}");
@@ -261,7 +263,7 @@ impl Stripe {
             ));
         }
 
-        form.push(("line_items[0][quantity]".into(), sides.to_string()));
+        form.push(("line_items[0][quantity]".into(), units.to_string()));
         form.push((
             "line_items[0][price_data][currency]".into(),
             p.currency.clone(),
@@ -272,7 +274,10 @@ impl Stripe {
         ));
         form.push((
             "line_items[0][price_data][product_data][name]".into(),
-            "RFID/NFC card label (printed side)".into(),
+            // The unit is named, not assumed: "printed side" on YMCKO, "card"
+            // on YMCKOKO. A receipt reading "printed side × 2" for a one-card
+            // YMCKOKO order would be a lie about what was bought.
+            format!("RFID/NFC card label ({unit})"),
         ));
 
         for (i, country) in p.countries.iter().enumerate() {

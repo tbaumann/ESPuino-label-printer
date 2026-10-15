@@ -118,9 +118,9 @@ pub async fn create_prefix(
 /// Change a prefix's ribbon. Idempotent: re-applying the current ribbon is a
 /// no-op that still returns the prefix.
 ///
-/// Deliberately not guarded here — whether the prefix's *cards* can be printed
-/// on the new ribbon is [`cards_incompatible_with_ribbon`], which the route
-/// checks first so a refusal happens before anything is written.
+/// Nothing about a card is checked, because nothing about a card is tied to the
+/// ribbon except how it is rendered. Re-rendering the derived artifacts is the
+/// route's job; this only writes the column.
 pub async fn set_prefix_ribbon(
     pool: &SqlitePool,
     uuid: Uuid,
@@ -196,11 +196,14 @@ pub async fn set_ribbon_stock(
     Ok(RibbonStock { ribbon, in_stock })
 }
 
-/// The price of one printed side per ribbon, ordered by ribbon, for the shop
-/// config — each one carrying whether it can be ordered right now.
+/// The price of one billing unit per ribbon, ordered by ribbon, for the shop
+/// config — each one carrying what its unit is and whether it can be ordered
+/// right now.
 ///
-/// The price is per *side*: how many of them a card costs is the ribbon's rule
-/// ([`Ribbon::billed_sides`]), applied at the checkout, not stored per price.
+/// The stored figure is per unit, and the *unit* is the ribbon's own
+/// ([`Ribbon::billing_unit`]): one printed side on YMCKO, one whole card on
+/// YMCKOKO. How many units a card costs is [`Ribbon::billed_units`], applied at
+/// the checkout, not stored per price.
 pub async fn list_ribbon_prices(pool: &SqlitePool) -> Result<Vec<RibbonPrice>, ApiError> {
     let ribbons = list_ribbon_stock(pool).await?;
     let rows = sqlx::query("SELECT ribbon, price_cents FROM ribbon_prices ORDER BY ribbon")
@@ -215,6 +218,7 @@ pub async fn list_ribbon_prices(pool: &SqlitePool) -> Result<Vec<RibbonPrice>, A
             Ok(RibbonPrice {
                 ribbon,
                 price_cents: r.get("price_cents"),
+                unit: ribbon.billing_unit().to_string(),
                 available: ribbons
                     .iter()
                     .find(|s| s.ribbon == ribbon)
@@ -224,7 +228,7 @@ pub async fn list_ribbon_prices(pool: &SqlitePool) -> Result<Vec<RibbonPrice>, A
         .collect()
 }
 
-/// The price of one printed side on a ribbon, in the currency's minor unit.
+/// The price of one billing unit on a ribbon, in the currency's minor unit.
 ///
 /// A ribbon with no configured price is a misconfiguration, not a free card, so
 /// it surfaces as an error rather than silently pricing at zero.
@@ -235,6 +239,34 @@ pub async fn ribbon_price(pool: &SqlitePool, ribbon: Ribbon) -> Result<i64, ApiE
         .await?
         .ok_or_else(|| ApiError::Internal(format!("no price configured for ribbon {ribbon}")))?;
     Ok(row.get("price_cents"))
+}
+
+/// Set one ribbon's price (operator action). Upserts, so a price row deleted by
+/// hand is restored rather than silently ignored — a ribbon with no price would
+/// refuse every checkout.
+///
+/// Returns the price as the shop serves it, with the unit derived from the
+/// ribbon and `available` from the stock flag, so the caller never has to
+/// re-derive either.
+pub async fn set_ribbon_price(
+    pool: &SqlitePool,
+    ribbon: Ribbon,
+    price_cents: i64,
+) -> Result<RibbonPrice, ApiError> {
+    sqlx::query(
+        "INSERT INTO ribbon_prices (ribbon, price_cents) VALUES (?1, ?2)
+         ON CONFLICT(ribbon) DO UPDATE SET price_cents = excluded.price_cents",
+    )
+    .bind(ribbon.as_str())
+    .bind(price_cents)
+    .execute(pool)
+    .await?;
+    Ok(RibbonPrice {
+        ribbon,
+        price_cents,
+        unit: ribbon.billing_unit().to_string(),
+        available: ribbon_in_stock(pool, ribbon).await?,
+    })
 }
 
 /// Freeze the ribbon a prefix was charged for, so the spooler prints what the
@@ -282,6 +314,19 @@ pub async fn list_prefixes(
 /// Move a prefix to a new status. Re-applying the current status is a no-op
 /// (idempotent, so shop/queue callbacks can retry).
 ///
+/// **Entering `queued` clears every card's `printed_at`,** in the same
+/// transaction as the status write. `queued` means "this order is a print job
+/// waiting to be run", so requeueing reprints the whole order: a `printing`
+/// order that died halfway, or one already `printed` that has to be printed
+/// again. This is the operator's reprint lever, and the only place card print
+/// state is ever reset.
+///
+/// Two consequences are deliberate. `printing` does *not* clear anything — a
+/// spooler picking a half-finished job back up resumes from the marks. And
+/// re-applying `queued` to a prefix that is already `queued` is not a
+/// transition, so it resets nothing: a retried callback must not silently spend
+/// a ribbon.
+///
 /// `force` skips transition validation — used for admin writes, which may move
 /// a prefix to any status at any time (e.g. requeue a stuck `printing` order,
 /// which has no legal edge back).
@@ -313,6 +358,9 @@ pub async fn set_status(
             current.status, next
         )));
     }
+    // One transaction, so a prefix can never read as `queued` while its cards
+    // still carry the previous run's marks.
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE prefixes
             SET status = ?2,
@@ -323,8 +371,22 @@ pub async fn set_status(
     .bind(uuid.to_string())
     .bind(next.as_str())
     .bind(order_ref)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if next == PrefixStatus::Queued {
+        let cleared = sqlx::query(
+            "UPDATE cards SET printed_at = NULL, updated_at = datetime('now')
+              WHERE prefix_uuid = ?1 AND printed_at IS NOT NULL",
+        )
+        .bind(uuid.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if cleared > 0 {
+            tracing::info!(%uuid, cleared, "prefix queued: card print marks cleared, the order reprints");
+        }
+    }
+    tx.commit().await?;
     get_prefix(pool, uuid).await
 }
 
@@ -451,9 +513,8 @@ pub async fn next_card_id(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiErr
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
 ///
 /// A `back_image_path`/`back_image_content_type` of `None` clears any stored
-/// back image. Whether `back` is one the prefix's ribbon can print, and whether
-/// a `back_text` goes with it, is enforced by the route layer before this is
-/// called.
+/// back image. Whether a `back_text` goes with the `back` is enforced by the
+/// route layer before this is called; no ribbon rules out a back source.
 pub async fn upsert_card(
     pool: &SqlitePool,
     prefix: Uuid,
@@ -504,8 +565,7 @@ pub async fn upsert_card(
 ///
 /// The back source becomes [`BackSource::Image`]: attaching an image *is* saying
 /// that this card's back is that image, so the two are written together rather
-/// than leaving a card whose stored image nothing would look at. The caller has
-/// already checked that the prefix's ribbon can print a colour back.
+/// than leaving a card whose stored image nothing would look at.
 pub async fn set_card_back_image(
     pool: &SqlitePool,
     prefix: Uuid,
@@ -568,13 +628,15 @@ pub async fn cards_missing_back(pool: &SqlitePool, prefix: Uuid) -> Result<i64, 
     Ok(missing)
 }
 
-/// Total ribbon panels a prefix's cards are billed for on a given ribbon.
+/// Total billing units a prefix's cards cost on a given ribbon: the sum of
+/// [`Ribbon::billed_units`] over the cards.
 ///
-/// The rule is [`Ribbon::billed_sides`], applied per card: YMCKO charges per
-/// printed side, YMCKOKO charges a full double-sided card whatever the back is.
-/// Derived here from the stored back sources rather than from the request, so
-/// the figure the checkout locks into Stripe is the one the cards actually are.
-pub async fn billed_sides(
+/// The unit is the ribbon's own ([`Ribbon::billing_unit`]) — one printed side on
+/// YMCKO (one or two per card), one whole card on YMCKOKO — and it is the
+/// quantity the checkout's line item multiplies that ribbon's price by. Derived
+/// here from the stored back sources rather than from the request, so the figure
+/// the checkout locks into Stripe is the one the cards actually are.
+pub async fn billed_units(
     pool: &SqlitePool,
     prefix: Uuid,
     ribbon: Ribbon,
@@ -588,48 +650,19 @@ pub async fn billed_sides(
     let mut total = 0;
     for r in &rows {
         let back = back_source_of(r)?;
-        total += ribbon.billed_sides(back) * r.get::<i64, _>("n");
+        total += ribbon.billed_units(back) * r.get::<i64, _>("n");
     }
     Ok(total)
-}
-
-/// How many of a prefix's cards carry a back the given ribbon cannot print —
-/// i.e. how many would be stranded by switching the prefix to it.
-///
-/// Derived from [`Ribbon::allows_back`] rather than a second copy of the rule,
-/// so the two cannot drift. Used to refuse a ribbon change that would leave an
-/// order unprintable, which nobody would otherwise notice until the spooler
-/// went looking for a raster.
-pub async fn cards_incompatible_with_ribbon(
-    pool: &SqlitePool,
-    prefix: Uuid,
-    ribbon: Ribbon,
-) -> Result<i64, ApiError> {
-    if ribbon == Ribbon::Ymcko {
-        return Ok(0); // YMCKO prints any back side.
-    }
-    let rows = sqlx::query(
-        "SELECT back_source, COUNT(*) AS n FROM cards WHERE prefix_uuid = ?1 GROUP BY back_source",
-    )
-    .bind(prefix.to_string())
-    .fetch_all(pool)
-    .await?;
-    let mut bad = 0;
-    for r in &rows {
-        let src = back_source_of(r)?;
-        if !ribbon.allows_back(src) {
-            bad += r.get::<i64, _>("n");
-        }
-    }
-    Ok(bad)
 }
 
 /// Update a card's metadata without touching its front image.
 ///
 /// The back side is one choice, so a patch carries at most one intent for it:
-/// the new `back` (validated against the prefix's ribbon) and, for a markdown
-/// back, its text. Both are validated before anything is written, so a refused
-/// patch leaves the card exactly as it was.
+/// the new `back` and, for a markdown back, its text. Both are validated before
+/// anything is written, so a refused patch leaves the card exactly as it was.
+///
+/// No ribbon can refuse a back: every source is printable on either ribbon, and
+/// the ribbon only decides the depth the back is rendered in.
 ///
 /// Switching source deliberately leaves the *other* material in place: turning a
 /// card from `image` to `markdown` and back again must not lose the uploaded
@@ -641,17 +674,8 @@ pub async fn update_card_meta(
     patch: &CardPatch,
 ) -> Result<Card, ApiError> {
     let card = get_card(pool, prefix, id).await?; // 404 if the card is unknown
-    let ribbon = get_prefix(pool, prefix).await?.ribbon;
 
     // Validate the whole back change before writing any of it.
-    if let Some(back) = patch.back {
-        if !ribbon.allows_back(back) {
-            return Err(ApiError::BadRequest(format!(
-                "a '{back}' back cannot be printed on a {ribbon} prefix: its back panel is \
-                 black only, so use 'none' or 'markdown'"
-            )));
-        }
-    }
     if let Some(text) = patch.back_text.as_deref() {
         let effective = patch.back.unwrap_or(card.back);
         if effective != BackSource::Markdown {
@@ -883,14 +907,14 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
                 name: r.get("name"),
                 printed_at: r.get("printed_at"),
                 back: back_avail,
-                billed_sides: ribbon.billed_sides(back),
+                billed_units: ribbon.billed_units(back),
                 printable,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     // Derived before `cards` is moved into the queue.
     let unprinted_count = cards.iter().filter(|c| c.printed_at.is_none()).count() as i64;
-    let billed_sides = cards.iter().map(|c| c.billed_sides).sum();
+    let billed_units = cards.iter().map(|c| c.billed_units).sum();
     let resume = p.status == PrefixStatus::Printing && unprinted_count > 0;
     Ok(PrintQueue {
         prefix,
@@ -898,7 +922,7 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
         ribbon,
         cards,
         unprinted_count,
-        billed_sides,
+        billed_units,
         resume,
     })
 }
@@ -1159,46 +1183,55 @@ mod tests {
         assert_eq!(Ribbon::parse("ymckokok"), None);
     }
 
+    /// No ribbon rules out a back side: the only thing the ribbon changes is the
+    /// depth the back is rendered in. A picture on the second black panel is a
+    /// poor choice, not a forbidden one.
     #[test]
-    fn only_ymcko_can_print_a_colour_back() {
-        // YMCKO's back is a panel set of its own: anything print there.
-        for back in [
+    fn every_back_is_legal_on_either_ribbon_and_only_the_depth_differs() {
+        let backs = [
             BackSource::None,
             BackSource::Front,
             BackSource::Image,
             BackSource::Markdown,
-        ] {
-            assert!(Ribbon::Ymcko.allows_back(back), "ymcko allows {back}");
+        ];
+        for back in backs {
+            // The depth is the ribbon's consequence, whatever the source.
+            assert_eq!(
+                Ribbon::Ymcko.back_depth(),
+                BackDepth::Color,
+                "{back} on ymcko"
+            );
+            assert_eq!(
+                Ribbon::Ymckoko.back_depth(),
+                BackDepth::Black,
+                "{back} on ymckoko"
+            );
         }
-        // YMCKOKO's back is the second black panel: text yes, colour no.
-        assert!(Ribbon::Ymckoko.allows_back(BackSource::None));
-        assert!(Ribbon::Ymckoko.allows_back(BackSource::Markdown));
-        assert!(!Ribbon::Ymckoko.allows_back(BackSource::Image));
-        assert!(!Ribbon::Ymckoko.allows_back(BackSource::Front));
     }
 
+    /// The two ribbons price the same order differently, because their unit is
+    /// different: YMCKO charges per printed side, YMCKOKO per whole card —
+    /// its panel set is spent whether or not the second black panel is used.
     #[test]
-    fn back_depth_is_the_ribbons_consequence() {
-        assert_eq!(Ribbon::Ymcko.back_depth(), BackDepth::Color);
-        assert_eq!(Ribbon::Ymckoko.back_depth(), BackDepth::Black);
-    }
+    fn billing_units_are_sides_on_ymcko_and_cards_on_ymckoko() {
+        assert_eq!(Ribbon::Ymcko.billing_unit(), "side");
+        assert_eq!(Ribbon::Ymckoko.billing_unit(), "card");
 
-    #[test]
-    fn billing_is_per_printed_side_on_ymcko_and_always_two_on_ymckoko() {
-        // YMCKO bills the sides actually printed.
-        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::None), 1);
-        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Front), 2);
-        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Image), 2);
-        assert_eq!(Ribbon::Ymcko.billed_sides(BackSource::Markdown), 2);
-        // YMCKOKO always burns a full double-sided card: the second black panel
-        // is lost either way, so a blank back saves nothing.
+        assert_eq!(Ribbon::Ymcko.billed_units(BackSource::None), 1);
+        assert_eq!(Ribbon::Ymcko.billed_units(BackSource::Front), 2);
+        assert_eq!(Ribbon::Ymcko.billed_units(BackSource::Image), 2);
+        assert_eq!(Ribbon::Ymcko.billed_units(BackSource::Markdown), 2);
+
+        // One unit — one card — per card, single-sided or not. Not two: the
+        // stored price is the price of a *card* on this ribbon, so charging two
+        // of them per card doubles the bill.
         for back in [
             BackSource::None,
             BackSource::Front,
             BackSource::Image,
             BackSource::Markdown,
         ] {
-            assert_eq!(Ribbon::Ymckoko.billed_sides(back), 2, "{back}");
+            assert_eq!(Ribbon::Ymckoko.billed_units(back), 1, "{back}");
         }
     }
 
@@ -1455,8 +1488,12 @@ mod tests {
         assert_eq!(cards_missing_back(&pool, p.uuid).await.unwrap(), 2);
     }
 
+    /// What the checkout charges: the *same* four cards cost one thing on YMCKO
+    /// (per printed side) and another on YMCKOKO (per card), because each ribbon
+    /// prices its own unit. Every back source counts on either ribbon — no card
+    /// is unprintable, so no card has to be changed to switch.
     #[tokio::test]
-    async fn incompatibility_is_counted_from_the_ribbons_own_rule() {
+    async fn an_orders_billed_units_depend_on_the_ribbon() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
@@ -1466,51 +1503,15 @@ mod tests {
         card(&pool, p.uuid, 3, BackSource::Image).await;
         card(&pool, p.uuid, 4, BackSource::Markdown).await;
 
-        // YMCKO prints any of them, so nothing blocks a change to it.
+        // YMCKO: 1 + 2 + 2 + 2 printed sides.
         assert_eq!(
-            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymcko)
-                .await
-                .unwrap(),
-            0
+            billed_units(&pool, p.uuid, Ribbon::Ymcko).await.unwrap(),
+            7
         );
-        // YMCKOKO cannot print the colour-backed pair.
+        // YMCKOKO: one card each, whatever the back is.
         assert_eq!(
-            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
-                .await
-                .unwrap(),
-            2
-        );
-        // Switching is then legal only after they are single-sided again.
-        set_card_back_image(&pool, p.uuid, 3, "blobs/3-back.png", "image/png")
-            .await
-            .expect("re-attach");
-        update_card_meta(
-            &pool,
-            p.uuid,
-            3,
-            &CardPatch {
-                back: Some(BackSource::None),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("single-sided again");
-        update_card_meta(
-            &pool,
-            p.uuid,
-            2,
-            &CardPatch {
-                back: Some(BackSource::None),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("single-sided again");
-        assert_eq!(
-            cards_incompatible_with_ribbon(&pool, p.uuid, Ribbon::Ymckoko)
-                .await
-                .unwrap(),
-            0
+            billed_units(&pool, p.uuid, Ribbon::Ymckoko).await.unwrap(),
+            4
         );
     }
 
@@ -1567,26 +1568,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_markdown_back_is_refused_on_an_ineligible_ribbon() {
-        // Markdown is fine on YMCKOKO; a colour back is not.
+    async fn every_back_source_is_storable_on_either_ribbon() {
+        // A picture back on a black-panel ribbon is a poor choice, not a
+        // refused one: it is stored, and rendered in black.
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
             .await
             .expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
 
-        let err = update_card_meta(
-            &pool,
-            p.uuid,
-            1,
-            &CardPatch {
-                back: Some(BackSource::Image),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect_err("an image back cannot be printed on YMCKOKO");
-        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        for back in [BackSource::Front, BackSource::Image] {
+            let ok = update_card_meta(
+                &pool,
+                p.uuid,
+                1,
+                &CardPatch {
+                    back: Some(back),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{back} on YMCKOKO: {e:?}"));
+            assert_eq!(ok.back, back);
+        }
 
         let ok = update_card_meta(
             &pool,
@@ -1599,7 +1603,7 @@ mod tests {
             },
         )
         .await
-        .expect("markdown is printable on YMCKOKO");
+        .expect("markdown on YMCKOKO");
         assert_eq!(ok.back, BackSource::Markdown);
     }
 
@@ -1609,19 +1613,21 @@ mod tests {
         let p = create_prefix(&pool, None, None).await.expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
 
-        // The name is valid, the back is not. Neither may land.
+        // The name is valid; text against a back that is not markdown is not.
+        // (No ribbon rule can refuse a patch any more, so this is the one
+        // self-contradiction left.) Neither half may land.
         let err = update_card_meta(
             &pool,
             p.uuid,
             1,
             &CardPatch {
                 name: Some("Renamed".into()),
-                back: Some(BackSource::Image),
+                back_text: Some("- one".into()),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("image back on YMCKOKO");
+        .expect_err("back_text on a single-sided card");
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
         let c = get_card(&pool, p.uuid, 1).await.expect("card");
@@ -1722,6 +1728,59 @@ mod tests {
     // Print queue
     // -----------------------------------------------------------------------
 
+    /// Queuing is the operator's reprint lever: it puts every card back into
+    /// the run. Nothing else resets print state, and a retry must not.
+    #[tokio::test]
+    async fn entering_queued_clears_every_card_print_mark() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        card(&pool, p.uuid, 2, BackSource::None).await;
+        mark_card_printed(&pool, p.uuid, 1).await.expect("printed");
+        mark_card_printed(&pool, p.uuid, 2).await.expect("printed");
+        assert_eq!(print_queue(&pool, p.uuid).await.unwrap().unprinted_count, 0);
+
+        // Somewhere that is not `queued` leaves the marks alone.
+        set_status(&pool, p.uuid, PrefixStatus::Paid, None, true)
+            .await
+            .expect("paid");
+        assert_eq!(
+            print_queue(&pool, p.uuid).await.unwrap().unprinted_count,
+            0,
+            "moving to paid is not a reprint"
+        );
+
+        // Entering `queued` resets the whole run.
+        set_status(&pool, p.uuid, PrefixStatus::Queued, None, true)
+            .await
+            .expect("queued");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.unprinted_count, 2, "every card is unprinted again");
+        assert!(q.cards.iter().all(|c| c.printed_at.is_none()));
+        assert!(!q.resume, "a fresh run is not a resume");
+
+        // Re-applying `queued` is not a transition: a card printed from this
+        // queue stays marked, so a retried call cannot reprint a whole order.
+        mark_card_printed(&pool, p.uuid, 1).await.expect("printed");
+        set_status(&pool, p.uuid, PrefixStatus::Queued, None, true)
+            .await
+            .expect("queued again");
+        assert_eq!(
+            print_queue(&pool, p.uuid).await.unwrap().unprinted_count,
+            1,
+            "a no-op re-queue must not clear the marks"
+        );
+
+        // A half-finished order picked back up keeps its marks too: `printing`
+        // is where a spooler resumes from, not where it restarts.
+        set_status(&pool, p.uuid, PrefixStatus::Printing, None, true)
+            .await
+            .expect("printing");
+        let q = print_queue(&pool, p.uuid).await.expect("queue");
+        assert_eq!(q.unprinted_count, 1);
+        assert!(q.resume, "printing with cards still unprinted is a resume");
+    }
+
     #[tokio::test]
     async fn print_queue_reports_the_back_the_ribbon_prints() {
         let pool = test_pool().await;
@@ -1737,10 +1796,10 @@ mod tests {
         assert_eq!(q.cards[0].back, BackAvailability::Black);
         // A single-sided card has nothing to print on the back.
         assert_eq!(q.cards[1].back, BackAvailability::None);
-        // YMCKOKO bills two panels for every card, single-sided or not.
-        assert_eq!(q.billed_sides, 4);
-        assert_eq!(q.cards[0].billed_sides, 2);
-        assert_eq!(q.cards[1].billed_sides, 2);
+        // YMCKOKO bills one card per card, single-sided or not.
+        assert_eq!(q.billed_units, 2);
+        assert_eq!(q.cards[0].billed_units, 1);
+        assert_eq!(q.cards[1].billed_units, 1);
     }
 
     #[tokio::test]
@@ -1763,7 +1822,7 @@ mod tests {
         assert_eq!(q.cards[2].back, BackAvailability::Color);
         assert_eq!(q.cards[3].back, BackAvailability::None);
         // YMCKO bills per printed side.
-        assert_eq!(q.billed_sides, 2 + 2 + 2 + 1);
+        assert_eq!(q.billed_units, 2 + 2 + 2 + 1);
     }
 
     #[tokio::test]

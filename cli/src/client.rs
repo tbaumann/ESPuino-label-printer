@@ -220,8 +220,8 @@ impl Client {
     }
 
     /// Upload (or replace) one card's back image, leaving its front alone, and
-    /// make that image the card's back. Only a ribbon that can print a colour
-    /// back (YMCKO) accepts this; the server answers 400 on YMCKOKO.
+    /// make that image the card's back. Either ribbon accepts it: on a
+    /// black-panel ribbon the picture is rendered in black and white.
     pub async fn upload_back_image(&self, prefix: &str, id: i64, file: &Path) -> Result<Value> {
         let bytes = tokio::fs::read(file)
             .await

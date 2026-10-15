@@ -3,7 +3,7 @@
   import {
     api,
     backIncomplete,
-    billedSides,
+    billedUnits,
     formatMoney,
     RIBBONS,
     rememberProject,
@@ -37,13 +37,14 @@
   // Amounts pre-rendered, so the template never re-derives a price and `shop`
   // never has to be narrowed there.
   //
-  // The price is per printed *side*; how many sides the order burns is the sum
-  // over the cards, because a batch may mix single- and double-sided cards. The
-  // one exception is YMCKOKO, where every card is a full double-sided one
-  // whatever its back is (its second black panel is spent either way), which is
-  // `billedSides`' rule.
-  const sides = $derived(
-    prefix ? cards.reduce((n, c) => n + billedSides(prefix!.ribbon, c.back), 0) : 0,
+  // A ribbon's price is the price of one *billing unit*, and the two ribbons
+  // price the same order differently: YMCKO's unit is one printed side (so the
+  // count is the sum over the cards, because a batch may mix single- and
+  // double-sided ones), YMCKOKO's is one whole card (its panel set is spent
+  // whether or not the second black panel is used). That rule is `billedUnits`,
+  // mirroring the server's.
+  const units = $derived(
+    prefix ? cards.reduce((n, c) => n + billedUnits(prefix!.ribbon, c.back), 0) : 0,
   )
 
   const shopView = $derived(
@@ -52,14 +53,17 @@
           const price = shop.prices.find((p) => p.ribbon === prefix!.ribbon)
           if (!price) return null
           return {
-            perSide: formatMoney(price.price_cents, shop.currency),
-            sides,
+            perUnit: formatMoney(price.price_cents, shop.currency),
+            // What the unit is called, straight from the server: "side" or
+            // "card". The UI never guesses it from the ribbon.
+            unit: price.unit,
+            units,
             shipping:
               shop.shipping_cents > 0
                 ? formatMoney(shop.shipping_cents, shop.currency)
                 : null,
             total: formatMoney(
-              price.price_cents * sides + shop.shipping_cents,
+              price.price_cents * units + shop.shipping_cents,
               shop.currency,
             ),
           }
@@ -67,10 +71,11 @@
       : null,
   )
 
-  // One row per ribbon, in the order the shop offers them, each with the price
-  // of one printed side and whether it is currently in stock. An out-of-stock
-  // ribbon stays in this list — the customer should see that it exists and is
-  // out — and is rendered disabled rather than dropped.
+  // One row per ribbon, in the order the shop offers them, each with its price —
+  // per *unit*, and the unit is named as the server names it — and whether it is
+  // currently in stock. An out-of-stock ribbon stays in this list — the customer
+  // should see that it exists and is out — and is rendered disabled rather than
+  // dropped.
   //
   // Without a shop config there is nothing to say about stock, so everything
   // reads as available; the server is the one that actually refuses, and a
@@ -81,7 +86,10 @@
       return {
         ...r,
         available: price ? price.available : true,
-        price: price && shop ? `${formatMoney(price.price_cents, shop.currency)} per side` : null,
+        price:
+          price && shop
+            ? `${formatMoney(price.price_cents, shop.currency)} per ${price.unit}`
+            : null,
       }
     }),
   )
@@ -104,9 +112,9 @@
     error = null
     try {
       prefix = await api.setRibbon(uuid, ribbon)
-      // The ribbon decides what a back may be, so a card that chose a picture
-      // back may no longer be printable. The server refuses the change that
-      // would strand one, and this re-read makes sure the rows agree with it.
+      // Nothing on a card changes with the ribbon, so no card can be stranded:
+      // the server re-renders the rasters and repaints the back previews in the
+      // new colour depth. Re-read the cards, because those previews did change.
       await refresh()
     } catch (e) {
       error = (e as Error).message
@@ -269,7 +277,7 @@
         <h2>Ribbon</h2>
         <span style="flex:1"></span>
         <span class="muted">
-          one ribbon per project — it decides what a card's back can be
+          one ribbon per project — it decides how a card's back is printed
         </span>
       </div>
       <div class="modes">
@@ -324,7 +332,7 @@
           <span style="flex:1"></span>
           {#if !awaitingPayment}
             <span class="muted">
-              {shopView.sides} printed side{shopView.sides === 1 ? '' : 's'} × {shopView.perSide}
+              {shopView.units} {shopView.unit}{shopView.units === 1 ? '' : 's'} × {shopView.perUnit}
               {#if shopView.shipping}
                 + {shopView.shipping} shipping
               {/if}

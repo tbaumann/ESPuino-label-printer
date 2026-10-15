@@ -76,7 +76,7 @@ Commands (every API field is a flag):
 | `prefix set-status <P> <STATUS> [--order-ref R]` | set a prefix's status (any transition) |
 | `card list <P>` | index of cards in a prefix |
 | `card get <P> <ID>` / `card delete <P> <ID>` | card metadata / delete |
-| `card back-image <P> <ID> <FILE>` | upload/replace a card's back image, making that image its back (YMCKO only) |
+| `card back-image <P> <ID> <FILE>` | upload/replace a card's back image, making that image its back |
 | `upload <P> <FILE> [--id N] [--name N] [--serial-number S] [--back B] [--back-text T]` | upload one card |
 | `batch <P> <DIR> [--recursive] [--start-id N] [--name-template T] [--serial-prefix P] [--serial-width W] [--back B] [--back-text T] [--dry-run]` | upload a folder |
 
@@ -136,19 +136,21 @@ covers payment properly.
 Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
 *is* the prefix. Use "Open" to return to an existing project code; recent
 projects are remembered in `localStorage`. A project page holds the ribbon
-chooser (one radio per ribbon, with the price of one printed side; a ribbon that
+chooser (one radio per ribbon, with the price of one billing unit — a printed
+side or a whole card, as the server names it; a ribbon that
 is out of stock is shown greyed out and disabled, never removed), the drop zone
 (drag images, or a whole folder) and one row per card.
 
 ### One card panel, and the per-card back choice
 
-The ribbon fixes what a back *may* be; the card chooses what its back *is*.
-`CardRow.svelte` renders each card — the front, the back the chosen source
-produces, and the editor beside them — and puts the two controls in two places on
-purpose: which back the card *has* is chosen in the editor (one button per source
-the ribbon allows, with what that source needs under it), while the **file chooser
-for an `image` back sits in the back pane**, because that pane is the picture it
-chooses. `cards/CardFields.svelte` holds the shared header (name, delete and the
+The card chooses what its back *is*; the ribbon chooses nothing about that — it
+decides only the colour depth the back is rendered in, and therefore what the
+spooler is handed. `CardRow.svelte` renders each card — the front, the back the
+chosen source produces, and the editor beside them — and puts the two controls in
+two places on purpose: which back the card *has* is chosen in the editor (one
+button per source, all four on either ribbon, with what that source needs under
+it), while the **file chooser for an `image` back sits in the back pane**, because
+that pane is the picture it chooses. `cards/CardFields.svelte` holds the shared header (name, delete and the
 debounced save).
 
 | `back` | Printed on the back | The pane shows | The editor offers |
@@ -158,18 +160,23 @@ debounced save).
 | `image` | a second uploaded picture | the uploaded picture, or the drop prompt | the file chooser, in the pane |
 | `markdown` | text, rendered to an image | the rendered markdown | the back-text textarea |
 
+The pane shows the *depth-accurate* render, which is the server's output: on a
+colour-back ribbon that is the picture, on a black-back one the same picture
+reduced to black and white. Switching the project's ribbon therefore repaints
+the back previews — and nothing else about the card changes.
+
 While an `image` pane holds no picture yet, the **whole pane is a file drop
 area**: a picture dropped anywhere on it becomes that card's back, and clicking
 the empty area opens the picker. A pane already showing artwork still takes a drop
 — a deliberate replace — but no longer opens a file dialog on a click, since the
-chooser inside it is right there. On YMCKOKO `image` is not on offer at all, so
-there is no drop area to be had.
+chooser inside it is right there.
 
-Everything but `none` makes the card double-sided. Which of the four are on
-offer is the ribbon's rule, not a per-card one: YMCKO's back is a colour panel
-set of its own, so it offers all four; YMCKOKO's back is the second black panel,
-so it offers `none` and `markdown` only. The API holds the same rule and refuses
-the rest with `400`.
+Everything but `none` makes the card double-sided. All four sources are on offer
+on either ribbon: the ribbon is not a permission, only a rendering choice. A
+picture on YMCKOKO's second black panel comes out black and white rather than
+being refused — a poor choice, and the customer's to make. On a `markdown` back
+the editor *does* say when image markup will be dropped, and on a black-back
+ribbon when a picture will be reduced, but neither is a refusal.
 
 The drop zone uploads **fronts** — one file, one card — so a new card is
 single-sided, and one with an `image` back starts without its picture. The page
@@ -200,6 +207,17 @@ order reference. Each row takes a new status, and there is a delete button;
 `/admin/p/<uuid>` shows that prefix's cards as a read-only **print preview** —
 front image and back panel, with no editor, no uploader and nothing that writes
 to a card.
+
+Above the prefix list sits the shop itself: one row per ribbon with its price in
+the shop's currency and its stock checkbox. The price is written for the
+ribbon's own unit — a printed side, or a whole card — and the row says which, so
+the operator never has to know the rule to read the number. Both are database
+state (`ribbon_prices`, `ribbon_stock`) with their own endpoints
+(`PUT /api/shop/ribbons/{ribbon}/price`, `PUT /api/shop/ribbons/{ribbon}`), so
+the shop can be repriced or a ribbon pulled without a redeploy. A price change
+applies to checkouts opened after it, never to one already open; a ribbon taken
+out of stock keeps its price and stays visible-but-disabled in the customer
+chooser, and only stops *new* checkouts.
 
 The admin views are just two more routes under `web/src/routes/`; there is no
 separate bundle. Since the session cookie is `HttpOnly`, the UI cannot read it,
@@ -280,10 +298,11 @@ line.
    and copy its signing secret into `STRIPE_WEBHOOK_SECRET`;
 4. set `PUBLIC_BASE_URL` to the public origin, e.g. `https://cards.example.com`
    — that is where Stripe sends the customer back;
-5. set the prices: `ribbon_prices` holds the price of one printed *side* per
-   ribbon (seeded at 500 cents each), alongside `STRIPE_SHIPPING_CENTS` and
-   `STRIPE_CURRENCY`. A card costs one or two of them, and YMCKOKO always
-   charges two. Taking a ribbon out of stock is the same kind of database state
+5. set the prices: `ribbon_prices` holds one price per ribbon (seeded at 500
+   cents each), alongside `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`. The
+   unit differs per ribbon — a printed side on YMCKO (a card costs one or two of
+   them), a whole card on YMCKOKO — and `Ribbon::billing_unit` is what says so.
+   Taking a ribbon out of stock is the same kind of database state
    (`ribbon_stock`, both ribbons seeded in stock), flipped through
    `PUT /api/shop/ribbons/{ribbon}` with the operator token;
 6. only then switch to live keys.
@@ -405,19 +424,22 @@ data/
   Carries a `status` (see lifecycle below), `status_changed_at`, an optional
   `order_ref` (external shop id), and a `ribbon` that fixes the ribbon load and
   therefore what a card's back side may be.
-- **Ribbons** — `ymcko` (colour front, and a back that may be a picture, a
-  copy of the front, or text — in colour) and `ymckoko` (colour front, black-only
-  back; the **default**). The one choice per *job*, because a batch cannot mix
-  ribbon loads. Set at prefix creation or via `PATCH /api/prefixes/{prefix}`
-  while the prefix is still writable — refused with `409` if a card's back
-  could not be printed on the new ribbon.
-- **Pricing** — one price per ribbon, for one printed *side*, in the database
-  (`ribbon_prices`, seeded at 500 cents each), not the environment. YMCKO bills
-  per printed side (one for a single-sided card, two for a double-sided one);
-  YMCKOKO always bills two, because its second black panel is spent either way.
-  When a checkout opens, the ribbon is snapshotted onto the prefix
-  (`paid_ribbon`), so the spooler prints what the customer paid for even if the
-  operator later changes it.
+- **Ribbons** — `ymcko` (colour front and a full-colour back) and `ymckoko`
+  (colour front, black-and-white back; the **default**). The one choice per
+  *job*, because a batch cannot mix ribbon loads. Set at prefix creation or via
+  `PATCH /api/prefixes/{prefix}` while the prefix is still writable. The switch
+  is always lossless: no card is tied to the ribbon except in how it is
+  rendered, so the route re-renders the prefix's derived artifacts from the
+  stored originals and nothing else changes.
+- **Pricing** — one price per ribbon in the database (`ribbon_prices`, seeded at
+  500 cents each), not the environment, and the *unit* that price is for differs
+  per ribbon (`unit` in the shop config, `Ribbon::billing_unit`): YMCKO prices a
+  printed *side* (one for a single-sided card, two for a double-sided one),
+  YMCKOKO prices a whole *card* whatever its back is, because its panel set is
+  spent whether or not the second black panel is used. `Ribbon::billed_units`
+  applies the rule at the checkout. When a checkout opens, the ribbon is
+  snapshotted onto the prefix (`paid_ribbon`), so the spooler prints what the
+  customer paid for even if the operator later changes it.
 - **Ribbon availability** — two stock flags in the database (`ribbon_stock`,
   `ymcko` and `ymckoko`, both seeded in stock), flipped through
   `PUT /api/shop/ribbons/{ribbon}`. The shop config serves both flags and, per
@@ -458,6 +480,13 @@ draft ──Pay──▶ payment_pending ──paid──▶ paid ──▶ queu
 - `GET /api/prefixes?status=paid` is the print queue's work list.
 - Transitions are validated; an invalid one returns `409`. Re-applying the
   current status is a no-op, so shop/queue callbacks can safely retry.
+- **Entering `queued` clears every card's `printed_at`, in the same transaction
+  as the status write** — `queued` means "a print run waiting to happen", so it
+  is the operator's reprint lever: a half-printed job, or one already printed
+  that has to be printed again, starts from card 1 instead of resuming. No other
+  status touches print state: `printing` is where the spooler resumes from, and
+  re-applying `queued` when the prefix is already queued is not a transition, so
+  it clears nothing (a retried callback must not spend a ribbon).
 - There are no accounts: a customer's credential is the prefix uuid they know,
   and the operator additionally presents a bearer token. See "Who may do what".
 
@@ -554,9 +583,10 @@ an admin session.
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | back image bytes (an `image` back only) |
-| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the back image, making that image the card's back (YMCKO only) |
-| GET    | `/api/shop/config`                     | price, currency, ribbon availability, and whether payment is on |
+| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the back image, making that image the card's back |
+| GET    | `/api/shop/config`                     | prices, currency, ribbon stock, shipping and countries |
 | PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
+| PUT    | `/api/shop/ribbons/{ribbon}/price`     | set a ribbon's price, in minor units, for its own unit **(admin)** |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
 | POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |
 | POST   | `/api/admin/session`                   | log in: token → session cookie |
@@ -567,9 +597,9 @@ Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
 `name`, `serial_number`, `back`, `back_text` and a file part `image`, plus an
 optional `back_image` file part. `back` is one of `none`, `front`, `image` or
 `markdown`, and defaults to `none` (a single-sided card); sending a `back_image`
-part implies `back=image`. `back_text` is only accepted for a `markdown` back,
-and `back_image` only when the prefix's ribbon can print a colour back — a field
-that does not fit is rejected with `400`, never silently stored.
+part implies `back=image`. `back_text` is only accepted for a `markdown` back;
+no ribbon restricts a back *source*, so `400` is for a form that contradicts
+itself, never for a choice the ribbon dislikes.
 
 `back_image` is optional even for an `image` back, because cards are created by
 the front-image dropzone, one file at a time. A card without one is simply not

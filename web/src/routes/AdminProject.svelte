@@ -115,6 +115,10 @@
       </div>
       <p class="muted" style="margin-top:8px;font-size:13px">
         Any status, in any direction — including back out of printing.
+        Queuing <strong>reprints the whole order</strong>: it clears every card's
+        printed mark, so a job that died halfway starts again from card 1. Setting
+        any other status leaves the marks alone, and so does re-applying the status
+        the prefix already has.
       </p>
     </section>
 

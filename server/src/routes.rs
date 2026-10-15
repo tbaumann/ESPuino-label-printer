@@ -15,7 +15,7 @@ use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, BackSource, Card, CardIndex, CardPatch, NeedsAttentionItem,
     NeedsAttentionKind, Prefix, PrefixInput, PrefixRibbonPatch, PrefixStatus, PrintQueue, Ribbon,
-    RibbonStock, RibbonStockPatch, ShopConfig, StatusInput,
+    RibbonPrice, RibbonPricePatch, RibbonStock, RibbonStockPatch, ShopConfig, StatusInput,
 };
 use crate::notify;
 use crate::render;
@@ -107,8 +107,10 @@ struct StoredCard {
 }
 
 /// Pull `name`, `serial_number`, `back`, `back_text`, an `image` file and an
-/// optional `back_image` file out of a multipart form, validating the back
-/// fields against the prefix's ribbon *before* writing anything to disk.
+/// optional `back_image` file out of a multipart form, validating the fields
+/// against each other *before* writing anything to disk. The prefix's ribbon
+/// has no say here: it changes how a back is rendered, never whether one is
+/// allowed.
 ///
 /// The `back_image` is **optional even for an `image` back**: a card exists
 /// from its front image, and the back image is added per card afterwards
@@ -122,7 +124,6 @@ async fn store_card_form(
     data_dir: &PathBuf,
     prefix: Uuid,
     id: i64,
-    ribbon: Ribbon,
 ) -> Result<StoredCard, ApiError> {
     let mut name: Option<String> = None;
     let mut serial: Option<String> = None;
@@ -227,14 +228,6 @@ async fn store_card_form(
         (None, false) => BackSource::None,
     };
 
-    // The back side is fixed by the ribbon, which is the one thing a batch
-    // cannot mix. Reject rather than silently store a field nothing will render.
-    if !ribbon.allows_back(back) {
-        return Err(ApiError::BadRequest(format!(
-            "a '{back}' back cannot be printed on a {ribbon} prefix: its back panel is black \
-             only, so use 'none' or 'markdown'"
-        )));
-    }
     if back_text.is_some() && back != BackSource::Markdown {
         return Err(ApiError::BadRequest(format!(
             "back_text is only valid for a 'markdown' back, not '{back}'"
@@ -347,11 +340,12 @@ async fn rerender_card(
         read_original(&format!("blobs/{prefix}/{id}-back.{}", extension_for(ct)))
     });
 
-    // Back side, from the card's own choice. Where the back is an image, the
-    // *ribbon* decides the colour depth it is rendered in — and because only
-    // YMCKO may print an image back at all (see `Ribbon::allows_back`), that
-    // raster is always 24-bit colour here. A markdown back is the one source a
-    // black-panel ribbon can print too, so the depth is passed to its renderer.
+    // Back side, from the card's own choice. The *ribbon* decides the colour
+    // depth every back source is rendered in — 24-bit colour on YMCKO, 1-bit
+    // black on YMCKOKO — and nothing else about the back depends on it. A
+    // picture on a black panel is reduced to black and white rather than
+    // refused; the choice is the customer's.
+    let depth = ribbon.back_depth();
     let (back_display, back_raster) = match card.back {
         // A single-sided card: no back side exists, so there is nothing to
         // render and the statuses stay absent.
@@ -360,16 +354,16 @@ async fn rerender_card(
         // original and it needs no upload of its own.
         BackSource::Front => match front_original.as_deref() {
             Some(orig) => (
-                Some(color_display(st, prefix, id, orig)?),
-                Some(color_raster(st, prefix, id, orig, &raster)?),
+                Some(back_display(st, prefix, id, orig, depth)?),
+                Some(back_raster(st, prefix, id, orig, &raster, depth)?),
             ),
             // The front failed to render above; nothing to derive a back from.
             None => (None, None),
         },
         BackSource::Image => match back_original.as_deref() {
             Some(orig) => (
-                Some(color_display(st, prefix, id, orig)?),
-                Some(color_raster(st, prefix, id, orig, &raster)?),
+                Some(back_display(st, prefix, id, orig, depth)?),
+                Some(back_raster(st, prefix, id, orig, &raster, depth)?),
             ),
             // Not uploaded yet: the card is incomplete rather than having an
             // empty back silently substituted.
@@ -381,7 +375,7 @@ async fn rerender_card(
             // reason, so the card is visibly not printable rather than having a
             // blank back silently substituted.
             Some(text) => {
-                let res = render::render_back_markdown_stub(text, &raster, ribbon.back_depth());
+                let res = render::render_back_markdown_stub(text, &raster, depth);
                 let (status, err) = match res {
                     RenderResult::Ready(_) => (RenderStatus::Ready, None),
                     RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
@@ -404,16 +398,20 @@ async fn rerender_card(
     .await
 }
 
-/// Render a colour back display image from `original`, write it and report.
-fn color_display(
+/// Render a back display image from `original`, write it and report. The
+/// preview is the depth-accurate render: on a black panel it is the same
+/// black-and-white reduction the raster is built from, so what the row shows is
+/// what the printer puts on the card.
+fn back_display(
     st: &AppState,
     prefix: Uuid,
     id: i64,
     original: &[u8],
+    depth: crate::models::BackDepth,
 ) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
     use crate::models::RenderStatus;
     use crate::render::RenderResult;
-    Ok(match render::render_back_display_color(original) {
+    Ok(match render::render_back_display(original, depth) {
         RenderResult::Ready(bytes) => {
             write_blob(&st.data_dir, prefix, &format!("{id}-back-display.png"), &bytes)?;
             (RenderStatus::Ready, None)
@@ -422,21 +420,20 @@ fn color_display(
     })
 }
 
-/// Render a 24-bit colour back print raster from `original`, write it and
-/// report. `size` is only the raster's dimensions — the colour depth is the
-/// ribbon's, and a black-panel back never reaches this at all (see
-/// [`crate::models::Ribbon::allows_back`]): its back is the markdown renderer's
-/// 1-bit output.
-fn color_raster(
+/// Render a back print raster from `original`, write it and report. `size` is
+/// the printer's internal bitmap; `depth` is the ribbon's, which decides the
+/// format — a 24-bit colour BMP, or a 1-bit one for the second black panel.
+fn back_raster(
     st: &AppState,
     prefix: Uuid,
     id: i64,
     original: &[u8],
     size: &crate::render::RasterSize,
+    depth: crate::models::BackDepth,
 ) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
     use crate::models::RenderStatus;
     use crate::render::RenderResult;
-    Ok(match render::render_back_raster_color(original, size) {
+    Ok(match render::render_back_raster(original, size, depth) {
         RenderResult::Ready(bytes) => {
             write_blob(&st.data_dir, prefix, &format!("{id}-back-print.bmp"), &bytes)?;
             (RenderStatus::Ready, None)
@@ -559,10 +556,8 @@ pub async fn put_card(
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
-    let ribbon = db::ensure_writable(&st.pool, prefix, caller.is_admin())
-        .await?
-        .ribbon;
-    let c = store_card_form(mp, &st.data_dir, prefix, id, ribbon).await?;
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    let c = store_card_form(mp, &st.data_dir, prefix, id).await?;
     db::upsert_card(
         &st.pool,
         prefix,
@@ -595,11 +590,9 @@ pub async fn post_card(
 ) -> Result<(StatusCode, Json<Card>), ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
-    let ribbon = db::ensure_writable(&st.pool, prefix, caller.is_admin())
-        .await?
-        .ribbon;
+    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let id = db::next_card_id(&st.pool, prefix).await?;
-    let c = store_card_form(mp, &st.data_dir, prefix, id, ribbon).await?;
+    let c = store_card_form(mp, &st.data_dir, prefix, id).await?;
     db::upsert_card(
         &st.pool,
         prefix,
@@ -848,21 +841,16 @@ async fn read_file_part(mut mp: Multipart, part: &str) -> Result<(Vec<u8>, Strin
 /// Reject a back-image write that this prefix or card cannot take.
 ///
 /// Split out from the handler so the two refusals that are not multipart
-/// plumbing — the ribbon cannot print a colour back at all, and the card does
-/// not exist — are testable without building a multipart body.
+/// plumbing — the prefix is frozen, and the card does not exist — are testable
+/// without building a multipart body. No ribbon is consulted: an `image` back is
+/// legal on either one, and on a black panel it is simply rendered in black.
 async fn ensure_back_image_writable(
     pool: &SqlitePool,
     prefix: Uuid,
     id: i64,
     admin: bool,
 ) -> Result<(), ApiError> {
-    let ribbon = db::ensure_writable(pool, prefix, admin).await?.ribbon;
-    if !ribbon.allows_back(BackSource::Image) {
-        return Err(ApiError::BadRequest(format!(
-            "an uploaded back image is a colour back, which the {ribbon} ribbon cannot print; \
-             use a 'markdown' back or a single-sided card instead"
-        )));
-    }
+    db::ensure_writable(pool, prefix, admin).await?;
     db::get_card(pool, prefix, id).await?; // 404 for an unknown card
     Ok(())
 }
@@ -874,8 +862,8 @@ async fn ensure_back_image_writable(
 /// time), and the back is then added per card. Attaching the image also makes
 /// the card's `back` [`BackSource::Image`] — see `db::set_card_back_image`.
 ///
-/// Only a ribbon that can print a colour back accepts this, so a YMCKOKO prefix
-/// refuses the upload rather than storing a blob nothing will ever print.
+/// The ribbon has no say in whether the upload is accepted: on a black panel the
+/// picture is rendered to 1 bit rather than refused.
 ///
 /// Re-uploading replaces the stored blob, whatever format the old one was in —
 /// `write_blob` cleans the earlier file up, so there are no orphans.
@@ -885,7 +873,7 @@ async fn ensure_back_image_writable(
         description = "Multipart form carrying exactly one file part, `back_image`."),
     responses(
         (status = 200, body = Card),
-        (status = 400, description = "the mode has no colour back, or the file part is missing or empty", body = crate::error::ErrorBody),
+        (status = 400, description = "the file part is missing or empty", body = crate::error::ErrorBody),
         (status = 404, description = "unknown prefix or card", body = crate::error::ErrorBody),
         (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
     ))]
@@ -911,11 +899,15 @@ pub async fn put_card_back_image(
 
 /// Change a prefix's ribbon while it is still writable.
 ///
-/// Refused if the change would strand a card: a YMCKOKO prefix cannot print a
-/// colour back, so a prefix holding one has to have those cards made
-/// single-sided (or markdown-backed) first. Without this the change would
-/// succeed and produce an order the spooler could not print, which nobody would
-/// notice until printing.
+/// Always allowed, and always lossless: nothing about a card is tied to the
+/// ribbon except *how it is rendered*, so the switch cannot strand a card. What
+/// it does change is the colour depth of every back side, so the prefix's
+/// derived artifacts are re-rendered from the stored originals — the back
+/// previews repaint in the new depth, and the print rasters are regenerated in
+/// the new format. The card data itself is untouched, and no original blob is
+/// rewritten.
+///
+/// Re-applying the current ribbon is a no-op: no re-render, no write.
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body = PrefixRibbonPatch,
@@ -923,7 +915,7 @@ pub async fn put_card_back_image(
         (status = 200, body = Prefix),
         (status = 400, body = crate::error::ErrorBody),
         (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen, or a card's back side cannot be printed on the new ribbon", body = crate::error::ErrorBody)
+        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
     ))]
 pub async fn patch_prefix_ribbon(
     State(st): State<AppState>,
@@ -936,19 +928,15 @@ pub async fn patch_prefix_ribbon(
     db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
     let current = db::get_prefix(&st.pool, prefix).await?;
     if current.ribbon == input.ribbon {
-        return Ok(Json(current)); // idempotent: nothing to check or write
+        return Ok(Json(current)); // idempotent: nothing to render or write
     }
-    let stranded = db::cards_incompatible_with_ribbon(&st.pool, prefix, input.ribbon).await?;
-    if stranded > 0 {
-        return Err(ApiError::Conflict(format!(
-            "{stranded} of prefix {prefix}'s cards have a back side the {} ribbon cannot print; \
-             make them single-sided or markdown-backed first",
-            input.ribbon
-        )));
+    let updated = db::set_prefix_ribbon(&st.pool, prefix, input.ribbon).await?;
+    // The rasters (and the depth-accurate back previews) are derived from the
+    // stored originals, so switching ribbon is a re-render, not a data change.
+    for card in db::list_cards(&st.pool, prefix).await? {
+        rerender_card(&st, prefix, card.id).await?;
     }
-    Ok(Json(
-        db::set_prefix_ribbon(&st.pool, prefix, input.ribbon).await?,
-    ))
+    Ok(Json(updated))
 }
 
 /// Delete a card (metadata + image).
@@ -1398,6 +1386,55 @@ pub async fn put_ribbon_stock(
     Ok(Json(db::set_ribbon_stock(&st.pool, ribbon, input.in_stock).await?))
 }
 
+/// The most one billing unit may be priced at, in the currency's minor unit.
+///
+/// A guard against the euro/cents mix-up, not a pricing policy: `10.00` typed as
+/// cents is 10, but `1000` meant as cents while thinking in euros is 10.00, and
+/// the failure that actually costs money is the reverse — a price two orders of
+/// magnitude too high, charged silently. 100 000 minor units is 1000.00 in any
+/// currency with a two-digit minor unit, well above any card label.
+const MAX_PRICE_CENTS: i64 = 100_000;
+
+/// Set one ribbon's price. **Admin only.**
+///
+/// The unit is the ribbon's (`side` or `card`), never part of the request: the
+/// stored figure is always the price of one unit, and
+/// [`crate::models::Ribbon::billed_units`] is what multiplies it at the
+/// checkout. A price change affects sessions opened *after* it — one already
+/// open was priced when it was created, and the operator changing the price
+/// does not re-price it.
+#[utoipa::path(put, path = "/api/shop/ribbons/{ribbon}/price", tag = "shop",
+    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckoko")),
+    request_body = RibbonPricePatch,
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, body = RibbonPrice),
+        (status = 400, description = "unknown ribbon, or a price outside the allowed range", body = crate::error::ErrorBody),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+    ))]
+pub async fn put_ribbon_price(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(ribbon): Path<String>,
+    Json(input): Json<RibbonPricePatch>,
+) -> Result<Json<RibbonPrice>, ApiError> {
+    auth::resolve(&st, &headers).await?.require_admin()?;
+    let ribbon = Ribbon::parse(&ribbon)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown ribbon: {ribbon}")))?;
+    if input.price_cents < 0 || input.price_cents > MAX_PRICE_CENTS {
+        return Err(ApiError::BadRequest(format!(
+            "price must be between 0 and {MAX_PRICE_CENTS} minor units; got {}. \
+             (The figure is in cents/öre, not euros.)",
+            input.price_cents
+        )));
+    }
+    tracing::info!(%ribbon, price_cents = input.price_cents, "ribbon price set");
+    Ok(Json(
+        db::set_ribbon_price(&st.pool, ribbon, input.price_cents).await?,
+    ))
+}
+
 /// Refuse to sell a job that cannot be printed.
 ///
 /// A ribbon that is out of stock is not orderable, however the customer got to
@@ -1509,14 +1546,15 @@ pub async fn create_checkout(
     // spooler as a front with a hole where its back should be.
     ensure_order_printable(&st.pool, prefix).await?;
 
-    // The price is per printed *side*, looked up from the database — not a
-    // single environment-wide figure, and not per card either. A ribbon with no
-    // configured price is a misconfiguration and refuses the checkout rather
-    // than pricing at zero.
+    // The price is per billing *unit*, looked up from the database — not a
+    // single environment-wide figure, and not the same unit on both ribbons. A
+    // ribbon with no configured price is a misconfiguration and refuses the
+    // checkout rather than pricing at zero.
     let price_cents = db::ribbon_price(&st.pool, p.ribbon).await?;
-    // How many panels this order actually burns, which is what is charged:
-    // per printed side on YMCKO, always two per card on YMCKOKO.
-    let sides = db::billed_sides(&st.pool, prefix, p.ribbon).await?;
+    // How many units this order actually costs, which is what is charged: one
+    // per printed side on YMCKO, one per card whatever its back is on YMCKOKO —
+    // the two ribbons price the same order differently.
+    let units = db::billed_units(&st.pool, prefix, p.ribbon).await?;
 
     // Flip to payment_pending BEFORE opening the session, and note the order: a
     // customer can pay the moment they land on Stripe's page, and the webhook
@@ -1536,7 +1574,7 @@ pub async fn create_checkout(
 
     let base = public_base_url(&st, &headers);
     let session = match stripe
-        .create_checkout_session(prefix, sides, price_cents, &base)
+        .create_checkout_session(prefix, units, price_cents, p.ribbon.billing_unit(), &base)
         .await
     {
         Ok(s) => s,
@@ -1554,8 +1592,8 @@ pub async fn create_checkout(
         }
     };
 
-    tracing::info!(%prefix, session = %session.id, cards = p.card_count, sides,
-        "checkout session created; waiting for the payment webhook");
+    tracing::info!(%prefix, session = %session.id, cards = p.card_count, units,
+        ribbon = %p.ribbon, "checkout session created; waiting for the payment webhook");
     Ok(Json(session))
 }
 
@@ -1953,6 +1991,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/shop/config", axum::routing::get(shop_config))
         .route(
+            "/api/shop/ribbons/:ribbon/price",
+            axum::routing::put(put_ribbon_price),
+        )
+        .route(
             "/api/shop/ribbons/:ribbon",
             axum::routing::put(put_ribbon_stock),
         )
@@ -2348,22 +2390,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_back_image_needs_a_ribbon_that_prints_colour_and_a_real_card() {
+    async fn a_back_image_needs_a_real_card_on_an_unsealed_prefix() {
         let pool = test_pool().await;
 
-        // YMCKOKO's back is the black panel, so an uploaded colour image is
-        // refused rather than stored as a blob nothing will ever print.
+        // The ribbon has no vote: a picture back is accepted on the black-panel
+        // ribbon too, and reduced to black when it is rendered.
         let black = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
             .await
             .unwrap();
         insert_card(&pool, black.uuid, 1, BackSource::None).await;
-        let err = ensure_back_image_writable(&pool, black.uuid, 1, false)
+        ensure_back_image_writable(&pool, black.uuid, 1, false)
             .await
-            .expect_err("YMCKOKO has no colour back");
-        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
-        assert!(err.to_string().contains("ymckoko"), "{err}");
+            .expect("a picture back on a YMCKOKO card");
 
-        // A ribbon that can print colour, but no such card to attach the back to.
+        // ...but there must be a card to attach it to.
         let colour = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
             .await
             .unwrap();
@@ -2581,6 +2621,90 @@ mod tests {
         assert!(!db::ribbon_in_stock(&pool, crate::models::Ribbon::Ymcko)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ribbon_price_is_admin_only_and_bounded() {
+        let pool = test_pool().await;
+        let mut st = state_with(
+            rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+            pool.clone(),
+        );
+        st.admin_token = Some(Arc::from("secret"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+
+        // A customer may not price a ribbon.
+        let denied = put_ribbon_price(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path("ymcko".to_string()),
+            Json(RibbonPricePatch { price_cents: 1 }),
+        )
+        .await
+        .expect_err("customer call");
+        assert!(matches!(denied, ApiError::Unauthorized(_)), "got {denied:?}");
+
+        // Unknown ribbon, and a price that is really a euro figure typed as
+        // cents, are both refused before anything is written.
+        for (ribbon, price) in [("ymckokok", 500), ("ymcko", -1), ("ymcko", 999_999)] {
+            let bad = put_ribbon_price(
+                State(st.clone()),
+                headers.clone(),
+                Path(ribbon.to_string()),
+                Json(RibbonPricePatch { price_cents: price }),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(bad, ApiError::BadRequest(_)), "{ribbon} {price}");
+        }
+        assert_eq!(
+            db::ribbon_price(&pool, crate::models::Ribbon::Ymcko)
+                .await
+                .unwrap(),
+            500,
+            "a refused write must not touch the stored price"
+        );
+
+        // The operator's call lands, with the unit derived from the ribbon.
+        let Json(updated) = put_ribbon_price(
+            State(st),
+            headers,
+            Path("ymckoko".to_string()),
+            Json(RibbonPricePatch { price_cents: 720 }),
+        )
+        .await
+        .expect("operator sets a price");
+        assert_eq!(updated.ribbon, crate::models::Ribbon::Ymckoko);
+        assert_eq!(updated.price_cents, 720);
+        assert_eq!(updated.unit, "card");
+        assert!(updated.available);
+        assert_eq!(
+            db::ribbon_price(&pool, crate::models::Ribbon::Ymckoko)
+                .await
+                .unwrap(),
+            720
+        );
+    }
+
+    #[tokio::test]
+    async fn a_price_change_does_not_reprice_an_open_order() {
+        // The checkout's figure is computed when the session opens; pricing a
+        // ribbon afterwards must not change what a live session charges.
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, Some(crate::models::Ribbon::Ymcko))
+            .await
+            .unwrap();
+        insert_card(&pool, p.uuid, 1, BackSource::None).await;
+
+        let before = db::billed_units(&pool, p.uuid, p.ribbon).await.unwrap()
+            * db::ribbon_price(&pool, p.ribbon).await.unwrap();
+        db::set_ribbon_price(&pool, p.ribbon, 900).await.unwrap();
+        let after = db::billed_units(&pool, p.uuid, p.ribbon).await.unwrap()
+            * db::ribbon_price(&pool, p.ribbon).await.unwrap();
+
+        assert_eq!(before, 500, "one printed side at the seeded price");
+        assert_eq!(after, 900, "the same order, priced again after the change");
     }
 
     #[tokio::test]
