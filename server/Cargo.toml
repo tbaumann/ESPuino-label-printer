@@ -1,5 +1,5 @@
 [package]
-name = "espuino-label-printer"
+name = "card-printer-server"
 version = "0.1.0"
 edition = "2021"
 description = "REST API backend for printing ESPuino/phoniebox/TONUino/SonUINO RFID card labels"

@@ -15,7 +15,7 @@ exercised for real rather than stubbed.
       STRIPE_SHIPPING_CENTS=250 \
       RESEND_API_KEY=re_test_x RESEND_API_BASE=http://127.0.0.1:12112 \
       EMAIL_FROM='ESPuino <orders@example.test>' OPERATOR_EMAIL=shop@example.test \
-      ./target/debug/espuino-label-printer &
+      ./target/debug/card-printer-server &
     python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 
 The order-email section (5b) runs only when `RESEND_API_KEY` and `EMAIL_FROM`

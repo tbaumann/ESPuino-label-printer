@@ -7,8 +7,8 @@ A Cargo workspace with two crates:
 
 | Crate                 | Path      | What it is                                            |
 |-----------------------|-----------|-------------------------------------------------------|
-| `espuino-label-printer` | `server/` | REST API (Axum + utoipa OpenAPI + SQLite/sqlx + blobs) |
-| `esplp-cli`             | `cli/`    | `esplp` command-line client                           |
+| `card-printer-server` | `server/` | REST API (Axum + utoipa OpenAPI + SQLite/sqlx + blobs) |
+| `card-printer-cli`    | `cli/`    | `card-printer-cli` command-line client                           |
 | — (Svelte SPA)          | `web/`    | browser UI, served by the server process              |
 
 Stack: **Axum** (HTTP) + **utoipa** (automatic OpenAPI 3.0 + Swagger UI) +
@@ -18,7 +18,7 @@ with a **Nix flake** (rust-flake / crane).
 ## Run (development)
 
 ```sh
-nix develop -c cargo run -p espuino-label-printer   # server
+nix develop -c cargo run -p card-printer-server   # server
 ```
 
 Then open http://127.0.0.1:8080/swagger-ui — the live, generated API docs.
@@ -27,20 +27,20 @@ The raw spec is at http://127.0.0.1:8080/api-docs/openapi.json.
 ## Run (Nix)
 
 ```sh
-nix run .#espuino-label-printer          # server, serving the web UI
-nix run .#esplp-cli -- --help            # CLI
-nix build .#                             # default = server + SPA, self-contained
-nix build .#espuino-label-printer-web    # just the built SPA
-nix build .#esplp-cli
+nix run .#card-printer-server            # server, serving the web UI
+nix run .#card-printer-cli -- --help     # CLI
+nix build .#                             # default = the spooler (card-printer)
+nix build .#card-printer-server-web      # just the built SPA
+nix build .#card-printer-cli
 ```
 
 The SPA is built from `web/` **in the Nix store** by `buildNpmPackage`
-(`packages.espuino-label-printer-web`), and the default package wraps the server
-binary so `STATIC_DIR` points straight at that store path. Nothing is read from
-`server/static`, and the deployed result depends on nothing in the working tree:
+(`packages.card-printer-server-web`), and the `card-printer-server` app wraps the
+server binary so `STATIC_DIR` points straight at that store path. Nothing is read
+from `server/static`, and the running server depends on nothing in the working tree:
 
 ```sh
-cd /tmp && /path/to/checkout/result/bin/espuino-label-printer   # web UI works
+nix run /path/to/checkout#card-printer-server   # web UI works
 ```
 
 `STATIC_DIR` is applied with `--set-default`, so exporting your own value still
@@ -60,11 +60,11 @@ directory into the store for evaluation, `web/node_modules` included, which
 makes every `nix build` / `nix run` slow. Once the tree is tracked (and
 `web/node_modules` is ignored) only the source is copied.
 
-## CLI (`esplp`)
+## CLI (`card-printer-cli`)
 
 ```sh
-esplp --server http://127.0.0.1:8080 <command>     # or export ESPLP_SERVER=...
-esplp --token <admin-token> prefix list           # or export ESPLP_TOKEN=...
+card-printer-cli --server http://127.0.0.1:8080 <command>     # or export ESPLP_SERVER=...
+card-printer-cli --token <admin-token> prefix list           # or export ESPLP_TOKEN=...
 ```
 
 Commands (every API field is a flag):
@@ -90,7 +90,7 @@ Notes:
   `SN-001`, `SN-002`, ... (zero-padded to `--serial-width`). `--dry-run` prints
   the plan without uploading.
 - `--quiet` prints just the uuid (prefix commands) or id (card commands) — handy
-  for scripting: `P=$(esplp prefix create --quiet)`.
+  for scripting: `P=$(card-printer-cli prefix create --quiet)`.
 - `prefix list` and `prefix set-status` are admin-only, so they need the
   operator token: `--token <tok>` or `ESPLP_TOKEN`. Every other command is
   customer-level and needs no token. Passing the token anyway is harmless — the
@@ -120,7 +120,7 @@ with an `ADMIN_TOKEN` — the same token must be in the test's environment:
 
 ```sh
 DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 \
-  PRINT_RASTER_WIDTH=508 PRINT_RASTER_HEIGHT=324 ./target/debug/espuino-label-printer &
+  PRINT_RASTER_WIDTH=508 PRINT_RASTER_HEIGHT=324 ./target/debug/card-printer-server &
 ADMIN_TOKEN=secret npm --prefix web test
 ```
 
@@ -347,7 +347,7 @@ DATA_DIR=/tmp/esplp-stripe STRIPE_SECRET_KEY=sk_test_x \
   STRIPE_SHIPPING_CENTS=250 \
   RESEND_API_KEY=re_test_x RESEND_API_BASE=http://127.0.0.1:12112 \
   EMAIL_FROM='ESPuino <orders@example.test>' OPERATOR_EMAIL=shop@example.test \
-  ./target/debug/espuino-label-printer &
+  ./target/debug/card-printer-server &
 python3 scripts/stripe_e2e_test.py http://127.0.0.1:8080
 ```
 
@@ -643,7 +643,7 @@ and back again does not lose the picture or the text.
 ```sh
 nix shell nixpkgs#python3 -c python3 scripts/make_png.py /tmp/card.png
 export ESPLP_SERVER=http://127.0.0.1:8080
-P=$(./target/debug/esplp prefix create --quiet)
-./target/debug/esplp upload "$P" /tmp/card.png --name Conni --serial-number SN-001
-./target/debug/esplp card list "$P"
+P=$(./target/debug/card-printer-cli prefix create --quiet)
+./target/debug/card-printer-cli upload "$P" /tmp/card.png --name Conni --serial-number SN-001
+./target/debug/card-printer-cli card list "$P"
 ```

@@ -11,7 +11,7 @@ use client::{is_image, Client};
 /// CLI for the ESPuino Label Printer API.
 #[derive(Parser)]
 #[command(
-    name = "esplp",
+    name = "card-printer-cli",
     version,
     about = "Upload and manage printable RFID card labels",
     long_about = None

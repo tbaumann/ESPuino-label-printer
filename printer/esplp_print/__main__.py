@@ -342,7 +342,7 @@ def _mark_status(client: Client, prefix: str, status: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="esplp-print",
+        prog="card-printer",
         description="Print a paid order (prefix) on the attached Evolis printer.",
     )
     p.add_argument("--server", default="http://127.0.0.1:8080", help="API base URL")

@@ -1,12 +1,12 @@
 [package]
-name = "esplp-cli"
+name = "card-printer-cli"
 version = "0.1.0"
 edition = "2021"
 description = "CLI client for the ESPuino Label Printer API"
 license = "MIT"
 
 [[bin]]
-name = "esplp"
+name = "card-printer-cli"
 path = "src/main.rs"
 
 [dependencies]
