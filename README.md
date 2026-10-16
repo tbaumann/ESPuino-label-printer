@@ -32,6 +32,7 @@ nix run .#card-printer-cli -- --help     # CLI
 nix build .#                             # default = the spooler (card-printer)
 nix build .#card-printer-server-web      # just the built SPA
 nix build .#card-printer-cli
+nix build .#card-printer-server-image    # OCI image tarball; docker load < result
 ```
 
 The SPA is built from `web/` **in the Nix store** by `buildNpmPackage`
