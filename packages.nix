@@ -2,7 +2,6 @@
   perSystem = {
     config,
     pkgs,
-    lib,
     self',
     ...
   }: let
@@ -17,17 +16,9 @@
       inherit web;
     };
   in {
-    packages =
-      {
-        card-printer-server = server;
-        card-printer = cardPrinter;
-        default = cardPrinter;
-      }
-      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-        card-printer-server-image = pkgs.callPackage ./nix/packages/card-printer-server-image.nix {
-          inherit server;
-        };
-      };
+    packages.card-printer-server = server;
+    packages.card-printer = cardPrinter;
+    packages.default = cardPrinter;
 
     apps.card-printer-server.program = "${server}/bin/card-printer-server";
     apps.card-printer-cli.program = "${self'.packages.card-printer-cli}/bin/card-printer-cli";

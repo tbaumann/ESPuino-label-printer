@@ -31,7 +31,6 @@ nix run .#card-printer-server            # server, serving the web UI
 nix run .#card-printer-cli -- --help     # CLI
 nix build .#                             # default = the spooler (card-printer)
 nix build .#card-printer-cli
-nix build .#card-printer-server-image    # OCI image tarball (dockerTools); docker load < result
 nix build .#oci-card-printer-server      # the server as a nix-oci image (see "OCI image" below)
 ```
 
