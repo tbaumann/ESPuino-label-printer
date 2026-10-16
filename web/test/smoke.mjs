@@ -283,8 +283,8 @@ console.log('\nB. project page renders a card')
   check('back preview shows the text', text.includes('02 Song Two'))
   // The preview shows the *processed* image the server derived, not the raw
   // upload — one renderer owns what a card looks like.
-  check('front preview points at the display-image endpoint',
-    w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-image"]`) !== null)
+  check('front preview points at the display/front endpoint',
+    w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/front"]`) !== null)
   check('renders a back preview pane', !!w.document.querySelector('.preview.back'))
   check('the back choice is marked on the card',
     w.document.querySelector('.back-choice.selected strong')?.textContent?.trim() === 'Text')
@@ -456,7 +456,7 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const t2 = w2.document.body.textContent ?? ''
   check('print preview renders the card', !!w2.document.querySelector('.card.preview-only'))
   check('preview shows the front image',
-    !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-image"]`))
+    !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/front"]`))
   check('preview shows the back text', t2.includes('01 Admin Song'))
   check('preview shows the name as text', t2.includes('Admin Preview Card'))
   check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
@@ -786,7 +786,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     )
     check('the server stored the back image', stored)
     const backImgSrc = () =>
-      w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`)
+      w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`)
         ?.getAttribute('src') ?? ''
     check(
       'the uploaded back is previewed',
@@ -821,7 +821,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     await addCard(prefix)
     const fd = new NodeFormData()
     fd.append('back_image', new NodeBlob([PNG], { type: 'image/png' }), 'back.png')
-    await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/back-image`, {
+    await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/image/back`, {
       method: 'PUT',
       body: fd,
     })
@@ -879,12 +879,12 @@ console.log('\nI. one panel, the same back choices on either ribbon')
 
     // And the artifact itself can say "still current" instead of being trusted:
     // every derived artifact carries a validator the browser can revalidate on.
-    const art = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display-back`)
+    const art = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display/back`)
     const etag = art.headers.get('etag')
     check('an artifact carries an ETag and must be revalidated',
       !!etag && art.headers.get('cache-control') === 'no-cache',
       `${etag} / ${art.headers.get('cache-control')}`)
-    const cond = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display-back`, {
+    const cond = await realFetch(`${BASE}/api/prefixes/${prefix}/cards/1/display/back`, {
       headers: { 'if-none-match': etag },
     })
     check('a matching If-None-Match answers 304', cond.status === 304, String(cond.status))
@@ -915,7 +915,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     const backFd = new NodeFormData()
     backFd.append('back_image', new NodeBlob([PNG], { type: 'image/png' }), 'back.png')
     const uploaded = await realFetch(
-      `${BASE}/api/prefixes/${prefix}/cards/1/back-image`,
+      `${BASE}/api/prefixes/${prefix}/cards/1/image/back`,
       { method: 'PUT', body: backFd },
     )
     check('the server stores it', uploaded.status === 200, String(uploaded.status))
@@ -927,7 +927,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     const wPic = await mount(`/p/${prefix}`, { bust: 'i3b' })
     check('the black-and-white back is previewed in the pane',
       !!wPic.document.querySelector(
-        `img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`),
+        `img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`),
     )
     check('the pane says the picture prints in black and white',
       /black and white/.test(wPic.document.body.textContent ?? ''),
@@ -1005,7 +1005,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       'the dropped picture is previewed in the pane',
       await waitFor(
         () =>
-          !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display-back"]`),
+          !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`),
       ),
     )
   }

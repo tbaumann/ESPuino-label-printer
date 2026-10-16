@@ -347,8 +347,8 @@ export const api = {
     return req<Card>(`/api/prefixes/${p}/cards`, { method: 'POST', body: fd })
   },
 
-  cardImageUrl: (p: string, id: number): string =>
-      `/api/prefixes/${p}/cards/${id}/image`,
+  cardFrontImageUrl: (p: string, id: number): string =>
+      `/api/prefixes/${p}/cards/${id}/image/front`,
 
     /**
      * The processed front display image (normalized PNG) the UI shows.
@@ -356,8 +356,8 @@ export const api = {
      * Pass a `version` (the card's `updated_at`) so a re-uploaded front is a new
      * URL rather than the one the browser already has cached.
      */
-    cardDisplayUrl: (p: string, id: number, version?: string): string =>
-      `/api/prefixes/${p}/cards/${id}/display-image${version ? `?v=${encodeURIComponent(version)}` : ''}`,
+    cardFrontDisplayUrl: (p: string, id: number, version?: string): string =>
+      `/api/prefixes/${p}/cards/${id}/display/front${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
     /**
      * The processed back display image: the picture on a colour back, the
@@ -368,8 +368,8 @@ export const api = {
      * second-granularity, so two renders in the same second would otherwise share
      * a URL and leave the browser showing the other one.
      */
-    cardDisplayBackUrl: (p: string, id: number, version?: string): string =>
-      `/api/prefixes/${p}/cards/${id}/display-back${version ? `?v=${encodeURIComponent(version)}` : ''}`,
+    cardBackDisplayUrl: (p: string, id: number, version?: string): string =>
+      `/api/prefixes/${p}/cards/${id}/display/back${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
   /**
    * The card's uploaded back image (an `image` back only).
@@ -379,7 +379,7 @@ export const api = {
    * showing the back the customer just replaced.
    */
   cardBackImageUrl: (p: string, id: number, version?: string): string =>
-    `/api/prefixes/${p}/cards/${id}/back-image${version ? `?v=${encodeURIComponent(version)}` : ''}`,
+    `/api/prefixes/${p}/cards/${id}/image/back${version ? `?v=${encodeURIComponent(version)}` : ''}`,
 
   /**
    * Attach or replace one card's back image, leaving the front alone. This also
@@ -389,7 +389,7 @@ export const api = {
   uploadBackImage: (p: string, id: number, file: File): Promise<Card> => {
     const fd = new FormData()
     fd.append('back_image', file, file.name)
-    return req<Card>(`/api/prefixes/${p}/cards/${id}/back-image`, { method: 'PUT', body: fd })
+    return req<Card>(`/api/prefixes/${p}/cards/${id}/image/back`, { method: 'PUT', body: fd })
   },
 
   /** Price and currency, so the UI can show a total before sending anyone to Stripe. */

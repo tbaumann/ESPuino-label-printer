@@ -238,7 +238,7 @@ impl Client {
         self.send(
             self.http
                 .put(format!(
-                    "{}/api/prefixes/{prefix}/cards/{id}/back-image",
+                    "{}/api/prefixes/{prefix}/cards/{id}/image/back",
                     self.base
                 ))
                 .multipart(form),

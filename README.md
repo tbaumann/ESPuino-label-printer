@@ -193,8 +193,8 @@ rather than showing a gap where the artwork was. The pane is the editing view
 only: the print queue carries no HTML, and the spooler prints the server's
 raster.
 
-The panes load the **server-derived display images** (`display-image`,
-`display-back`), so the aspect and any normalization are the server's. The one
+The panes load the **server-derived display images** (`display/front`,
+`display/back`), so the aspect and any normalization are the server's. The one
 exception is a markdown back's pane, which lays `back_text` out client-side for
 editing; what the spooler prints is the server's raster either way, so no
 preview is the source of truth for print.
@@ -599,9 +599,13 @@ an admin session.
 | PUT    | `/api/prefixes/{prefix}/cards/{id}`    | create/replace card at id (image required) |
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
-| GET    | `/api/prefixes/{prefix}/cards/{id}/image` | card front image bytes     |
-| GET    | `/api/prefixes/{prefix}/cards/{id}/back-image` | back image bytes (an `image` back only) |
-| PUT    | `/api/prefixes/{prefix}/cards/{id}/back-image` | upload or replace the back image, making that image the card's back |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/image/front` | card front image bytes     |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/image/back` | back image bytes (an `image` back only) |
+| PUT    | `/api/prefixes/{prefix}/cards/{id}/image/back` | upload or replace the back image, making that image the card's back |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/display/front` | normalized front preview (PNG) |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/display/back` | back preview at the ribbon's depth (PNG) |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/print-raster/front` | front print raster (BMP, the printer's own bitmap) |
+| GET    | `/api/prefixes/{prefix}/cards/{id}/print-raster/back` | back print raster (24-bit, or 1-bit on a black panel) |
 | GET    | `/api/shop/config`                     | prices, currency, ribbon stock, shipping and countries |
 | PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
 | PUT    | `/api/shop/ribbons/{ribbon}/price`     | set a ribbon's price, in minor units, for its own unit **(admin)** |
@@ -621,7 +625,7 @@ itself, never for a choice the ribbon dislikes.
 
 `back_image` is optional even for an `image` back, because cards are created by
 the front-image dropzone, one file at a time. A card without one is simply not
-complete: its own row offers the upload (`PUT .../cards/{id}/back-image`, which
+complete: its own row offers the upload (`PUT .../cards/{id}/image/back`, which
 leaves the front alone and makes the uploaded image the card's back), and an
 order containing an incomplete card is refused at the checkout with `409` rather
 than sold. `requires a back_image on every card` at creation time would have

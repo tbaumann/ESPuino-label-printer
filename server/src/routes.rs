@@ -114,7 +114,7 @@ struct StoredCard {
 ///
 /// The `back_image` is **optional even for an `image` back**: a card exists
 /// from its front image, and the back image is added per card afterwards
-/// (`put_card_back_image`, or this same form). Requiring it here would mean the
+/// (`put_back_image`, or this same form). Requiring it here would mean the
 /// front-image upload — a bulk, folder-at-a-time flow — could create nothing at
 /// all for a double-sided card. What has to hold is that no *order* is sold with
 /// a back missing, and that is checked where the money is
@@ -628,10 +628,10 @@ pub async fn get_card(
 }
 
 /// Fetch a card's front image bytes.
-#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/image", tag = "cards",
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/image/front", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
-pub async fn get_card_image(
+pub async fn get_front_image(
     State(st): State<AppState>,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
@@ -652,10 +652,10 @@ pub async fn get_card_image(
 }
 
 /// Fetch a card's colour back image bytes (only present in `double_sided_color`).
-#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/back-image", tag = "cards",
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/image/back", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
-pub async fn get_card_back_image(
+pub async fn get_back_image(
     State(st): State<AppState>,
     Path((prefix, id)): Path<(String, i64)>,
 ) -> Result<Response, ApiError> {
@@ -691,7 +691,7 @@ pub async fn get_card_back_image(
 /// Every ready artifact carries an `ETag` (a hash of the bytes) and
 /// `Cache-Control: no-cache`, and a request that presents a matching
 /// `If-None-Match` gets a `304` instead. The URL of an artifact never changes —
-/// it is `/cards/{id}/display-back`, not a versioned path — but its *content*
+/// it is `/cards/{id}/display/back`, not a versioned path — but its *content*
 /// does, whenever the card is re-rendered: a re-upload, a back-source change, or
 /// a ribbon switch that moves the back between colour and 1-bit. Without a
 /// validator a browser is free to keep showing the old picture after any of
@@ -762,7 +762,7 @@ fn artifact_etag(bytes: &[u8]) -> String {
 }
 
 /// Fetch a card's front display image (the normalized PNG the frontend shows).
-#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display-image", tag = "cards",
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display/front", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "display image bytes", content_type = "image/png"),
@@ -770,7 +770,7 @@ fn artifact_etag(bytes: &[u8]) -> String {
         (status = 423, description = "still rendering", body = crate::error::ErrorBody),
         (status = 500, description = "render failed", body = crate::error::ErrorBody)
     ))]
-pub async fn get_card_display_image(
+pub async fn get_front_display(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
@@ -787,7 +787,7 @@ pub async fn get_card_display_image(
 }
 
 /// Fetch a card's back display image (colour back, or the rendered black back).
-#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display-back", tag = "cards",
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/display/back", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "back display image bytes", content_type = "image/png"),
@@ -795,7 +795,7 @@ pub async fn get_card_display_image(
         (status = 423, description = "still rendering", body = crate::error::ErrorBody),
         (status = 500, description = "render failed", body = crate::error::ErrorBody)
     ))]
-pub async fn get_card_display_back(
+pub async fn get_back_display(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
@@ -813,7 +813,7 @@ pub async fn get_card_display_back(
 
 /// Fetch a card's front print raster (24-bit BMP at the printer DPI). The print
 /// preview and the spooler both read these exact bytes.
-#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/print-raster", tag = "cards",
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/print-raster/front", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "print raster bytes", content_type = "image/bmp"),
@@ -821,7 +821,7 @@ pub async fn get_card_display_back(
         (status = 423, description = "still rendering", body = crate::error::ErrorBody),
         (status = 500, description = "render failed", body = crate::error::ErrorBody)
     ))]
-pub async fn get_card_print_raster(
+pub async fn get_front_raster(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
@@ -846,7 +846,7 @@ pub async fn get_card_print_raster(
         (status = 423, description = "still rendering", body = crate::error::ErrorBody),
         (status = 500, description = "render failed", body = crate::error::ErrorBody)
     ))]
-pub async fn get_card_print_raster_back(
+pub async fn get_back_raster(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
@@ -922,7 +922,7 @@ async fn ensure_back_image_writable(
 ///
 /// Re-uploading replaces the stored blob, whatever format the old one was in —
 /// `write_blob` cleans the earlier file up, so there are no orphans.
-#[utoipa::path(put, path = "/api/prefixes/{prefix}/cards/{id}/back-image", tag = "cards",
+#[utoipa::path(put, path = "/api/prefixes/{prefix}/cards/{id}/image/back", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     request_body(content = String, content_type = "multipart/form-data",
         description = "Multipart form carrying exactly one file part, `back_image`."),
@@ -932,7 +932,7 @@ async fn ensure_back_image_writable(
         (status = 404, description = "unknown prefix or card", body = crate::error::ErrorBody),
         (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
     ))]
-pub async fn put_card_back_image(
+pub async fn put_back_image(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
@@ -1996,28 +1996,28 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_card),
         )
         .route(
-            "/api/prefixes/:prefix/cards/:id/image",
-            axum::routing::get(get_card_image),
+            "/api/prefixes/:prefix/cards/:id/image/front",
+            axum::routing::get(get_front_image),
         )
         .route(
-            "/api/prefixes/:prefix/cards/:id/back-image",
-            axum::routing::get(get_card_back_image).put(put_card_back_image),
+            "/api/prefixes/:prefix/cards/:id/image/back",
+            axum::routing::get(get_back_image).put(put_back_image),
         )
         .route(
-            "/api/prefixes/:prefix/cards/:id/display-image",
-            axum::routing::get(get_card_display_image),
+            "/api/prefixes/:prefix/cards/:id/display/front",
+            axum::routing::get(get_front_display),
         )
         .route(
-            "/api/prefixes/:prefix/cards/:id/display-back",
-            axum::routing::get(get_card_display_back),
+            "/api/prefixes/:prefix/cards/:id/display/back",
+            axum::routing::get(get_back_display),
         )
         .route(
-            "/api/prefixes/:prefix/cards/:id/print-raster",
-            axum::routing::get(get_card_print_raster),
+            "/api/prefixes/:prefix/cards/:id/print-raster/front",
+            axum::routing::get(get_front_raster),
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/print-raster/back",
-            axum::routing::get(get_card_print_raster_back),
+            axum::routing::get(get_back_raster),
         )
         .route(
             "/api/prefixes/:prefix/cards/:id/printed",
@@ -2961,7 +2961,7 @@ mod tests {
                 assert_eq!(raster[28], 24);
 
                 // The endpoints serve them with the right status semantics.
-                let resp = get_card_display_image(
+                let resp = get_front_display(
                     State(st.clone()),
                     HeaderMap::new(),
                     Path((p.uuid.to_string(), 1)),
@@ -2969,7 +2969,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), axum::http::StatusCode::OK);
-                let resp = get_card_print_raster(
+                let resp = get_front_raster(
                     State(st.clone()),
                     HeaderMap::new(),
                     Path((p.uuid.to_string(), 1)),
@@ -2978,7 +2978,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(resp.status(), axum::http::StatusCode::OK);
                 // A back side that does not exist is a 404.
-                let err = get_card_display_back(
+                let err = get_back_display(
                     State(st.clone()),
                     HeaderMap::new(),
                     Path((p.uuid.to_string(), 1)),
@@ -3094,7 +3094,7 @@ mod tests {
                 rerender_card(&st, prefix, 1).await.unwrap();
                 let (p, id) = (prefix.to_string(), 1i64);
 
-                let res = get_card_display_image(State(st.clone()), HeaderMap::new(), Path((p.clone(), id)))
+                let res = get_front_display(State(st.clone()), HeaderMap::new(), Path((p.clone(), id)))
                     .await
                     .expect("the front display image");
                 assert_eq!(res.status(), StatusCode::OK);
@@ -3114,7 +3114,7 @@ mod tests {
                 // The same validator comes back as a 304 with no body.
                 let mut req = HeaderMap::new();
                 req.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
-                let res = get_card_display_image(State(st), req, Path((p, id)))
+                let res = get_front_display(State(st), req, Path((p, id)))
                     .await
                     .expect("the conditional request");
                 assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
@@ -3178,7 +3178,7 @@ mod tests {
                 assert_eq!(card.print_back, Some(RenderStatus::Failed));
 
                 // The failed back raster answers 500, not a blank 200.
-                let err = get_card_print_raster_back(
+                let err = get_back_raster(
                     State(st.clone()),
                     HeaderMap::new(),
                     Path((p.uuid.to_string(), 1)),

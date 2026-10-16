@@ -36,7 +36,7 @@ from .printer import (
     RibbonStatus,
 )
 
-RASTER_FRONT = "/api/prefixes/{prefix}/cards/{id}/print-raster"
+RASTER_FRONT = "/api/prefixes/{prefix}/cards/{id}/print-raster/front"
 RASTER_BACK = "/api/prefixes/{prefix}/cards/{id}/print-raster/back"
 
 # Lifecycle statuses that represent work waiting to be printed. A batch run

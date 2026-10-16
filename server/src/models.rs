@@ -351,8 +351,8 @@ pub struct Card {
 
 /// One card as the print spooler sees it: the operator-only `printed_at` is
 /// included here, unlike in the public `Card`. The spooler prints the raster, so
-/// this carries no rendering of the back text — only what its `print-raster`
-/// endpoints answer.
+/// this carries no rendering of the back text — only what its
+/// `print-raster/front` and `print-raster/back` endpoints answer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PrintQueueCard {
     pub id: i64,
