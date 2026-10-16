@@ -2,7 +2,7 @@
 
 ## Image upload validation
 
-`GET /api/prefixes/{prefix}/cards/{id}/image` serves back whatever
+`GET /api/prefixes/{prefix}/cards/{id}/image/front` serves back whatever
 `Content-Type` the uploader sent, so it is a stored-XSS vector on the app's own
 origin. Verified: an upload with `Content-Type: text/html` is accepted (201),
 and the endpoint then returns `content-type: text/html` with no
