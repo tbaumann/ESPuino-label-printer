@@ -30,15 +30,15 @@ The raw spec is at http://127.0.0.1:8080/api-docs/openapi.json.
 nix run .#card-printer-server            # server, serving the web UI
 nix run .#card-printer-cli -- --help     # CLI
 nix build .#                             # default = the spooler (card-printer)
-nix build .#card-printer-server-web      # just the built SPA
 nix build .#card-printer-cli
-nix build .#card-printer-server-image    # OCI image tarball; docker load < result
+nix build .#card-printer-server-image    # OCI image tarball (dockerTools); docker load < result
+nix build .#oci-card-printer-server      # the server as a nix-oci image (see "OCI image" below)
 ```
 
-The SPA is built from `web/` **in the Nix store** by `buildNpmPackage`
-(`packages.card-printer-server-web`), and the `card-printer-server` app wraps the
-server binary so `STATIC_DIR` points straight at that store path. Nothing is read
-from `server/static`, and the running server depends on nothing in the working tree:
+The SPA is built from `web/` **in the Nix store** by `buildNpmPackage` and baked
+into the `card-printer-server` package: the crate binary is wrapped so `STATIC_DIR`
+points straight at that store path. Nothing is read from `server/static`, and the
+running server depends on nothing in the working tree:
 
 ```sh
 nix run /path/to/checkout#card-printer-server   # web UI works
@@ -60,6 +60,24 @@ That also matters for speed: in a *non-git* checkout Nix copies the entire
 directory into the store for evaluation, `web/node_modules` included, which
 makes every `nix build` / `nix run` slow. Once the tree is tracked (and
 `web/node_modules` is ignored) only the source is copied.
+
+## OCI image
+
+`nix build .#oci-card-printer-server` builds the server image with
+[nix-oci](https://github.com/Dauliac/nix-oci) (nix2container), wired in `oci.nix`:
+
+```sh
+nix build .#oci-card-printer-server            # image; result/bin/ has push, load-docker, load-podman, sandbox
+nix run .#oci-load-podman-card-printer-server  # load into podman/docker
+nix run .#oci-push-card-printer-server         # skopeo push to ghcr.io/tbaumann/card-printer-server
+```
+
+`oci.nix` sets the runtime shape: entrypoint `card-printer-server`, `DATA_DIR=/data`
+as a declared volume, `BIND_ADDR=0.0.0.0:8080`, and `SSL_CERT_FILE` from `cacert`
+(the server verifies TLS against Stripe). The container runs as the non-root
+`card-printer` user (UID/GID 4000) and nothing in the image is writable by it, so
+`/data` must be a writable mount: `--tmpfs /data:rw,mode=1777`, or a volume owned by
+4000:4000.
 
 ## CLI (`card-printer-cli`)
 
