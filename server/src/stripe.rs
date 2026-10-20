@@ -15,7 +15,9 @@
 //!    and redirects the browser to the returned `url`, where Stripe collects the
 //!    shipping address and the money;
 //! 3. Stripe calls `POST /api/webhooks/stripe`, whose signature is checked by
-//!    [`Stripe::verify_webhook`], and the prefix becomes `paid`.
+//!    [`Stripe::verify_webhook`], and the prefix becomes `paid` — with the
+//!    shipping address Checkout collected stored on it, so shipping the order
+//!    never means reading the Stripe dashboard.
 //!
 //! The redirect in step 2 is *not* proof of payment: it can arrive before the
 //! webhook does, and a customer can forge it by hand. Only step 3 changes state.
@@ -30,6 +32,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::models::ShippingAddress;
 
 /// How old a webhook signature may be before we reject it, so a captured
 /// request cannot be replayed indefinitely. Stripe's own default is 5 minutes.
@@ -401,8 +404,52 @@ pub struct SessionObject {
     /// fallback: `customer_details.email` is the one the customer confirmed.
     #[serde(default)]
     pub customer_email: Option<String>,
+    /// The address Checkout collected — at the top level up to API version
+    /// 2025-03-27, and under `collected_information` from 2025-03-31.basil on.
+    /// Both are read, because which one arrives is a property of the webhook
+    /// endpoint's configured API version rather than of this code. See
+    /// [`SessionObject::shipping_address`].
+    #[serde(default)]
+    pub shipping_details: Option<ShippingDetails>,
+    #[serde(default)]
+    pub collected_information: Option<CollectedInformation>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// The shipping details block, in the shape Stripe sends it: the recipient's
+/// name sitting beside the address rather than inside it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShippingDetails {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub address: Option<PostalAddress>,
+}
+
+/// A postal address, every field nullable exactly as Stripe has it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostalAddress {
+    #[serde(default)]
+    pub line1: Option<String>,
+    #[serde(default)]
+    pub line2: Option<String>,
+    #[serde(default)]
+    pub postal_code: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+}
+
+/// The `collected_information` block, which is where the shipping details moved
+/// in API version 2025-03-31.basil.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollectedInformation {
+    #[serde(default)]
+    pub shipping_details: Option<ShippingDetails>,
 }
 
 /// Who paid. Checkout collects the email, so this is how the shop learns where
@@ -469,6 +516,62 @@ impl SessionObject {
             .filter(|s| !s.is_empty());
         reference.or(from_metadata).map(str::to_string)
     }
+
+    /// Where to ship this order: the address Checkout collected, or `None` when
+    /// it collected none.
+    ///
+    /// Two payload shapes are read, and that is deliberate. Up to API version
+    /// 2025-03-27 the address is `shipping_details` at the top level of the
+    /// session; from 2025-03-31.basil on it is
+    /// `collected_information.shipping_details` (the top-level field was
+    /// removed). Which one arrives depends on the API version configured on the
+    /// *webhook endpoint*, which is not something this code sets — so reading
+    /// only one of them means a version bump in the Dashboard silently stops
+    /// stored addresses with no error anywhere. The top-level shape is looked
+    /// at first, then the nested one.
+    ///
+    /// `None`, not an all-`None` struct, when Stripe sent nothing usable: a
+    /// blank address is not a shippable order, and the caller must be able to
+    /// tell it apart from a real one without re-deriving that check.
+    pub fn shipping_address(&self) -> Option<ShippingAddress> {
+        let details = self.shipping_details.as_ref().or_else(|| {
+            self.collected_information
+                .as_ref()
+                .and_then(|c| c.shipping_details.as_ref())
+        })?;
+        let address = details.address.as_ref();
+        let (line1, line2, postal_code, city, state, country) = match address {
+            Some(a) => (
+                clean(a.line1.as_deref()),
+                clean(a.line2.as_deref()),
+                clean(a.postal_code.as_deref()),
+                clean(a.city.as_deref()),
+                clean(a.state.as_deref()),
+                clean(a.country.as_deref()),
+            ),
+            None => (None, None, None, None, None, None),
+        };
+        let address = ShippingAddress {
+            name: clean(details.name.as_deref()),
+            line1,
+            line2,
+            postal_code,
+            city,
+            state,
+            country,
+        };
+        (!address.is_empty()).then_some(address)
+    }
+}
+
+/// A field as Stripe sent it, with blank treated as absent: a field the
+/// customer left empty comes back as `""`, and an empty string is not an
+/// address line, a name, or a country code.
+fn clean(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Check a Stripe signature header. Split out from [`Stripe`] so it can be
@@ -769,6 +872,8 @@ mod tests {
             currency: None,
             customer_details: None,
             customer_email: None,
+            shipping_details: None,
+            collected_information: None,
             metadata: None,
         };
         assert_eq!(with_ref.prefix_uuid().as_deref(), Some("abc"));
@@ -820,6 +925,8 @@ mod tests {
                 name: None,
             }),
             customer_email: Some("prefilled@example.com".into()),
+            shipping_details: None,
+            collected_information: None,
             metadata: None,
         };
         // A blank details email must not shadow a usable prefilled one.
@@ -830,5 +937,123 @@ mod tests {
         session.customer_details = None;
         assert_eq!(session.payer_email(), None);
         assert_eq!(session.payer_name(), None);
+    }
+
+    fn shipping_of(json: &str) -> Option<ShippingAddress> {
+        let session: SessionObject =
+            serde_json::from_str(json).expect("a plausible Stripe session object");
+        session.shipping_address()
+    }
+
+    #[test]
+    fn the_shipping_address_comes_from_the_top_level_field() {
+        // Exactly the shape Stripe sent before 2025-03-31: the name beside the
+        // address, the address with nullable fields, `state` absent on a German
+        // one.
+        let address = shipping_of(
+            r#"{
+                "id": "cs_1",
+                "payment_status": "paid",
+                "shipping_details": {
+                    "name": "  Ada Lovelace  ",
+                    "address": {
+                        "line1": "Analytical Engine Way 1",
+                        "line2": null,
+                        "postal_code": "10115",
+                        "city": "Berlin",
+                        "state": null,
+                        "country": "DE"
+                    }
+                }
+            }"#,
+        )
+        .expect("the address Stripe collected");
+        assert_eq!(address.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(address.line1.as_deref(), Some("Analytical Engine Way 1"));
+        assert_eq!(address.line2, None);
+        assert_eq!(address.postal_code.as_deref(), Some("10115"));
+        assert_eq!(address.city.as_deref(), Some("Berlin"));
+        assert_eq!(address.state, None);
+        assert_eq!(address.country.as_deref(), Some("DE"));
+    }
+
+    #[test]
+    fn the_shipping_address_is_read_from_the_nested_basil_shape_too() {
+        // From API version 2025-03-31.basil the top-level `shipping_details` is
+        // gone and the block lives under `collected_information`. Which shape
+        // arrives is the webhook endpoint's configured version, so both are
+        // read — a Dashboard version bump must not silently stop storing
+        // addresses.
+        let address = shipping_of(
+            r#"{
+                "id": "cs_1",
+                "payment_status": "paid",
+                "collected_information": {
+                    "shipping_details": {
+                        "name": "Ada Lovelace",
+                        "address": { "line1": "Analytical Engine Way 1", "country": "DE" }
+                    }
+                }
+            }"#,
+        )
+        .expect("the address Stripe collected");
+        assert_eq!(address.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(address.line1.as_deref(), Some("Analytical Engine Way 1"));
+        assert_eq!(address.country.as_deref(), Some("DE"));
+        assert_eq!(address.city, None);
+    }
+
+    #[test]
+    fn the_top_level_shape_wins_when_both_are_present() {
+        // Should not happen, but the precedence is documented, so pin it rather
+        // than leave it to whichever order the code happens to be written in.
+        let address = shipping_of(
+            r#"{
+                "id": "cs_1",
+                "shipping_details": {
+                    "name": "Top Level",
+                    "address": { "country": "DE" }
+                },
+                "collected_information": {
+                    "shipping_details": {
+                        "name": "Nested",
+                        "address": { "country": "FR" }
+                    }
+                }
+            }"#,
+        )
+        .expect("an address");
+        assert_eq!(address.name.as_deref(), Some("Top Level"));
+        assert_eq!(address.country.as_deref(), Some("DE"));
+    }
+
+    #[test]
+    fn an_address_stripe_did_not_collect_is_no_address() {
+        // The three ways there is nothing to store: no block at all, an explicit
+        // null, and a block whose every field the customer left blank. All must
+        // read as `None`, because an all-blank address must never overwrite a
+        // real one.
+        for json in [
+            r#"{"id": "cs_1", "payment_status": "paid"}"#,
+            r#"{"id": "cs_1", "shipping_details": null}"#,
+            r#"{"id": "cs_1", "shipping_details": {"name": "   ", "address": null}}"#,
+            r#"{"id": "cs_1", "shipping_details": {"name": "", "address": {"line1": " ", "city": "", "country": "  "}}}"#,
+            r#"{"id": "cs_1", "collected_information": {"shipping_details": null}}"#,
+        ] {
+            assert_eq!(shipping_of(json), None, "should be no address: {json}");
+        }
+    }
+
+    #[test]
+    fn a_partial_address_keeps_the_fields_it_has() {
+        // A country-only address is thin but real, and dropping it would lose
+        // the one part of the order we cannot infer from anywhere else.
+        let address = shipping_of(
+            r#"{"id": "cs_1", "shipping_details": {"address": {"country": "de"}}}"#,
+        )
+        .expect("a thin but real address");
+        assert_eq!(address.country.as_deref(), Some("de"));
+        assert_eq!(address.name, None);
+        assert!(!address.is_empty());
     }
 }

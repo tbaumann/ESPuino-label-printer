@@ -267,9 +267,19 @@ money arrived.
    `/p/<uuid>?paid=1` **and** calls `POST /api/webhooks/stripe`;
 4. the webhook is the only thing that marks an order paid. It verifies the
    `Stripe-Signature` header, reads the prefix uuid out of `client_reference_id`,
-   moves `payment_pending → paid`, and stores the Stripe session id as
-   `order_ref`. That transition is also what sends the order emails — see
-   "Email notifications (Resend)" below.
+   moves `payment_pending → paid`, stores the Stripe session id as `order_ref`
+   and the shipping address Checkout collected on the prefix. That transition is
+   also what sends the order emails — see "Email notifications (Resend)" below.
+
+The address is stored with the order, so shipping it never means reading the
+Stripe dashboard. It is served by `GET /api/prefixes/{prefix}/shipping`
+**(admin)** — an address is the customer's, and the prefix uuid is the only
+credential the customer's own view holds, so it is deliberately not a field of
+the public prefix JSON. Both `shipping_details` and
+`collected_information.shipping_details` are read: which one Stripe sends is the
+API version the **webhook endpoint** is configured for, not something this code
+sets, and an endpoint version bump must not silently stop storing addresses. An
+address-less event leaves a stored one alone.
 
 **The redirect is not proof of payment.** It is a separate event from the webhook
 and can arrive first — or be typed in by hand. So the project page never trusts
@@ -454,6 +464,12 @@ data/
   Carries a `status` (see lifecycle below), `status_changed_at`, an optional
   `order_ref` (external shop id), and a `ribbon` that fixes the ribbon load and
   therefore what a card's back side may be.
+- **Shipping address** — collected by Stripe Checkout and stored on the prefix by
+  the payment webhook, so shipping an order does not mean reading the Stripe
+  dashboard. Served only by `GET /api/prefixes/{prefix}/shipping` **(admin)**;
+  never part of the public prefix JSON, whose uuid is the customer's only
+  credential. Empty until the payment settles, and on a checkout that collected
+  no address.
 - **Ribbons** — `ymcko` (colour front and a full-colour back) and `ymckoko`
   (colour front, black-and-white back; the **default**). The one choice per
   *job*, because a batch cannot mix ribbon loads. Set at prefix creation or via
@@ -624,6 +640,7 @@ an admin session.
 | GET    | `/api/prefixes/{prefix}/cards/{id}/display/back` | back preview at the ribbon's depth (PNG) |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/print-raster/front` | front print raster (BMP, the printer's own bitmap) |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/print-raster/back` | back print raster (24-bit, or 1-bit on a black panel) |
+| GET    | `/api/prefixes/{prefix}/shipping`      | where the order ships, as Stripe collected it **(admin)** |
 | GET    | `/api/shop/config`                     | prices, currency, ribbon stock, shipping and countries |
 | PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
 | PUT    | `/api/shop/ribbons/{ribbon}/price`     | set a ribbon's price, in minor units, for its own unit **(admin)** |

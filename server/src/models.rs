@@ -269,6 +269,57 @@ pub struct Prefix {
     pub unprinted_count: Option<i64>,
 }
 
+/// Where a paid order ships, as Stripe Checkout collected it.
+///
+/// Admin-only data. It is the customer's own address, so it is served by its
+/// own endpoint rather than as a field of [`Prefix`] — the public prefix JSON
+/// is readable by anyone holding the uuid, and the customer does not need their
+/// address read back to them.
+///
+/// Every field is optional because the address Stripe collected is: a field the
+/// customer left empty comes back as an empty string, which is dropped here
+/// rather than stored as one. An address where *nothing* survived is no address
+/// at all — that is what `is_empty` answers, and it is the webhook's guard
+/// against a blank payload overwriting a stored address.
+///
+/// Nothing here is validated or normalized. It is copied from Stripe as it was
+/// confirmed there, because that is the copy the parcel is addressed from —
+/// re-formatting a country or dropping a province would be us guessing at an
+/// address a courier has to be able to read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ShippingAddress {
+    /// The recipient's name, as typed at Checkout. This is Poste Restante-style
+    /// handwritten text, not a field of `address` — Stripe keeps it beside them.
+    pub name: Option<String>,
+    pub line1: Option<String>,
+    pub line2: Option<String>,
+    pub postal_code: Option<String>,
+    pub city: Option<String>,
+    /// Region/province. Frequently absent: it is not part of a German address,
+    /// and Stripe only collects it from the countries that have one.
+    pub state: Option<String>,
+    /// Two-letter ISO country code, as `STRIPE_COUNTRIES` allowed it.
+    pub country: Option<String>,
+}
+
+impl ShippingAddress {
+    /// True when no field carries any text: Stripe collected no address, or
+    /// every part of the one it collected was blank.
+    ///
+    /// This is the difference between "nothing to store" and a real address,
+    /// so it is what keeps an addressless event from wiping the address a
+    /// previous delivery of the same order stored.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.line1.is_none()
+            && self.line2.is_none()
+            && self.postal_code.is_none()
+            && self.city.is_none()
+            && self.state.is_none()
+            && self.country.is_none()
+    }
+}
+
 /// Availability state of a server-side derived artifact (display image or print
 /// raster). Same value set the card JSON and the print endpoints report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

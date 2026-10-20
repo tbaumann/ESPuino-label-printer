@@ -1,6 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { api, adminApi, STATUSES, type Card, type Prefix, type PrefixStatus } from '../lib/api'
+  import {
+    api,
+    adminApi,
+    addressLines,
+    STATUSES,
+    type Card,
+    type Prefix,
+    type PrefixStatus,
+    type ShippingAddress,
+  } from '../lib/api'
   import { navigate } from '../lib/router'
   import CardRow from '../lib/CardRow.svelte'
 
@@ -11,6 +20,12 @@
   let loading = $state(true)
   let error = $state<string | null>(null)
   let busy = $state(false)
+
+  // The shipping address is a separate, operator-only call. Kept apart from the
+  // page's own load so an anonymous visit — which can still read the prefix and
+  // its cards — says why the address is empty instead of failing outright.
+  let shipping = $state<ShippingAddress | null>(null)
+  let shippingError = $state<string | null>(null)
 
   // Editable copies for the status form; refreshed from the server after a write.
   let status = $state<PrefixStatus>('draft')
@@ -24,6 +39,20 @@
     orderRef = p.order_ref ?? ''
   }
 
+  /**
+   * Read where the order ships. The address is only ever written by Stripe's
+   * payment webhook, so nothing on this page changes it — one read is enough.
+   */
+  async function loadShipping() {
+    try {
+      shipping = await adminApi.shippingAddress(uuid)
+      shippingError = null
+    } catch (e) {
+      shipping = null
+      shippingError = (e as Error).message
+    }
+  }
+
   onMount(async () => {
     try {
       await refresh()
@@ -32,6 +61,7 @@
     } finally {
       loading = false
     }
+    await loadShipping()
   })
 
   async function apply() {
@@ -120,6 +150,36 @@
         any other status leaves the marks alone, and so does re-applying the status
         the prefix already has.
       </p>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <h2>Shipping</h2>
+        <span style="flex:1"></span>
+        <span class="muted">as Stripe collected it at checkout</span>
+      </div>
+      {#if shippingError}
+        <p class="muted" style="margin-top:10px">
+          Operator only — {shippingError}.
+          <a
+            href="/admin"
+            style="color:var(--accent);text-decoration:none"
+            onclick={(e) => { e.preventDefault(); navigate('/admin') }}
+          >Log in</a>
+          to read where this order ships.
+        </p>
+      {:else if shipping}
+        <address class="address">
+          {#each addressLines(shipping) as line, i (i)}
+            <div>{line}</div>
+          {/each}
+        </address>
+      {:else}
+        <p class="muted" style="margin-top:10px">
+          Nothing to ship to yet: the address is stored when Stripe confirms the
+          payment. An order whose checkout collected no address stays empty here.
+        </p>
+      {/if}
     </section>
 
     <section>

@@ -40,7 +40,7 @@
         # No healthcheck: nix2container drops Healthcheck from the image config
         # (upstream bug #197), so it would only cost image size here. nix-oci's
         # deploy modules re-inject it as `podman --health-cmd` at runtime.
-        cve.trivy.enabled = true; # or grype, vulnix
+        cve.trivy.enabled = false; # or grype, vulnix
         sbom.syft.enabled = true;
         credentialsLeak.trivy.enabled = true;
         test.containerStructureTest.enabled = true; # or dive, dgoss

@@ -22,6 +22,7 @@
         inputs.nix-oci.modules.flake.nix-oci
         ./packages.nix
         ./oci.nix
+        ./checks.nix
       ];
       systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
       perSystem = {

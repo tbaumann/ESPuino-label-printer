@@ -136,6 +136,7 @@ impl utoipa::Modify for SecurityAddon {
         routes::put_ribbon_price,
         routes::create_checkout,
         routes::stripe_webhook,
+        routes::get_prefix_shipping,
     ),
     components(schemas(
         models::Prefix,
@@ -159,6 +160,7 @@ impl utoipa::Modify for SecurityAddon {
         models::RibbonStock,
         models::RibbonStockPatch,
         models::RibbonPricePatch,
+        models::ShippingAddress,
         stripe::CheckoutSession,
         error::ErrorBody,
     ))

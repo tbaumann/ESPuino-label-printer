@@ -16,6 +16,10 @@
       inherit web;
     };
   in {
+    # nix-lib (pulled in by the nix-oci module) otherwise exports a docs package
+    # for the `nix-lib.lib.*` functions nix-oci declares. We have no use for it.
+    nix-lib.docs.enableOutput = false;
+
     packages.card-printer-server = server;
     packages.card-printer = cardPrinter;
     packages.default = cardPrinter;

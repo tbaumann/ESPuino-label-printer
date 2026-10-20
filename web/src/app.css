@@ -741,6 +741,18 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+/* Where the order ships, on the admin project page: one block of lines, in the
+   order a letter is addressed. `address` is the semantic element for exactly
+   this, and browsers italicise it by default — the address is data here, not a
+   caption, so that is undone. */
+.address {
+  margin-top: 10px;
+  font-style: normal;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .backtext {
   font-family: var(--mono);
   font-size: 12px;

@@ -30,6 +30,40 @@ export interface Prefix {
   card_count: number
 }
 
+/**
+ * Where a paid order ships, as Stripe Checkout collected it. Operator-only: an
+ * address is the customer's, so the server serves it from an admin endpoint
+ * rather than as a field of `Prefix`, whose uuid is the customer's only
+ * credential.
+ *
+ * Every field is nullable, because the address Stripe collected is: the parts
+ * the customer left empty are absent here rather than empty strings.
+ */
+export interface ShippingAddress {
+  /** The recipient's name, as typed at Checkout. */
+  name: string | null
+  line1: string | null
+  line2: string | null
+  postal_code: string | null
+  city: string | null
+  /** Region/province — absent on an address that has none, such as a German one. */
+  state: string | null
+  /** Two-letter ISO country code. */
+  country: string | null
+}
+
+/**
+ * The address as the lines it is written on: recipient, street, "postal code
+ * city", country. Parts the customer left empty are dropped rather than shown
+ * as blank lines, so a thin address does not look like a broken one.
+ */
+export function addressLines(a: ShippingAddress): string[] {
+  const city = [a.postal_code, a.city].filter((part) => !!part).join(' ')
+  return [a.name, a.line1, a.line2, city, a.country].filter(
+    (line): line is string => !!line && line.trim() !== '',
+  )
+}
+
 export interface Card {
   id: number
   name: string
@@ -439,6 +473,14 @@ export const adminApi = {
 
   listPrefixes: (status?: PrefixStatus | ''): Promise<Prefix[]> =>
     req<Prefix[]>(`/api/prefixes${status ? `?status=${status}` : ''}`),
+
+  /**
+   * Where this order ships, as Stripe collected it at Checkout. `null` when
+   * there is none — an order still awaiting payment, or a session that
+   * collected no address — which is not an error.
+   */
+  shippingAddress: (p: string): Promise<ShippingAddress | null> =>
+    req<ShippingAddress | null>(`/api/prefixes/${p}/shipping`),
 
   /**
    * The "needs attention" list: prefixes where money and the order disagree

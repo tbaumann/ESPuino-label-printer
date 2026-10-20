@@ -12,3 +12,4 @@ server/static/
 # nix build symlinks (result, result-1, ...)
 result*
 .worktrees/
+scripts/__pycache__/

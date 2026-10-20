@@ -15,7 +15,8 @@ use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, BackSource, Card, CardIndex, CardPatch, NeedsAttentionItem,
     NeedsAttentionKind, Prefix, PrefixInput, PrefixRibbonPatch, PrefixStatus, PrintQueue, Ribbon,
-    RibbonPrice, RibbonPricePatch, RibbonStock, RibbonStockPatch, ShopConfig, StatusInput,
+    RibbonPrice, RibbonPricePatch, RibbonStock, RibbonStockPatch, ShippingAddress, ShopConfig,
+    StatusInput,
 };
 use crate::notify;
 use crate::render;
@@ -1345,6 +1346,37 @@ pub async fn needs_attention(
     Ok(Json(items))
 }
 
+/// Where a paid order ships — the address Checkout collected, as the webhook
+/// stored it.
+///
+/// Admin-only, and deliberately its own endpoint rather than a field of the
+/// prefix JSON: the prefix uuid is the only credential the customer's own view
+/// has, so an address served there would be readable by anyone who has the
+/// uuid. Shipping the order is the operator's job, and this is where they read
+/// the address instead of opening the Stripe dashboard.
+///
+/// `null` when nothing was collected — an order that has not been paid yet, or
+/// a Checkout session configured without address collection. That is not an
+/// error: there is simply nothing to ship to yet.
+#[utoipa::path(get, path = "/api/prefixes/{prefix}/shipping", tag = "admin",
+    params(("prefix" = Uuid, Path, description = "prefix uuid")),
+    security(("bearerAuth" = []), ("sessionCookie" = [])),
+    responses(
+        (status = 200, description = "the stored shipping address, or null when there is none",
+            body = Option<ShippingAddress>),
+        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
+        (status = 404, description = "prefix not found", body = crate::error::ErrorBody)
+    ))]
+pub async fn get_prefix_shipping(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(prefix): Path<String>,
+) -> Result<Json<Option<ShippingAddress>>, ApiError> {
+    auth::resolve(&st, &headers).await?.require_admin()?;
+    let prefix = parse_uuid(&prefix)?;
+    Ok(Json(db::prefix_shipping(&st.pool, prefix).await?))
+}
+
 // ---------------------------------------------------------------------------
 // Shop — Stripe Checkout, and the webhook that records the payment
 // ---------------------------------------------------------------------------
@@ -1769,6 +1801,25 @@ async fn record_payment(
         Err(e) => return Err(e),
     };
 
+    // The shipping address comes off the settled session and is stored before
+    // the status changes, so a retry after a failed write re-runs both and
+    // cannot lose the address. An address-less session (nothing collected, or
+    // an older payload shape) leaves whatever is already stored alone: the
+    // setter would write blanks, and a later delivery must never un-ship an
+    // order that a previous one shipped.
+    match session.shipping_address() {
+        Some(address) => {
+            db::set_prefix_shipping(pool, prefix, &address).await?;
+            tracing::info!(%prefix, session = %session.id,
+                "shipping address recorded for the order");
+        }
+        None => tracing::warn!(
+            %prefix, session = %session.id,
+            "the Stripe session carries no shipping address, so none was stored; the order is \
+             still recorded, but shipping it means reading the payment in the Stripe dashboard"
+        ),
+    }
+
     match current.status {
         PrefixStatus::PaymentPending => {
             let updated =
@@ -2028,6 +2079,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(get_print_queue),
         )
         .route(
+            "/api/prefixes/:prefix/shipping",
+            axum::routing::get(get_prefix_shipping),
+        )
+        .route(
             "/api/admin/session",
             axum::routing::post(admin_login)
                 .get(admin_session)
@@ -2097,12 +2152,15 @@ mod tests {
             currency: None,
             customer_details: None,
             customer_email: None,
+            shipping_details: None,
+            collected_information: None,
             metadata: None,
         }
     }
 
     /// A settled `checkout.session.completed` event for prefix `prefix`, the
-    /// shape the payment webhook acts on.
+    /// shape the payment webhook acts on: paid, with the address Checkout
+    /// collected (the checkout asks for one, so a real order has it).
     fn payment_event(prefix: Option<&str>) -> stripe::Event {
         stripe::Event {
             id: "evt_paid".into(),
@@ -2120,10 +2178,61 @@ mod tests {
                         name: Some("Ada Lovelace".into()),
                     }),
                     customer_email: None,
+                    shipping_details: Some(test_shipping_details()),
+                    collected_information: None,
                     metadata: None,
                 },
             },
         }
+    }
+
+    /// The address the tests expect to find stored on a paid prefix.
+    fn test_shipping_address() -> ShippingAddress {
+        ShippingAddress {
+            name: Some("Ada Lovelace".into()),
+            line1: Some("Analytical Engine Way 1".into()),
+            line2: None,
+            postal_code: Some("10115".into()),
+            city: Some("Berlin".into()),
+            state: None,
+            country: Some("DE".into()),
+        }
+    }
+
+    fn test_shipping_details() -> stripe::ShippingDetails {
+        let expected = test_shipping_address();
+        stripe::ShippingDetails {
+            name: expected.name,
+            address: Some(stripe::PostalAddress {
+                line1: expected.line1,
+                line2: expected.line2,
+                postal_code: expected.postal_code,
+                city: expected.city,
+                state: expected.state,
+                country: expected.country,
+            }),
+        }
+    }
+
+    /// The same delivery with the address stripped, as Stripe sends it when
+    /// Checkout collected none. A delivery like this must never wipe an address
+    /// a previous one stored.
+    fn payment_event_without_address(prefix: Option<&str>) -> stripe::Event {
+        let mut event = payment_event(prefix);
+        event.data.object.shipping_details = None;
+        event
+    }
+
+    /// The same payment in the shape API version 2025-03-31.basil sends: the
+    /// address is nested under `collected_information` instead of sitting at the
+    /// top level of the session. Both shapes must land in the same column.
+    fn payment_event_nested_address(prefix: Option<&str>) -> stripe::Event {
+        let mut event = payment_event(prefix);
+        let moved = event.data.object.shipping_details.take();
+        event.data.object.collected_information = Some(stripe::CollectedInformation {
+            shipping_details: moved,
+        });
+        event
     }
 
     /// The public origin the tests hand to the notification path.
@@ -2250,6 +2359,93 @@ mod tests {
         .unwrap();
         assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
         assert!(anomaly_kinds(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_settled_payment_stores_the_shipping_address() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        // Nothing to ship to before the payment lands.
+        assert_eq!(db::prefix_shipping(&pool, p.uuid).await.unwrap(), None);
+
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db::prefix_shipping(&pool, p.uuid).await.unwrap(),
+            Some(test_shipping_address())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_basil_payload_shape_stores_the_same_address() {
+        // The address moved from `shipping_details` to
+        // `collected_information.shipping_details` in API version 2025-03-31.basil,
+        // and which one arrives depends on the webhook endpoint's version rather
+        // than on anything this code controls. Both must fill the same columns.
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event_nested_address(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db::prefix_shipping(&pool, p.uuid).await.unwrap(),
+            Some(test_shipping_address())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_without_an_address_never_wipes_a_stored_one() {
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, None).await.unwrap();
+        db::set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .unwrap();
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(db::prefix_shipping(&pool, p.uuid).await.unwrap().is_some());
+
+        // A degraded redelivery — the address stripped, as a session with no
+        // collected address carries it. The order stays paid and the address it
+        // already has stays put.
+        record_payment(
+            &pool,
+            None,
+            TEST_BASE,
+            &payment_event_without_address(Some(&p.uuid.to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status_of(&pool, p.uuid).await, PrefixStatus::Paid);
+        assert_eq!(
+            db::prefix_shipping(&pool, p.uuid).await.unwrap(),
+            Some(test_shipping_address())
+        );
     }
 
     #[tokio::test]

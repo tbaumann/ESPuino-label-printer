@@ -8,7 +8,7 @@ use crate::error::ApiError;
 use crate::models::{
     BackAvailability, BackDepth, BackSource, Card, CardPatch, NeedsAttentionKind, PaymentAnomaly,
     Prefix, PrefixStatus, PrintQueue, PrintQueueCard, RenderStatus, Ribbon, RibbonPrice,
-    RibbonStock,
+    RibbonStock, ShippingAddress,
 };
 
 /// Open (creating if needed) the SQLite database and run migrations.
@@ -104,6 +104,78 @@ pub async fn create_prefix(
         return Err(e.into());
     }
     get_prefix(pool, uuid).await
+}
+
+/// Where a prefix ships, as the Stripe webhook stored it.
+///
+/// `None` when no address was ever stored: an order that has not been paid yet,
+/// or a deployment whose Checkout session collects no address. The route that
+/// serves this is admin-only — it is the customer's address, and the public
+/// prefix JSON deliberately carries none of it.
+pub async fn prefix_shipping(
+    pool: &SqlitePool,
+    uuid: Uuid,
+) -> Result<Option<ShippingAddress>, ApiError> {
+    let row = sqlx::query(
+        "SELECT shipping_name, shipping_line1, shipping_line2, shipping_postal_code,
+                shipping_city, shipping_state, shipping_country
+           FROM prefixes WHERE uuid = ?1",
+    )
+    .bind(uuid.to_string())
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("prefix {uuid}")))?;
+
+    let address = ShippingAddress {
+        name: row.get("shipping_name"),
+        line1: row.get("shipping_line1"),
+        line2: row.get("shipping_line2"),
+        postal_code: row.get("shipping_postal_code"),
+        city: row.get("shipping_city"),
+        state: row.get("shipping_state"),
+        country: row.get("shipping_country"),
+    };
+    // The columns are written together or not at all, so an all-empty row is a
+    // prefix that simply has no address rather than one with a broken one.
+    Ok((!address.is_empty()).then_some(address))
+}
+
+/// Store where a prefix ships. Idempotent, and the only writer is the Stripe
+/// webhook.
+///
+/// The caller must not pass an empty address: every column here is nullable, so
+/// writing blanks over a real address would lose it for good with nothing to
+/// recover it from. [`ShippingAddress::is_empty`] is the check, and the webhook
+/// makes it before calling this — the alternative is a second delivery of a
+/// degraded event silently un-shipping a paid order.
+pub async fn set_prefix_shipping(
+    pool: &SqlitePool,
+    uuid: Uuid,
+    address: &ShippingAddress,
+) -> Result<(), ApiError> {
+    let affected = sqlx::query(
+        "UPDATE prefixes
+            SET shipping_name = ?2, shipping_line1 = ?3, shipping_line2 = ?4,
+                shipping_postal_code = ?5, shipping_city = ?6, shipping_state = ?7,
+                shipping_country = ?8
+          WHERE uuid = ?1",
+    )
+    .bind(uuid.to_string())
+    .bind(&address.name)
+    .bind(&address.line1)
+    .bind(&address.line2)
+    .bind(&address.postal_code)
+    .bind(&address.city)
+    .bind(&address.state)
+    .bind(&address.country)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(ApiError::NotFound(format!("prefix {uuid}")));
+    }
+    Ok(())
 }
 
 /// Change a prefix's ribbon. Idempotent: re-applying the current ribbon is a

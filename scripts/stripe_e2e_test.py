@@ -25,6 +25,10 @@ that really matter for that feature: the customer's confirmation is addressed to
 the address on the Stripe session and links back to their project, and a
 *replayed* webhook delivery sends no second email.
 
+The shipping-address section (5d) needs `ADMIN_TOKEN` on the server and in this
+test's environment, because the address is served by an admin-only endpoint and
+read back from there — never from the public prefix JSON.
+
 The exit code is the number of failed checks.
 """
 
@@ -58,6 +62,30 @@ ORDER_UNIT_CENTS = 500
 ORDER_UNITS = 2
 SHIPPING_CENTS = 250
 ORDER_AMOUNT_TOTAL = ORDER_UNITS * ORDER_UNIT_CENTS + SHIPPING_CENTS
+# The address Checkout collects, in the shape Stripe puts it on the session, and
+# the same address as the API serves it back (the name beside the address there,
+# flattened here). One pair of constants, so the delivered event and the
+# expectation in section 5d cannot drift apart.
+SHIPPING_DETAILS = {
+    "name": "Ada Lovelace",
+    "address": {
+        "line1": "Analytical Engine Way 1",
+        "line2": None,
+        "postal_code": "10115",
+        "city": "Berlin",
+        "state": None,
+        "country": "DE",
+    },
+}
+EXPECTED_SHIPPING = {
+    "name": "Ada Lovelace",
+    "line1": "Analytical Engine Way 1",
+    "line2": None,
+    "postal_code": "10115",
+    "city": "Berlin",
+    "state": None,
+    "country": "DE",
+}
 # The order emails are only sent when the server was given both a key and a
 # from-address; without them the checks are skipped with a note, the same way
 # the smoke test skips its Pay scenario when payment is not configured.
@@ -145,6 +173,8 @@ def payment_event(
     customer_email: Any = CUSTOMER_EMAIL,
     amount_total: int = ORDER_AMOUNT_TOTAL,
     currency: str = "eur",
+    shipping: Any = SHIPPING_DETAILS,
+    nested_shipping: bool = False,
 ) -> dict:
     obj: dict = {"id": session, "object": "checkout.session", "payment_status": payment_status}
     if prefix is not None:
@@ -161,6 +191,14 @@ def payment_event(
     if customer_email is not None:
         # What Checkout collects and the order confirmation is addressed to.
         obj["customer_details"] = {"email": customer_email, "name": "Ada Lovelace"}
+    if shipping is not None:
+        # `nested_shipping` is the API version 2025-03-31.basil shape, where the
+        # block moved under `collected_information`; the flat one is what older
+        # versions send. Which arrives is the webhook endpoint's version.
+        if nested_shipping:
+            obj["collected_information"] = {"shipping_details": shipping}
+        else:
+            obj["shipping_details"] = shipping
     return {
         "id": "evt_" + uuid.uuid4().hex[:16],
         "object": "event",
@@ -646,6 +684,73 @@ else:
     check(
         "the prefix's stored ribbon is the one that prints",
         json_request("GET", f"/api/prefixes/{prefix}", headers=ops)[1].get("ribbon") == "ymcko",
+    )
+
+# --- 5d. the shipping address the webhook stored ----------------------------
+# The address is read back from the admin endpoint and never from the public
+# prefix JSON: the prefix uuid is the customer's only credential, so an address
+# served there would be readable by anyone who has the uuid.
+print("\n5d. the shipping address")
+if not ops_token:
+    print("  note no ADMIN_TOKEN set, so the shipping-address checks are skipped")
+else:
+    ops = {"authorization": f"Bearer {ops_token}"}
+    status, address = json_request("GET", f"/api/prefixes/{prefix}/shipping", headers=ops)
+    check("the operator can read where the order ships", status == 200, str(status))
+    check(
+        "it is the address the Stripe session carried",
+        address == EXPECTED_SHIPPING,
+        json.dumps(address),
+    )
+    public = json_request("GET", f"/api/prefixes/{prefix}")[1] or {}
+    check(
+        "the public prefix JSON carries no address",
+        not any("shipping" in key for key in public),
+        json.dumps(public),
+    )
+    status, _ = json_request("GET", f"/api/prefixes/{prefix}/shipping")
+    check("reading it without the operator token is refused (401)", status == 401, str(status))
+
+    # Nothing collected: the order is paid and has nowhere to ship to, which is
+    # a null and not an error.
+    unaddressed = new_prefix(cards=1, start_checkout=True)
+    status, _ = deliver(
+        payment_event(prefix=unaddressed, session="cs_no_address", shipping=None)
+    )
+    check("a payment whose session collected no address is accepted (200)", status == 200, str(status))
+    status, address = json_request(
+        "GET", f"/api/prefixes/{unaddressed}/shipping", headers=ops
+    )
+    check(
+        "and that order simply has no address",
+        status == 200 and address is None,
+        f"{status} {address}",
+    )
+
+    # API version 2025-03-31.basil moved the block under `collected_information`.
+    # Which shape arrives is the webhook endpoint's version, not something the
+    # server chooses, so both have to land in the same columns.
+    nested = new_prefix(cards=1, start_checkout=True)
+    status, _ = deliver(
+        payment_event(prefix=nested, session="cs_nested", nested_shipping=True)
+    )
+    check("the 2025-03-31.basil payload shape is accepted (200)", status == 200, str(status))
+    address = json_request("GET", f"/api/prefixes/{nested}/shipping", headers=ops)[1]
+    check(
+        "and stores the same address",
+        address == EXPECTED_SHIPPING,
+        json.dumps(address),
+    )
+
+    # A later delivery with no address — a degraded event, or a redelivery of a
+    # session that never collected one — must not un-ship an order that a
+    # previous delivery shipped.
+    status, _ = deliver(payment_event(prefix=prefix, shipping=None))
+    address = json_request("GET", f"/api/prefixes/{prefix}/shipping", headers=ops)[1]
+    check(
+        "an address-less redelivery leaves the stored address alone",
+        address == EXPECTED_SHIPPING,
+        json.dumps(address),
     )
 
 # --- 6. events that must be handled or ignored safely -----------------------
