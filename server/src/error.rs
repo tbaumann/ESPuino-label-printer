@@ -31,7 +31,7 @@ pub enum ApiError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
-/// The caller has too many failed admin-credential attempts in a window and
+    /// The caller has too many failed admin-credential attempts in a window and
     /// is temporarily locked out. `Retry-After` advertises how long. Distinct
     /// from `Forbidden` (a permanent rejection) so a client can back off.
     #[error("rate limited: {0}")]

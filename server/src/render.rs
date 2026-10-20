@@ -62,7 +62,10 @@ impl RasterSize {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1296);
-        Self { width: w, height: h }
+        Self {
+            width: w,
+            height: h,
+        }
     }
 }
 
@@ -73,7 +76,6 @@ pub enum RenderResult {
     Ready(Vec<u8>),
     Failed(String),
 }
-
 
 fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
     image::load_from_memory(bytes).map_err(|e| format!("unreadable image: {e}"))
@@ -88,7 +90,9 @@ fn fit_to(img: &DynamicImage, w: u32, h: u32) -> RgbImage {
     let scale = (w as f32 / iw as f32).min(h as f32 / ih as f32);
     let nw = ((iw as f32 * scale).round() as u32).max(1);
     let nh = ((ih as f32 * scale).round() as u32).max(1);
-    let scaled = img.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3).to_rgb8();
+    let scaled = img
+        .resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+        .to_rgb8();
     let mut canvas = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
     let ox = (w - nw) / 2;
     let oy = (h - nh) / 2;
@@ -106,10 +110,7 @@ fn luma(p: &Rgb<u8>) -> u32 {
 /// the card's white. A plain 50% cut, deliberately — no dithering, no greys; a
 /// black panel can make neither.
 fn to_ink(canvas: &RgbImage) -> Vec<bool> {
-    canvas
-        .pixels()
-        .map(|p| luma(p) < 128)
-        .collect()
+    canvas.pixels().map(|p| luma(p) < 128).collect()
 }
 
 /// A 1-bit canvas as a greyscale image: pure black where the printer puts ink,
@@ -157,7 +158,7 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
     out.extend_from_slice(&file_size.to_le_bytes()); // bfSize
     out.extend_from_slice(&[0, 0, 0, 0]); // bfReserved
     out.extend_from_slice(&((14 + 40) as u32).to_le_bytes()); // bfOffBits
-    // BITMAPINFOHEADER (40 bytes)
+                                                              // BITMAPINFOHEADER (40 bytes)
     out.extend_from_slice(&(40u32).to_le_bytes()); // biSize
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
@@ -171,7 +172,11 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
     for y in (0..h).rev() {
         let row = &pixels[(y * row_stride) as usize..((y + 1) * row_stride) as usize];
         for x in 0..w {
-            let (r, g, b) = (row[(x * 3) as usize], row[(x * 3 + 1) as usize], row[(x * 3 + 2) as usize]);
+            let (r, g, b) = (
+                row[(x * 3) as usize],
+                row[(x * 3 + 1) as usize],
+                row[(x * 3 + 2) as usize],
+            );
             out.push(b);
             out.push(g);
             out.push(r);
@@ -199,7 +204,7 @@ pub fn bmp_1(ink: &[bool], w: u32, h: u32) -> Vec<u8> {
     out.extend_from_slice(&(file_size as u32).to_le_bytes());
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(&((14 + 40 + palette) as u32).to_le_bytes()); // bfOffBits
-    // BITMAPINFOHEADER
+                                                                        // BITMAPINFOHEADER
     out.extend_from_slice(&(40u32).to_le_bytes());
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
@@ -209,7 +214,7 @@ pub fn bmp_1(ink: &[bool], w: u32, h: u32) -> Vec<u8> {
     out.extend_from_slice(&((padded * h as usize) as u32).to_le_bytes());
     out.extend_from_slice(&(2u32).to_le_bytes()); // biClrUsed
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // biClrImportant..padding
-    // Palette: index 0 black (ink), index 1 white (card).
+                                                                  // Palette: index 0 black (ink), index 1 white (card).
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(&[255, 255, 255, 0]);
 
@@ -271,9 +276,11 @@ pub fn render_back_display(original: &[u8], depth: BackDepth) -> RenderResult {
             let canvas = fit_to(&img, DISPLAY_WIDTH, DISPLAY_HEIGHT);
             let encoded = match depth {
                 BackDepth::Color => encode_png(&canvas),
-                BackDepth::Black => {
-                    encode_gray_png(&ink_to_gray(&to_ink(&canvas), DISPLAY_WIDTH, DISPLAY_HEIGHT))
-                }
+                BackDepth::Black => encode_gray_png(&ink_to_gray(
+                    &to_ink(&canvas),
+                    DISPLAY_WIDTH,
+                    DISPLAY_HEIGHT,
+                )),
             };
             match encoded {
                 Ok(bytes) => RenderResult::Ready(bytes),
@@ -296,9 +303,7 @@ pub fn render_back_raster(original: &[u8], size: &RasterSize, depth: BackDepth) 
             let canvas = fit_to(&img, size.width, size.height);
             RenderResult::Ready(match depth {
                 BackDepth::Color => bmp_24(canvas.as_raw(), size.width, size.height),
-                BackDepth::Black => {
-                    bmp_1(&to_ink(&canvas), size.width, size.height)
-                }
+                BackDepth::Black => bmp_1(&to_ink(&canvas), size.width, size.height),
             })
         }
         Err(e) => RenderResult::Failed(e),
@@ -419,16 +424,25 @@ mod tests {
 
     #[test]
     fn raster_is_a_24_bit_bmp_at_the_requested_size() {
-        let size = RasterSize { width: 200, height: 126 };
+        let size = RasterSize {
+            width: 200,
+            height: 126,
+        };
         let bytes = png_of(tiny_rgb(100, 200, 64));
         let res = render_front_raster(&bytes, &size);
-        let RenderResult::Ready(bmp) = res else { panic!("failed: {res:?}") };
+        let RenderResult::Ready(bmp) = res else {
+            panic!("failed: {res:?}")
+        };
         assert_eq!(&bmp[0..2], b"BM");
         assert_eq!(bmp[28], 24);
         assert_eq!(bmp[18..22], 200u32.to_le_bytes());
         assert_eq!(bmp[22..26], 126u32.to_le_bytes());
         let expected_size = 14 + 40 + ((200 * 3 + 3) & !3) * 126;
-        assert_eq!(bmp.len(), expected_size, "raster is exactly the printer bitmap");
+        assert_eq!(
+            bmp.len(),
+            expected_size,
+            "raster is exactly the printer bitmap"
+        );
     }
 
     /// The scaling contract: the picture is fitted *inside* the printer bitmap,
@@ -436,7 +450,10 @@ mod tests {
     /// therefore keep its full height in the raster.
     #[test]
     fn raster_letterboxes_a_tall_picture_instead_of_cropping_it() {
-        let size = RasterSize { width: 400, height: 200 };
+        let size = RasterSize {
+            width: 400,
+            height: 200,
+        };
         // 100x400: taller than the panel, so fitting it leaves white margins
         // left and right and the picture spans the full height.
         let bytes = png_of(RgbImage::from_pixel(100, 400, Rgb([10, 10, 10])));
@@ -455,7 +472,10 @@ mod tests {
     /// display preview is that same reduction — ink stays ink, paper stays paper.
     #[test]
     fn black_back_raster_and_display_agree() {
-        let size = RasterSize { width: 100, height: 100 };
+        let size = RasterSize {
+            width: 100,
+            height: 100,
+        };
         // A 100x100 canvas: black on the left half, white on the right.
         let mut img = RgbImage::from_pixel(100, 100, Rgb([255, 255, 255]));
         for y in 0..100 {
@@ -472,7 +492,9 @@ mod tests {
         assert!(!bmp.is_empty());
 
         let color = render_back_raster(&bytes, &size, BackDepth::Color);
-        let RenderResult::Ready(color) = color else { panic!("colour raster failed") };
+        let RenderResult::Ready(color) = color else {
+            panic!("colour raster failed")
+        };
         assert_eq!(color[28], 24, "a colour back stays 24-bit");
 
         let RenderResult::Ready(display) = render_back_display(&bytes, BackDepth::Black) else {
@@ -487,8 +509,14 @@ mod tests {
 
     #[test]
     fn bad_input_fails_not_panics() {
-        assert!(matches!(render_front_display(b"not an image"), RenderResult::Failed(_)));
-        let size = RasterSize { width: 200, height: 126 };
+        assert!(matches!(
+            render_front_display(b"not an image"),
+            RenderResult::Failed(_)
+        ));
+        let size = RasterSize {
+            width: 200,
+            height: 126,
+        };
         assert!(matches!(
             render_back_raster(b"not an image", &size, BackDepth::Black),
             RenderResult::Failed(_)
@@ -497,7 +525,10 @@ mod tests {
 
     #[test]
     fn markdown_back_stub_reports_failed_not_ready() {
-        let size = RasterSize { width: 200, height: 126 };
+        let size = RasterSize {
+            width: 200,
+            height: 126,
+        };
         // Both depths: the stub is a stub on either ribbon.
         for depth in [BackDepth::Color, BackDepth::Black] {
             assert!(matches!(

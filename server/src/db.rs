@@ -465,8 +465,7 @@ pub async fn ensure_writable(
 }
 
 fn render_status(v: &str) -> Result<RenderStatus, ApiError> {
-    RenderStatus::parse(v)
-        .ok_or_else(|| ApiError::Internal(format!("unknown render status {v}")))
+    RenderStatus::parse(v).ok_or_else(|| ApiError::Internal(format!("unknown render status {v}")))
 }
 
 fn back_source_of(row: &sqlx::sqlite::SqliteRow) -> Result<BackSource, ApiError> {
@@ -643,9 +642,7 @@ pub async fn set_card_back_image(
     .execute(pool)
     .await?;
     if done.rows_affected() == 0 {
-        return Err(ApiError::NotFound(format!(
-            "card {id} in prefix {prefix}"
-        )));
+        return Err(ApiError::NotFound(format!("card {id} in prefix {prefix}")));
     }
     get_card(pool, prefix, id).await
 }
@@ -738,7 +735,11 @@ pub async fn update_card_meta(
                 "back_text is only valid for a 'markdown' back".into(),
             ));
         }
-        let value = if text.trim().is_empty() { None } else { Some(text) };
+        let value = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
         sqlx::query(
             "UPDATE cards SET back_text = ?3, updated_at = datetime('now')
               WHERE prefix_uuid = ?1 AND id = ?2",
@@ -835,7 +836,6 @@ pub async fn delete_card(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<(),
     Ok(())
 }
 
-
 /// Record the outcome of rendering a card's derived artifacts.
 ///
 /// Each pair is `(status, error)` where `error` is `Some` only on `failed`. A
@@ -928,18 +928,17 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
     // cards, and fetches `print-raster/back` exactly when `back` is not
     // `none`. It never silently prints an original whose render is pending or
     // failed.
-    let parse_status =
-        |v: String| RenderStatus::parse(&v).unwrap_or(RenderStatus::Pending);
+    let parse_status = |v: String| RenderStatus::parse(&v).unwrap_or(RenderStatus::Pending);
     let cards = rows
         .iter()
         .map(|r| {
             let back = back_source_of(r)?;
             let back_text: Option<String> = r.get("back_text");
             let back_image: Option<String> = r.get("back_image_content_type");
-            let front_ready = parse_status(r.get::<String, _>("front_raster_status"))
-                == RenderStatus::Ready;
-            let back_ready = parse_status(r.get::<String, _>("back_raster_status"))
-                == RenderStatus::Ready;
+            let front_ready =
+                parse_status(r.get::<String, _>("front_raster_status")) == RenderStatus::Ready;
+            let back_ready =
+                parse_status(r.get::<String, _>("back_raster_status")) == RenderStatus::Ready;
             // Whether there is anything to print on the back at all. A card
             // whose material is still missing is not printable, exactly as the
             // checkout's gate refuses to sell it.
@@ -1573,10 +1572,7 @@ mod tests {
         card(&pool, p.uuid, 4, BackSource::Markdown).await;
 
         // YMCKO: 1 + 2 + 2 + 2 printed sides.
-        assert_eq!(
-            billed_units(&pool, p.uuid, Ribbon::Ymcko).await.unwrap(),
-            7
-        );
+        assert_eq!(billed_units(&pool, p.uuid, Ribbon::Ymcko).await.unwrap(), 7);
         // YMCKOKO: one card each, whatever the back is.
         assert_eq!(
             billed_units(&pool, p.uuid, Ribbon::Ymckoko).await.unwrap(),
@@ -1700,7 +1696,10 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
         let c = get_card(&pool, p.uuid, 1).await.expect("card");
-        assert_eq!(c.name, "c", "the valid half of a refused patch must not land");
+        assert_eq!(
+            c.name, "c",
+            "the valid half of a refused patch must not land"
+        );
         assert_eq!(c.back, BackSource::None);
     }
 
@@ -1716,7 +1715,11 @@ mod tests {
         // at the historical per-side default of 500.
         assert_eq!(prices.len(), 2);
         for p in &prices {
-            assert_eq!(p.price_cents, 500, "ribbon {} should default to 500", p.ribbon);
+            assert_eq!(
+                p.price_cents, 500,
+                "ribbon {} should default to 500",
+                p.ribbon
+            );
         }
         let ribbons: Vec<_> = prices.iter().map(|p| p.ribbon).collect();
         assert!(ribbons.contains(&Ribbon::Ymcko));
@@ -1730,7 +1733,9 @@ mod tests {
         assert_eq!(stock.len(), 2);
         assert!(stock.iter().all(|s| s.in_stock));
         assert!(ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
-        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko)
+            .await
+            .expect("ymckoko"));
     }
 
     #[tokio::test]
@@ -1768,7 +1773,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete flag");
-        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko).await.expect("ymckoko"));
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko)
+            .await
+            .expect("ymckoko"));
         // ...and the ribbon is not offered, rather than silently so.
         let prices = list_ribbon_prices(&pool).await.expect("list");
         assert!(
@@ -1940,20 +1947,24 @@ mod tests {
         assert!(!q.cards[0].printable);
 
         // The front alone is not enough: this card prints both sides.
-        sqlx::query("UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
-            .bind(p.uuid.to_string())
-            .execute(&pool)
-            .await
-            .expect("mark front ready");
+        sqlx::query(
+            "UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1",
+        )
+        .bind(p.uuid.to_string())
+        .execute(&pool)
+        .await
+        .expect("mark front ready");
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert!(!q.cards[0].printable);
 
         // With both rasters ready, the same card is printable.
-        sqlx::query("UPDATE cards SET back_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
-            .bind(p.uuid.to_string())
-            .execute(&pool)
-            .await
-            .expect("mark back ready");
+        sqlx::query(
+            "UPDATE cards SET back_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1",
+        )
+        .bind(p.uuid.to_string())
+        .execute(&pool)
+        .await
+        .expect("mark back ready");
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert!(q.cards[0].printable);
     }
@@ -1966,11 +1977,13 @@ mod tests {
             .expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
 
-        sqlx::query("UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1")
-            .bind(p.uuid.to_string())
-            .execute(&pool)
-            .await
-            .expect("mark front ready");
+        sqlx::query(
+            "UPDATE cards SET front_raster_status = 'ready' WHERE prefix_uuid = ?1 AND id = 1",
+        )
+        .bind(p.uuid.to_string())
+        .execute(&pool)
+        .await
+        .expect("mark front ready");
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert_eq!(q.cards[0].back, BackAvailability::None);
         assert!(q.cards[0].printable);

@@ -215,10 +215,7 @@ impl LoginLimiter {
             map.remove(key);
             return Ok(());
         }
-        if bucket
-            .blocked_until
-            .is_some_and(|b| now < b)
-        {
+        if bucket.blocked_until.is_some_and(|b| now < b) {
             return Err(ApiError::TooManyRequests(format!(
                 "too many failed admin attempts; try again in {}s",
                 bucket
@@ -472,7 +469,10 @@ mod tests {
         let h = headers_with(&[("x-forwarded-for", "203.0.113.7, 10.0.0.2")]);
         assert_eq!(client_ip(&h), "203.0.113.7");
         // Left-most (untrusted) entry wins; whitespace is trimmed.
-        let h = headers_with(&[("x-forwarded-for", " 203.0.113.9 "), ("x-real-ip", "10.1.2.3")]);
+        let h = headers_with(&[
+            ("x-forwarded-for", " 203.0.113.9 "),
+            ("x-real-ip", "10.1.2.3"),
+        ]);
         assert_eq!(client_ip(&h), "203.0.113.9");
     }
 

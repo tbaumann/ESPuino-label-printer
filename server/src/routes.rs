@@ -316,7 +316,12 @@ async fn rerender_card(
     let front_pair = match front_original.as_deref() {
         Some(orig) => match render::render_front_display(orig) {
             RenderResult::Ready(bytes) => {
-                write_blob(&st.data_dir, prefix, &format!("{id}-front-display.png"), &bytes)?;
+                write_blob(
+                    &st.data_dir,
+                    prefix,
+                    &format!("{id}-front-display.png"),
+                    &bytes,
+                )?;
                 (RenderStatus::Ready, None)
             }
             RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
@@ -329,7 +334,12 @@ async fn rerender_card(
     let front_raster = match front_original.as_deref() {
         Some(orig) => match render::render_front_raster(orig, &raster) {
             RenderResult::Ready(bytes) => {
-                write_blob(&st.data_dir, prefix, &format!("{id}-front-print.bmp"), &bytes)?;
+                write_blob(
+                    &st.data_dir,
+                    prefix,
+                    &format!("{id}-front-print.bmp"),
+                    &bytes,
+                )?;
                 (RenderStatus::Ready, None)
             }
             RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
@@ -342,9 +352,10 @@ async fn rerender_card(
 
     // The back's own uploaded image, when this card's back is an image. Named
     // from the stored content type, so a re-upload in another format is found.
-    let back_original = card.back_image_content_type.as_deref().and_then(|ct| {
-        read_original(&format!("blobs/{prefix}/{id}-back.{}", extension_for(ct)))
-    });
+    let back_original = card
+        .back_image_content_type
+        .as_deref()
+        .and_then(|ct| read_original(&format!("blobs/{prefix}/{id}-back.{}", extension_for(ct))));
 
     // Back side, from the card's own choice. The *ribbon* decides the colour
     // depth every back source is rendered in — 24-bit colour on YMCKO, 1-bit
@@ -419,7 +430,12 @@ fn back_display(
     use crate::render::RenderResult;
     Ok(match render::render_back_display(original, depth) {
         RenderResult::Ready(bytes) => {
-            write_blob(&st.data_dir, prefix, &format!("{id}-back-display.png"), &bytes)?;
+            write_blob(
+                &st.data_dir,
+                prefix,
+                &format!("{id}-back-display.png"),
+                &bytes,
+            )?;
             (RenderStatus::Ready, None)
         }
         RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
@@ -441,7 +457,12 @@ fn back_raster(
     use crate::render::RenderResult;
     Ok(match render::render_back_raster(original, size, depth) {
         RenderResult::Ready(bytes) => {
-            write_blob(&st.data_dir, prefix, &format!("{id}-back-print.bmp"), &bytes)?;
+            write_blob(
+                &st.data_dir,
+                prefix,
+                &format!("{id}-back-print.bmp"),
+                &bytes,
+            )?;
             (RenderStatus::Ready, None)
         }
         RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
@@ -617,7 +638,10 @@ pub async fn post_card(
         },
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(rerender_card(&st, prefix, id).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(rerender_card(&st, prefix, id).await?),
+    ))
 }
 
 /// Fetch one card's metadata.
@@ -735,11 +759,7 @@ fn serve_artifact(
                     })
                 })
             {
-                return Ok((
-                    StatusCode::NOT_MODIFIED,
-                    [(header::ETAG, etag)],
-                )
-                    .into_response());
+                return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
             }
             Ok((
                 [
@@ -1473,7 +1493,9 @@ pub async fn put_ribbon_stock(
     let ribbon = Ribbon::parse(&ribbon)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown ribbon: {ribbon}")))?;
     tracing::info!(%ribbon, in_stock = input.in_stock, "ribbon stock flag set");
-    Ok(Json(db::set_ribbon_stock(&st.pool, ribbon, input.in_stock).await?))
+    Ok(Json(
+        db::set_ribbon_stock(&st.pool, ribbon, input.in_stock).await?,
+    ))
 }
 
 /// The most one billing unit may be priced at, in the currency's minor unit.
@@ -2689,9 +2711,15 @@ mod tests {
         // ...until the prefix is sealed for the customer. The operator keeps the
         // write while the order is in flight, which is what lets a missing back
         // be filled in after the customer has paid.
-        db::set_status(&pool, colour.uuid, PrefixStatus::PaymentPending, None, false)
-            .await
-            .unwrap();
+        db::set_status(
+            &pool,
+            colour.uuid,
+            PrefixStatus::PaymentPending,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         let err = ensure_back_image_writable(&pool, colour.uuid, 1, false)
             .await
             .expect_err("sealed for the customer");
@@ -2861,7 +2889,10 @@ mod tests {
         )
         .await
         .expect_err("customer call");
-        assert!(matches!(denied, ApiError::Unauthorized(_)), "got {denied:?}");
+        assert!(
+            matches!(denied, ApiError::Unauthorized(_)),
+            "got {denied:?}"
+        );
         assert!(db::ribbon_in_stock(&pool, crate::models::Ribbon::Ymcko)
             .await
             .unwrap());
@@ -2915,7 +2946,10 @@ mod tests {
         )
         .await
         .expect_err("customer call");
-        assert!(matches!(denied, ApiError::Unauthorized(_)), "got {denied:?}");
+        assert!(
+            matches!(denied, ApiError::Unauthorized(_)),
+            "got {denied:?}"
+        );
 
         // Unknown ribbon, and a price that is really a euro figure typed as
         // cents, are both refused before anything is written.
@@ -3103,311 +3137,315 @@ mod tests {
 
         assert_eq!(mock.len(), 0, "no email for a payment that cannot attach");
         assert_eq!(
-                    anomaly_kinds(&pool).await,
-                    vec![NeedsAttentionKind::PaymentForDraft]
-                );
-            }
+            anomaly_kinds(&pool).await,
+            vec![NeedsAttentionKind::PaymentForDraft]
+        );
+    }
 
-            #[tokio::test]
-            async fn rerender_produces_display_and_raster_for_a_front() {
-                // A real PNG in memory, written to a temp data dir so the pipeline can
-                // read the original back and write the derived blobs.
-                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
-                std::fs::create_dir_all(&dir).unwrap();
-                let pool = test_pool().await;
-                let p = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
-                    .await
-                    .unwrap();
+    #[tokio::test]
+    async fn rerender_produces_display_and_raster_for_a_front() {
+        // A real PNG in memory, written to a temp data dir so the pipeline can
+        // read the original back and write the derived blobs.
+        let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
+            .await
+            .unwrap();
 
-                // Write a 2:1 PNG as the front original, then create the card pointing
-                // at it.
-                let img = image::RgbImage::from_pixel(200, 100, image::Rgb([200, 100, 50]));
-                let mut out = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::ImageRgb8(img)
-                    .write_to(&mut out, image::ImageFormat::Png)
-                    .unwrap();
-                let bytes = out.into_inner();
-                let rel = format!("blobs/{}/1.png", p.uuid);
-                let abs = dir.join(&rel);
-                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-                std::fs::write(&abs, &bytes).unwrap();
+        // Write a 2:1 PNG as the front original, then create the card pointing
+        // at it.
+        let img = image::RgbImage::from_pixel(200, 100, image::Rgb([200, 100, 50]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = out.into_inner();
+        let rel = format!("blobs/{}/1.png", p.uuid);
+        let abs = dir.join(&rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, &bytes).unwrap();
 
-                db::upsert_card(
-                    &pool,
-                    p.uuid,
-                    1,
-                    db::CardContent {
-                        name: "front",
-                        serial_number: None,
-                        back: BackSource::None,
-                        back_text: None,
-                        image_path: &rel,
-                        image_content_type: "image/png",
-                        back_image_path: None,
-                        back_image_content_type: None,
-                    },
-                )
-                .await
+        db::upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            db::CardContent {
+                name: "front",
+                serial_number: None,
+                back: BackSource::None,
+                back_text: None,
+                image_path: &rel,
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let st = AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(dir.clone()),
+            raster: TEST_RASTER,
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            notifier: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
+            checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+        };
+
+        let card = rerender_card(&st, p.uuid, 1).await.unwrap();
+        assert_eq!(card.display_front, RenderStatus::Ready);
+        assert_eq!(card.print_front, RenderStatus::Ready);
+        // Single-sided: no back side at all.
+        assert_eq!(card.display_back, None);
+        assert_eq!(card.print_back, None);
+
+        // The derived blobs exist and are the right kinds.
+        let display =
+            std::fs::read(dir.join(format!("blobs/{}/1-front-display.png", p.uuid))).unwrap();
+        assert_eq!(&display[0..8], b"\x89PNG\r\n\x1a\n");
+        let raster =
+            std::fs::read(dir.join(format!("blobs/{}/1-front-print.bmp", p.uuid))).unwrap();
+        assert_eq!(&raster[0..2], b"BM");
+        assert_eq!(raster[28], 24);
+
+        // The endpoints serve them with the right status semantics.
+        let resp = get_front_display(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path((p.uuid.to_string(), 1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let resp = get_front_raster(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path((p.uuid.to_string(), 1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        // A back side that does not exist is a 404.
+        let err = get_back_display(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path((p.uuid.to_string(), 1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prefix with one picture-backed card, rendered, on a real temp data dir.
+    /// Returns the state, the prefix and the temporary directory (so the caller
+    /// can read the blobs it wrote).
+    async fn rendered_picture_back(ribbon: Ribbon) -> (AppState, Uuid, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, Some(ribbon)).await.unwrap();
+
+        let write_png = |name: &str, w: u32, h: u32, v: u8| {
+            let img = image::RgbImage::from_pixel(w, h, image::Rgb([v, v, v]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut out, image::ImageFormat::Png)
                 .unwrap();
+            let rel = format!("blobs/{}/{name}", p.uuid);
+            let abs = dir.join(&rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, out.into_inner()).unwrap();
+            rel
+        };
+        let front = write_png("1.png", 200, 126, 200);
+        let back = write_png("1-back.png", 100, 100, 16);
 
-                let st = AppState {
-                    pool: pool.clone(),
-                    data_dir: Arc::new(dir.clone()),
-                    raster: TEST_RASTER,
-                    admin_token: None,
-                    sessions: crate::auth::Sessions::new(pool.clone()),
-                    cookie_secure: None,
-                    stripe: None,
-                    notifier: None,
-                    login_limiter: crate::auth::LoginLimiter::default(),
-                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
-                };
+        db::upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            db::CardContent {
+                name: "picture back",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: &front,
+                image_content_type: "image/png",
+                back_image_path: Some(&back),
+                back_image_content_type: Some("image/png"),
+            },
+        )
+        .await
+        .unwrap();
+        let st = AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(dir.clone()),
+            raster: TEST_RASTER,
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            notifier: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
+            checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+        };
+        (st, p.uuid, dir)
+    }
 
-                let card = rerender_card(&st, p.uuid, 1).await.unwrap();
-                assert_eq!(card.display_front, RenderStatus::Ready);
-                assert_eq!(card.print_front, RenderStatus::Ready);
-                // Single-sided: no back side at all.
-                assert_eq!(card.display_back, None);
-                assert_eq!(card.print_back, None);
+    /// The bit depth of a rendered back raster on disk.
+    fn back_raster_bits(dir: &StdPath, prefix: Uuid) -> u16 {
+        let raw = std::fs::read(dir.join(format!("blobs/{prefix}/1-back-print.bmp"))).unwrap();
+        assert_eq!(&raw[0..2], b"BM");
+        u16::from_le_bytes([raw[28], raw[29]])
+    }
 
-                // The derived blobs exist and are the right kinds.
-                let display = std::fs::read(dir.join(format!("blobs/{}/1-front-display.png", p.uuid))).unwrap();
-                assert_eq!(&display[0..8], b"\x89PNG\r\n\x1a\n");
-                let raster = std::fs::read(dir.join(format!("blobs/{}/1-front-print.bmp", p.uuid))).unwrap();
-                assert_eq!(&raster[0..2], b"BM");
-                assert_eq!(raster[28], 24);
+    /// One ribbon, and the renderer and the print queue both read it. The
+    /// queue's `back` is what decides whether the spooler calls
+    /// `set_image_buffer` or `set_black_buffer`, so a raster rendered at the
+    /// other depth would be fed to the wrong call — and a *paid* prefix is no
+    /// exception: the charge is history, the ribbon is a production decision.
+    #[tokio::test]
+    async fn the_back_raster_follows_the_prefix_s_ribbon_after_a_switch() {
+        let (st, prefix, dir) = rendered_picture_back(Ribbon::Ymcko).await;
+        rerender_card(&st, prefix, 1).await.unwrap();
+        assert_eq!(back_raster_bits(&dir, prefix), 24, "a colour back");
+        let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+        assert_eq!(queue.ribbon, Ribbon::Ymcko);
 
-                // The endpoints serve them with the right status semantics.
-                let resp = get_front_display(
-                    State(st.clone()),
-                    HeaderMap::new(),
-                    Path((p.uuid.to_string(), 1)),
-                )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), axum::http::StatusCode::OK);
-                let resp = get_front_raster(
-                    State(st.clone()),
-                    HeaderMap::new(),
-                    Path((p.uuid.to_string(), 1)),
-                )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), axum::http::StatusCode::OK);
-                // A back side that does not exist is a 404.
-                let err = get_back_display(
-                    State(st.clone()),
-                    HeaderMap::new(),
-                    Path((p.uuid.to_string(), 1)),
-                )
-                    .await
-                    .unwrap_err();
-                assert!(matches!(err, ApiError::NotFound(_)), "{err:?}");
+        // A ribbon switch: the rasters are re-rendered, and the queue reports
+        // the same thing the raster is.
+        let updated = db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymckoko)
+            .await
+            .unwrap();
+        assert_eq!(updated.ribbon, Ribbon::Ymckoko);
+        rerender_card(&st, prefix, 1).await.unwrap();
+        assert_eq!(back_raster_bits(&dir, prefix), 1, "re-rendered in 1 bit");
+        let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+        assert_eq!(queue.ribbon, Ribbon::Ymckoko);
+        assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Black);
 
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+        // And back again, so the depth is a function of `ribbon` and nothing
+        // else.
+        db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymcko)
+            .await
+            .unwrap();
+        rerender_card(&st, prefix, 1).await.unwrap();
+        assert_eq!(back_raster_bits(&dir, prefix), 24);
+        let queue = db::print_queue(&st.pool, prefix).await.unwrap();
+        assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Color);
+    }
 
-            /// A prefix with one picture-backed card, rendered, on a real temp data dir.
-            /// Returns the state, the prefix and the temporary directory (so the caller
-            /// can read the blobs it wrote).
-            async fn rendered_picture_back(ribbon: Ribbon) -> (AppState, Uuid, PathBuf) {
-                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
-                std::fs::create_dir_all(&dir).unwrap();
-                let pool = test_pool().await;
-                let p = db::create_prefix(&pool, None, Some(ribbon)).await.unwrap();
+    /// An artifact's path never changes but its bytes do, so it has to carry a
+    /// validator: a browser that keeps the old URL must be able to be told
+    /// "still current" or "here is the new one" rather than trusting its copy.
+    #[tokio::test]
+    async fn artifacts_carry_an_etag_and_answer_if_none_match() {
+        let (st, prefix, _dir) = rendered_picture_back(Ribbon::Ymcko).await;
+        rerender_card(&st, prefix, 1).await.unwrap();
+        let (p, id) = (prefix.to_string(), 1i64);
 
-                let write_png = |name: &str, w: u32, h: u32, v: u8| {
-                    let img = image::RgbImage::from_pixel(w, h, image::Rgb([v, v, v]));
-                    let mut out = std::io::Cursor::new(Vec::new());
-                    image::DynamicImage::ImageRgb8(img)
-                        .write_to(&mut out, image::ImageFormat::Png)
-                        .unwrap();
-                    let rel = format!("blobs/{}/{name}", p.uuid);
-                    let abs = dir.join(&rel);
-                    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-                    std::fs::write(&abs, out.into_inner()).unwrap();
-                    rel
-                };
-                let front = write_png("1.png", 200, 126, 200);
-                let back = write_png("1-back.png", 100, 100, 16);
+        let res = get_front_display(State(st.clone()), HeaderMap::new(), Path((p.clone(), id)))
+            .await
+            .expect("the front display image");
+        assert_eq!(res.status(), StatusCode::OK);
+        let etag = res
+            .headers()
+            .get(header::ETAG)
+            .expect("an ETag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache",
+            "a cached copy must be revalidated, not reused blind"
+        );
 
-                db::upsert_card(
-                    &pool,
-                    p.uuid,
-                    1,
-                    db::CardContent {
-                        name: "picture back",
-                        serial_number: None,
-                        back: BackSource::Image,
-                        back_text: None,
-                        image_path: &front,
-                        image_content_type: "image/png",
-                        back_image_path: Some(&back),
-                        back_image_content_type: Some("image/png"),
-                    },
-                )
-                .await
-                .unwrap();
-                let st = AppState {
-                    pool: pool.clone(),
-                    data_dir: Arc::new(dir.clone()),
-                    raster: TEST_RASTER,
-                    admin_token: None,
-                    sessions: crate::auth::Sessions::new(pool.clone()),
-                    cookie_secure: None,
-                    stripe: None,
-                    notifier: None,
-                    login_limiter: crate::auth::LoginLimiter::default(),
-                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
-                };
-                (st, p.uuid, dir)
-            }
+        // The same validator comes back as a 304 with no body.
+        let mut req = HeaderMap::new();
+        req.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let res = get_front_display(State(st), req, Path((p, id)))
+            .await
+            .expect("the conditional request");
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
 
-            /// The bit depth of a rendered back raster on disk.
-            fn back_raster_bits(dir: &StdPath, prefix: Uuid) -> u16 {
-                let raw = std::fs::read(dir.join(format!("blobs/{prefix}/1-back-print.bmp"))).unwrap();
-                assert_eq!(&raw[0..2], b"BM");
-                u16::from_le_bytes([raw[28], raw[29]])
-            }
+    #[tokio::test]
+    async fn rerender_marks_a_markdown_back_failed_until_a_renderer_lands() {
+        let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = test_pool().await;
+        let p = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+            .await
+            .unwrap();
 
-            /// One ribbon, and the renderer and the print queue both read it. The
-            /// queue's `back` is what decides whether the spooler calls
-            /// `set_image_buffer` or `set_black_buffer`, so a raster rendered at the
-            /// other depth would be fed to the wrong call — and a *paid* prefix is no
-            /// exception: the charge is history, the ribbon is a production decision.
-            #[tokio::test]
-            async fn the_back_raster_follows_the_prefix_s_ribbon_after_a_switch() {
-                let (st, prefix, dir) = rendered_picture_back(Ribbon::Ymcko).await;
-                rerender_card(&st, prefix, 1).await.unwrap();
-                assert_eq!(back_raster_bits(&dir, prefix), 24, "a colour back");
-                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
-                assert_eq!(queue.ribbon, Ribbon::Ymcko);
+        let img = image::RgbImage::from_pixel(200, 100, image::Rgb([10, 20, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = out.into_inner();
+        let rel = format!("blobs/{}/1.png", p.uuid);
+        let abs = dir.join(&rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, &bytes).unwrap();
 
-                // A ribbon switch: the rasters are re-rendered, and the queue reports
-                // the same thing the raster is.
-                let updated = db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymckoko)
-                    .await
-                    .unwrap();
-                assert_eq!(updated.ribbon, Ribbon::Ymckoko);
-                rerender_card(&st, prefix, 1).await.unwrap();
-                assert_eq!(back_raster_bits(&dir, prefix), 1, "re-rendered in 1 bit");
-                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
-                assert_eq!(queue.ribbon, Ribbon::Ymckoko);
-                assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Black);
+        db::upsert_card(
+            &pool,
+            p.uuid,
+            1,
+            db::CardContent {
+                name: "card",
+                serial_number: None,
+                back: BackSource::Markdown,
+                back_text: Some("# Title"),
+                image_path: &rel,
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
+        )
+        .await
+        .unwrap();
 
-                // And back again, so the depth is a function of `ribbon` and nothing
-                // else.
-                db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymcko).await.unwrap();
-                rerender_card(&st, prefix, 1).await.unwrap();
-                assert_eq!(back_raster_bits(&dir, prefix), 24);
-                let queue = db::print_queue(&st.pool, prefix).await.unwrap();
-                assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Color);
-            }
+        let st = AppState {
+            pool: pool.clone(),
+            data_dir: Arc::new(dir.clone()),
+            raster: TEST_RASTER,
+            admin_token: None,
+            sessions: crate::auth::Sessions::new(pool.clone()),
+            cookie_secure: None,
+            stripe: None,
+            notifier: None,
+            login_limiter: crate::auth::LoginLimiter::default(),
+            checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+        };
 
-            /// An artifact's path never changes but its bytes do, so it has to carry a
-            /// validator: a browser that keeps the old URL must be able to be told
-            /// "still current" or "here is the new one" rather than trusting its copy.
-            #[tokio::test]
-            async fn artifacts_carry_an_etag_and_answer_if_none_match() {
-                let (st, prefix, _dir) = rendered_picture_back(Ribbon::Ymcko).await;
-                rerender_card(&st, prefix, 1).await.unwrap();
-                let (p, id) = (prefix.to_string(), 1i64);
+        let card = rerender_card(&st, p.uuid, 1).await.unwrap();
+        // Front renders; the markdown back is a stub until a real
+        // renderer lands.
+        assert_eq!(card.display_front, RenderStatus::Ready);
+        assert_eq!(card.print_front, RenderStatus::Ready);
+        assert_eq!(card.display_back, Some(RenderStatus::Failed));
+        assert_eq!(card.print_back, Some(RenderStatus::Failed));
 
-                let res = get_front_display(State(st.clone()), HeaderMap::new(), Path((p.clone(), id)))
-                    .await
-                    .expect("the front display image");
-                assert_eq!(res.status(), StatusCode::OK);
-                let etag = res
-                    .headers()
-                    .get(header::ETAG)
-                    .expect("an ETag")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                assert_eq!(
-                    res.headers().get(header::CACHE_CONTROL).unwrap(),
-                    "no-cache",
-                    "a cached copy must be revalidated, not reused blind"
-                );
+        // The failed back raster answers 500, not a blank 200.
+        let err = get_back_raster(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path((p.uuid.to_string(), 1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
 
-                // The same validator comes back as a 304 with no body.
-                let mut req = HeaderMap::new();
-                req.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
-                let res = get_front_display(State(st), req, Path((p, id)))
-                    .await
-                    .expect("the conditional request");
-                assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
-            }
-
-            #[tokio::test]
-            async fn rerender_marks_a_markdown_back_failed_until_a_renderer_lands() {
-                let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
-                std::fs::create_dir_all(&dir).unwrap();
-                let pool = test_pool().await;
-                let p = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
-                    .await
-                    .unwrap();
-
-                let img = image::RgbImage::from_pixel(200, 100, image::Rgb([10, 20, 30]));
-                let mut out = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::ImageRgb8(img)
-                    .write_to(&mut out, image::ImageFormat::Png)
-                    .unwrap();
-                let bytes = out.into_inner();
-                let rel = format!("blobs/{}/1.png", p.uuid);
-                let abs = dir.join(&rel);
-                std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-                std::fs::write(&abs, &bytes).unwrap();
-
-                db::upsert_card(
-                    &pool,
-                    p.uuid,
-                    1,
-                    db::CardContent {
-                        name: "card",
-                        serial_number: None,
-                        back: BackSource::Markdown,
-                        back_text: Some("# Title"),
-                        image_path: &rel,
-                        image_content_type: "image/png",
-                        back_image_path: None,
-                        back_image_content_type: None,
-                    },
-                )
-                .await
-                .unwrap();
-
-                let st = AppState {
-                    pool: pool.clone(),
-                    data_dir: Arc::new(dir.clone()),
-                    raster: TEST_RASTER,
-                    admin_token: None,
-                    sessions: crate::auth::Sessions::new(pool.clone()),
-                    cookie_secure: None,
-                    stripe: None,
-                    notifier: None,
-                    login_limiter: crate::auth::LoginLimiter::default(),
-                    checkout_limiter: rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
-                };
-
-                let card = rerender_card(&st, p.uuid, 1).await.unwrap();
-                // Front renders; the markdown back is a stub until a real
-                // renderer lands.
-                assert_eq!(card.display_front, RenderStatus::Ready);
-                assert_eq!(card.print_front, RenderStatus::Ready);
-                assert_eq!(card.display_back, Some(RenderStatus::Failed));
-                assert_eq!(card.print_back, Some(RenderStatus::Failed));
-
-                // The failed back raster answers 500, not a blank 200.
-                let err = get_back_raster(
-                    State(st.clone()),
-                    HeaderMap::new(),
-                    Path((p.uuid.to_string(), 1)),
-                )
-                    .await
-                    .unwrap_err();
-                assert!(matches!(err, ApiError::Internal(_)), "{err:?}");
-
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

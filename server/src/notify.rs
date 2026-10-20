@@ -673,10 +673,10 @@ pub(crate) mod tests {
             .as_str()
             .unwrap()
             .contains("ada@example.test"));
-        assert!(operator["text"]
-            .as_str()
-            .unwrap()
-            .contains("ymckoko"), "the operator is told which ribbon to load");
+        assert!(
+            operator["text"].as_str().unwrap().contains("ymckoko"),
+            "the operator is told which ribbon to load"
+        );
     }
 
     #[tokio::test]

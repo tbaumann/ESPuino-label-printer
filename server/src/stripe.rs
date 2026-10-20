@@ -1048,10 +1048,9 @@ mod tests {
     fn a_partial_address_keeps_the_fields_it_has() {
         // A country-only address is thin but real, and dropping it would lose
         // the one part of the order we cannot infer from anywhere else.
-        let address = shipping_of(
-            r#"{"id": "cs_1", "shipping_details": {"address": {"country": "de"}}}"#,
-        )
-        .expect("a thin but real address");
+        let address =
+            shipping_of(r#"{"id": "cs_1", "shipping_details": {"address": {"country": "de"}}}"#)
+                .expect("a thin but real address");
         assert_eq!(address.country.as_deref(), Some("de"));
         assert_eq!(address.name, None);
         assert!(!address.is_empty());
