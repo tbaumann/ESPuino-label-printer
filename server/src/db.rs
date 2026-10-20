@@ -558,6 +558,20 @@ pub async fn next_card_id(pool: &SqlitePool, prefix: Uuid) -> Result<i64, ApiErr
     Ok(row.get("next_id"))
 }
 
+/// A card's content, as written by [`upsert_card`]: everything about the card
+/// except its `(prefix, id)` key. Borrowed, so a caller that owns the strings
+/// (the route layer's `StoredCard`) can pass them without cloning.
+pub struct CardContent<'a> {
+    pub name: &'a str,
+    pub serial_number: Option<&'a str>,
+    pub back: BackSource,
+    pub back_text: Option<&'a str>,
+    pub image_path: &'a str,
+    pub image_content_type: &'a str,
+    pub back_image_path: Option<&'a str>,
+    pub back_image_content_type: Option<&'a str>,
+}
+
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
 ///
 /// A `back_image_path`/`back_image_content_type` of `None` clears any stored
@@ -567,14 +581,7 @@ pub async fn upsert_card(
     pool: &SqlitePool,
     prefix: Uuid,
     id: i64,
-    name: &str,
-    serial_number: Option<&str>,
-    back: BackSource,
-    back_text: Option<&str>,
-    image_path: &str,
-    image_content_type: &str,
-    back_image_path: Option<&str>,
-    back_image_content_type: Option<&str>,
+    card: CardContent<'_>,
 ) -> Result<Card, ApiError> {
     sqlx::query(
         "INSERT INTO cards
@@ -594,14 +601,14 @@ pub async fn upsert_card(
     )
     .bind(prefix.to_string())
     .bind(id)
-    .bind(name)
-    .bind(serial_number)
-    .bind(back.as_str())
-    .bind(back_text)
-    .bind(image_path)
-    .bind(image_content_type)
-    .bind(back_image_path)
-    .bind(back_image_content_type)
+    .bind(card.name)
+    .bind(card.serial_number)
+    .bind(card.back.as_str())
+    .bind(card.back_text)
+    .bind(card.image_path)
+    .bind(card.image_content_type)
+    .bind(card.back_image_path)
+    .bind(card.back_image_content_type)
     .execute(pool)
     .await?;
 
@@ -978,6 +985,17 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
 // Payment anomalies — the dead ends behind the admin "needs attention" list
 // ---------------------------------------------------------------------------
 
+/// The fields of a [`PaymentAnomaly`] row the caller supplies; `id` and
+/// `created_at` are the database's.
+pub struct NewPaymentAnomaly<'a> {
+    pub kind: NeedsAttentionKind,
+    pub message: &'a str,
+    pub action: &'a str,
+    pub session_id: Option<&'a str>,
+    pub amount_cents: Option<i64>,
+    pub currency: Option<&'a str>,
+}
+
 /// Record a dead-end payment event: a settled payment that could not attach to
 /// a prefix (cancelled, draft, deleted, or already past printing). Written by
 /// the webhook at the moment the dead end happens, so the "needs attention"
@@ -985,12 +1003,7 @@ pub async fn print_queue(pool: &SqlitePool, prefix: Uuid) -> Result<PrintQueue, 
 pub async fn insert_payment_anomaly(
     pool: &SqlitePool,
     prefix: Uuid,
-    kind: NeedsAttentionKind,
-    message: &str,
-    action: &str,
-    session_id: Option<&str>,
-    amount_cents: Option<i64>,
-    currency: Option<&str>,
+    anomaly: NewPaymentAnomaly<'_>,
 ) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO payment_anomalies
@@ -998,12 +1011,12 @@ pub async fn insert_payment_anomaly(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(prefix.to_string())
-    .bind(kind.as_str())
-    .bind(message)
-    .bind(action)
-    .bind(session_id)
-    .bind(amount_cents)
-    .bind(currency)
+    .bind(anomaly.kind.as_str())
+    .bind(anomaly.message)
+    .bind(anomaly.action)
+    .bind(anomaly.session_id)
+    .bind(anomaly.amount_cents)
+    .bind(anomaly.currency)
     .execute(pool)
     .await?;
     Ok(())
@@ -1185,14 +1198,16 @@ mod tests {
             pool,
             prefix,
             id,
-            "c",
-            None,
-            back,
-            text,
-            "blobs/f.png",
-            "image/png",
-            image,
-            image.map(|_| "image/png"),
+            CardContent {
+                name: "c",
+                serial_number: None,
+                back,
+                back_text: text,
+                image_path: "blobs/f.png",
+                image_content_type: "image/png",
+                back_image_path: image,
+                back_image_content_type: image.map(|_| "image/png"),
+            },
         )
         .await
         .expect("upsert card");
@@ -1410,14 +1425,16 @@ mod tests {
             &pool,
             p.uuid,
             1,
-            "front only",
-            None,
-            BackSource::Image,
-            None,
-            "blobs/1.png",
-            "image/png",
-            None,
-            None,
+            CardContent {
+                name: "front only",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: "blobs/1.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .expect("upsert");
@@ -1437,14 +1454,16 @@ mod tests {
             &pool,
             p.uuid,
             1,
-            "front only",
-            None,
-            BackSource::Image,
-            None,
-            "blobs/1.png",
-            "image/png",
-            None,
-            None,
+            CardContent {
+                name: "front only",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: "blobs/1.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .expect("upsert");
@@ -1505,14 +1524,16 @@ mod tests {
             &pool,
             p.uuid,
             5,
-            "no image",
-            None,
-            BackSource::Image,
-            None,
-            "blobs/5.png",
-            "image/png",
-            None,
-            None,
+            CardContent {
+                name: "no image",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: "blobs/5.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .expect("upsert");
@@ -1520,14 +1541,16 @@ mod tests {
             &pool,
             p.uuid,
             6,
-            "blank text",
-            None,
-            BackSource::Markdown,
-            Some("  \n "),
-            "blobs/6.png",
-            "image/png",
-            None,
-            None,
+            CardContent {
+                name: "blank text",
+                serial_number: None,
+                back: BackSource::Markdown,
+                back_text: Some("  \n "),
+                image_path: "blobs/6.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .expect("upsert");
@@ -1881,14 +1904,16 @@ mod tests {
             &pool,
             p.uuid,
             1,
-            "no image yet",
-            None,
-            BackSource::Image,
-            None,
-            "blobs/1.png",
-            "image/png",
-            None,
-            None,
+            CardContent {
+                name: "no image yet",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: "blobs/1.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .expect("upsert");
@@ -2052,12 +2077,14 @@ mod tests {
         insert_payment_anomaly(
             &pool,
             prefix,
-            NeedsAttentionKind::PaymentForDeleted,
-            "a settled payment for a prefix that has since been deleted",
-            "refund_or_rebuild_by_hand",
-            Some("cs_1"),
-            Some(1750),
-            Some("eur"),
+            NewPaymentAnomaly {
+                kind: NeedsAttentionKind::PaymentForDeleted,
+                message: "a settled payment for a prefix that has since been deleted",
+                action: "refund_or_rebuild_by_hand",
+                session_id: Some("cs_1"),
+                amount_cents: Some(1750),
+                currency: Some("eur"),
+            },
         )
         .await
         .expect("insert");

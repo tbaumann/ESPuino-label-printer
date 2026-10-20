@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path as StdPath;
 
 use axum::body::Bytes;
 use axum::extract::{Multipart, Path, Query, State};
@@ -61,7 +61,7 @@ fn content_type_for(ext: &str) -> &'static str {
 /// is the full file name, e.g. `"3.png"` (front) or `"3-back.png"` (back).
 /// Returns the blob's path relative to the data dir, as stored in the DB.
 fn write_blob(
-    data_dir: &PathBuf,
+    data_dir: &StdPath,
     prefix: Uuid,
     filename: &str,
     bytes: &[u8],
@@ -122,7 +122,7 @@ struct StoredCard {
 /// (`ensure_order_printable`), not here.
 async fn store_card_form(
     mut mp: Multipart,
-    data_dir: &PathBuf,
+    data_dir: &StdPath,
     prefix: Uuid,
     id: i64,
 ) -> Result<StoredCard, ApiError> {
@@ -568,14 +568,16 @@ pub async fn put_card(
         &st.pool,
         prefix,
         id,
-        &c.name,
-        c.serial_number.as_deref(),
-        c.back,
-        c.back_text.as_deref(),
-        &c.image_rel,
-        &c.image_content_type,
-        c.back_image_rel.as_deref(),
-        c.back_image_content_type.as_deref(),
+        db::CardContent {
+            name: &c.name,
+            serial_number: c.serial_number.as_deref(),
+            back: c.back,
+            back_text: c.back_text.as_deref(),
+            image_path: &c.image_rel,
+            image_content_type: &c.image_content_type,
+            back_image_path: c.back_image_rel.as_deref(),
+            back_image_content_type: c.back_image_content_type.as_deref(),
+        },
     )
     .await?;
     Ok(Json(rerender_card(&st, prefix, id).await?))
@@ -603,14 +605,16 @@ pub async fn post_card(
         &st.pool,
         prefix,
         id,
-        &c.name,
-        c.serial_number.as_deref(),
-        c.back,
-        c.back_text.as_deref(),
-        &c.image_rel,
-        &c.image_content_type,
-        c.back_image_rel.as_deref(),
-        c.back_image_content_type.as_deref(),
+        db::CardContent {
+            name: &c.name,
+            serial_number: c.serial_number.as_deref(),
+            back: c.back,
+            back_text: c.back_text.as_deref(),
+            image_path: &c.image_rel,
+            image_content_type: &c.image_content_type,
+            back_image_path: c.back_image_rel.as_deref(),
+            back_image_content_type: c.back_image_content_type.as_deref(),
+        },
     )
     .await?;
     Ok((StatusCode::CREATED, Json(rerender_card(&st, prefix, id).await?)))
@@ -710,7 +714,7 @@ fn serve_artifact(
     match status {
         // The side does not exist for this card (no back in this mode, or a
         // colour card with no back image yet).
-        None => Err(ApiError::NotFound(format!("no such side for this card"))),
+        None => Err(ApiError::NotFound("no such side for this card".to_string())),
         Some(RenderStatus::Pending) => Err(ApiError::Locked(
             "the artifact is still being rendered; retry shortly".into(),
         )),
@@ -1785,12 +1789,14 @@ async fn record_payment(
             db::insert_payment_anomaly(
                 pool,
                 prefix,
-                NeedsAttentionKind::PaymentForDeleted,
-                &message,
-                "refund_or_rebuild_by_hand",
-                Some(&session.id),
-                session.amount_total,
-                session.currency.as_deref(),
+                db::NewPaymentAnomaly {
+                    kind: NeedsAttentionKind::PaymentForDeleted,
+                    message: &message,
+                    action: "refund_or_rebuild_by_hand",
+                    session_id: Some(&session.id),
+                    amount_cents: session.amount_total,
+                    currency: session.currency.as_deref(),
+                },
             )
             .await?;
             tracing::error!(%prefix, session = %session.id, amount = ?session.amount_total,
@@ -1875,12 +1881,14 @@ async fn record_payment(
             db::insert_payment_anomaly(
                 pool,
                 prefix,
-                NeedsAttentionKind::PaymentAfterPrinting,
-                &message,
-                "verify_then_refund_if_duplicate",
-                Some(&session.id),
-                session.amount_total,
-                session.currency.as_deref(),
+                db::NewPaymentAnomaly {
+                    kind: NeedsAttentionKind::PaymentAfterPrinting,
+                    message: &message,
+                    action: "verify_then_refund_if_duplicate",
+                    session_id: Some(&session.id),
+                    amount_cents: session.amount_total,
+                    currency: session.currency.as_deref(),
+                },
             )
             .await?;
             tracing::warn!(%prefix, session = %session.id, status = %current.status,
@@ -1898,12 +1906,14 @@ async fn record_payment(
             db::insert_payment_anomaly(
                 pool,
                 prefix,
-                NeedsAttentionKind::PaymentForDraft,
-                &message,
-                "refund_or_honour",
-                Some(&session.id),
-                session.amount_total,
-                session.currency.as_deref(),
+                db::NewPaymentAnomaly {
+                    kind: NeedsAttentionKind::PaymentForDraft,
+                    message: &message,
+                    action: "refund_or_honour",
+                    session_id: Some(&session.id),
+                    amount_cents: session.amount_total,
+                    currency: session.currency.as_deref(),
+                },
             )
             .await?;
             tracing::warn!(%prefix, session = %session.id, status = %current.status,
@@ -1916,12 +1926,14 @@ async fn record_payment(
             db::insert_payment_anomaly(
                 pool,
                 prefix,
-                NeedsAttentionKind::PaymentForCancelled,
-                &message,
-                "refund_or_honour",
-                Some(&session.id),
-                session.amount_total,
-                session.currency.as_deref(),
+                db::NewPaymentAnomaly {
+                    kind: NeedsAttentionKind::PaymentForCancelled,
+                    message: &message,
+                    action: "refund_or_honour",
+                    session_id: Some(&session.id),
+                    amount_cents: session.amount_total,
+                    currency: session.currency.as_deref(),
+                },
             )
             .await?;
             tracing::warn!(%prefix, session = %session.id, status = %current.status,
@@ -2122,6 +2134,7 @@ mod tests {
     use crate::models::RenderStatus;
     use crate::rate_limit;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2255,14 +2268,16 @@ mod tests {
             pool,
             prefix,
             id,
-            "c",
-            None,
-            back,
-            text,
-            "blobs/f.png",
-            "image/png",
-            image,
-            image.map(|_| "image/png"),
+            db::CardContent {
+                name: "c",
+                serial_number: None,
+                back,
+                back_text: text,
+                image_path: "blobs/f.png",
+                image_content_type: "image/png",
+                back_image_path: image,
+                back_image_content_type: image.map(|_| "image/png"),
+            },
         )
         .await
         .expect("upsert card");
@@ -2711,14 +2726,16 @@ mod tests {
             &pool,
             p.uuid,
             2,
-            "no back yet",
-            None,
-            BackSource::Image,
-            None,
-            "blobs/2.png",
-            "image/png",
-            None,
-            None,
+            db::CardContent {
+                name: "no back yet",
+                serial_number: None,
+                back: BackSource::Image,
+                back_text: None,
+                image_path: "blobs/2.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .unwrap();
@@ -2741,14 +2758,16 @@ mod tests {
             &pool,
             p.uuid,
             3,
-            "blank text",
-            None,
-            BackSource::Markdown,
-            Some("  "),
-            "blobs/3.png",
-            "image/png",
-            None,
-            None,
+            db::CardContent {
+                name: "blank text",
+                serial_number: None,
+                back: BackSource::Markdown,
+                back_text: Some("  "),
+                image_path: "blobs/3.png",
+                image_content_type: "image/png",
+                back_image_path: None,
+                back_image_content_type: None,
+            },
         )
         .await
         .unwrap();
@@ -3117,14 +3136,16 @@ mod tests {
                     &pool,
                     p.uuid,
                     1,
-                    "front",
-                    None,
-                    BackSource::None,
-                    None,
-                    &rel,
-                    "image/png",
-                    None,
-                    None,
+                    db::CardContent {
+                        name: "front",
+                        serial_number: None,
+                        back: BackSource::None,
+                        back_text: None,
+                        image_path: &rel,
+                        image_content_type: "image/png",
+                        back_image_path: None,
+                        back_image_content_type: None,
+                    },
                 )
                 .await
                 .unwrap();
@@ -3214,14 +3235,16 @@ mod tests {
                     &pool,
                     p.uuid,
                     1,
-                    "picture back",
-                    None,
-                    BackSource::Image,
-                    None,
-                    &front,
-                    "image/png",
-                    Some(&back),
-                    Some("image/png"),
+                    db::CardContent {
+                        name: "picture back",
+                        serial_number: None,
+                        back: BackSource::Image,
+                        back_text: None,
+                        image_path: &front,
+                        image_content_type: "image/png",
+                        back_image_path: Some(&back),
+                        back_image_content_type: Some("image/png"),
+                    },
                 )
                 .await
                 .unwrap();
@@ -3241,7 +3264,7 @@ mod tests {
             }
 
             /// The bit depth of a rendered back raster on disk.
-            fn back_raster_bits(dir: &PathBuf, prefix: Uuid) -> u16 {
+            fn back_raster_bits(dir: &StdPath, prefix: Uuid) -> u16 {
                 let raw = std::fs::read(dir.join(format!("blobs/{prefix}/1-back-print.bmp"))).unwrap();
                 assert_eq!(&raw[0..2], b"BM");
                 u16::from_le_bytes([raw[28], raw[29]])
@@ -3340,14 +3363,16 @@ mod tests {
                     &pool,
                     p.uuid,
                     1,
-                    "card",
-                    None,
-                    BackSource::Markdown,
-                    Some("# Title"),
-                    &rel,
-                    "image/png",
-                    None,
-                    None,
+                    db::CardContent {
+                        name: "card",
+                        serial_number: None,
+                        back: BackSource::Markdown,
+                        back_text: Some("# Title"),
+                        image_path: &rel,
+                        image_content_type: "image/png",
+                        back_image_path: None,
+                        back_image_content_type: None,
+                    },
                 )
                 .await
                 .unwrap();

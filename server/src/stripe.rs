@@ -677,7 +677,7 @@ fn constant_time_eq_hex(expected: &[u8], hex_candidate: &str) -> bool {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();

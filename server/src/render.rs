@@ -154,7 +154,7 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
 
     // BITMAPFILEHEADER (14 bytes, little-endian)
     out.extend_from_slice(b"BM");
-    out.extend_from_slice(&(file_size as u32).to_le_bytes()); // bfSize
+    out.extend_from_slice(&file_size.to_le_bytes()); // bfSize
     out.extend_from_slice(&[0, 0, 0, 0]); // bfReserved
     out.extend_from_slice(&((14 + 40) as u32).to_le_bytes()); // bfOffBits
     // BITMAPINFOHEADER (40 bytes)
@@ -164,7 +164,7 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
     out.extend_from_slice(&[1, 0]); // biPlanes
     out.extend_from_slice(&[24, 0]); // biBitCount
     out.extend_from_slice(&(0u32).to_le_bytes()); // biCompression = BI_RGB
-    out.extend_from_slice(&((padded * h) as u32).to_le_bytes()); // biSizeImage
+    out.extend_from_slice(&(padded * h).to_le_bytes()); // biSizeImage
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     // Pixel rows, bottom-up, BGR, padded to 4 bytes.
@@ -176,7 +176,7 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
             out.push(g);
             out.push(r);
         }
-        out.extend(std::iter::repeat(0).take((padded - row_stride) as usize));
+        out.extend(std::iter::repeat_n(0, (padded - row_stride) as usize));
     }
     out
 }
@@ -188,7 +188,7 @@ pub fn bmp_24(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
 /// to `set_black_buffer` verbatim.
 pub fn bmp_1(ink: &[bool], w: u32, h: u32) -> Vec<u8> {
     assert_eq!(ink.len(), (w as usize) * (h as usize), "ink mask size");
-    let row_stride = ((w as usize) + 7) / 8;
+    let row_stride = (w as usize).div_ceil(8);
     let padded = (row_stride + 3) & !3;
     let palette = 8; // two BGRA quads
     let file_size = 14 + 40 + palette + padded * h as usize;
@@ -226,7 +226,7 @@ pub fn bmp_1(ink: &[bool], w: u32, h: u32) -> Vec<u8> {
             }
             out.push(b);
         }
-        out.extend(std::iter::repeat(0).take(padded - row_stride));
+        out.extend(std::iter::repeat_n(0, padded - row_stride));
     }
     out
 }

@@ -28,6 +28,20 @@ pub fn mime_for(path: &Path) -> &'static str {
     }
 }
 
+/// The metadata of one card upload. The file and the target prefix are separate
+/// arguments: the file is read from disk, the prefix names the collection.
+pub struct UploadCard<'a> {
+    pub name: &'a str,
+    pub serial_number: Option<&'a str>,
+    /// The card's back side (none|front|image|markdown).
+    pub back: Option<&'a str>,
+    /// The markdown a `markdown` back is rendered from.
+    pub back_text: Option<&'a str>,
+    /// `Some(_)` uses PUT (create/replace at that index); `None` lets the
+    /// server assign the next id via POST.
+    pub id: Option<i64>,
+}
+
 pub fn is_image(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -163,20 +177,12 @@ impl Client {
         .await
     }
 
-    /// Upload one card image. `id = Some(_)` uses PUT (create/replace at that
-    /// index); `None` lets the server assign the next id via POST.
-    ///
-    /// `back` is the card's back side (none|front|image|markdown); `back_text`
-    /// is the markdown a `markdown` back is rendered from.
+    /// Upload one card image.
     pub async fn upload_card(
         &self,
         prefix: &str,
         file: &Path,
-        name: &str,
-        serial_number: Option<&str>,
-        back: Option<&str>,
-        back_text: Option<&str>,
-        id: Option<i64>,
+        card: UploadCard<'_>,
     ) -> Result<Value> {
         let bytes = tokio::fs::read(file)
             .await
@@ -192,23 +198,23 @@ impl Client {
             .mime_str(mime_for(file))?;
 
         let mut form = Form::new()
-            .text("name", name.to_string())
+            .text("name", card.name.to_string())
             .part("image", part);
-        if let Some(s) = serial_number {
+        if let Some(s) = card.serial_number {
             form = form.text("serial_number", s.to_string());
         }
         // Sending back text without a source means the card's back is that
         // text: a markdown back, rather than a single-sided card with a field
         // nothing renders.
-        let back = back.or(back_text.map(|_| "markdown"));
+        let back = card.back.or(card.back_text.map(|_| "markdown"));
         if let Some(b) = back {
             form = form.text("back", b.to_string());
         }
-        if let Some(b) = back_text {
+        if let Some(b) = card.back_text {
             form = form.text("back_text", b.to_string());
         }
 
-        let req = match id {
+        let req = match card.id {
             Some(id) => self
                 .http
                 .put(format!("{}/api/prefixes/{prefix}/cards/{id}", self.base)),

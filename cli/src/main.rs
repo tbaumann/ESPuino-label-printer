@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
-use client::{is_image, Client};
+use client::{is_image, Client, UploadCard};
 
 /// CLI for the ESPuino Label Printer API.
 #[derive(Parser)]
@@ -222,11 +222,13 @@ async fn main() -> Result<()> {
                 .upload_card(
                     &a.prefix,
                     &a.file,
-                    &name,
-                    a.serial_number.as_deref(),
-                    a.back.as_deref(),
-                    a.back_text.as_deref(),
-                    a.id,
+                    UploadCard {
+                        name: &name,
+                        serial_number: a.serial_number.as_deref(),
+                        back: a.back.as_deref(),
+                        back_text: a.back_text.as_deref(),
+                        id: a.id,
+                    },
                 )
                 .await?;
             emit(v, quiet)
@@ -271,11 +273,13 @@ async fn run_batch(client: &Client, a: BatchArgs, quiet: bool) -> Result<()> {
             .upload_card(
                 &a.prefix,
                 path,
-                &name,
-                serial.as_deref(),
-                a.back.as_deref(),
-                a.back_text.as_deref(),
-                id,
+                UploadCard {
+                    name: &name,
+                    serial_number: serial.as_deref(),
+                    back: a.back.as_deref(),
+                    back_text: a.back_text.as_deref(),
+                    id,
+                },
             )
             .await
         {
