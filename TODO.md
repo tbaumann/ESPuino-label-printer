@@ -21,24 +21,25 @@ Worth doing on its own, independent of the admin UI. Code: `store_card_form` and
 
 `back_text` is markdown, and it is rendered into a card's back. Markdown is just
 another back _source_ (`back_source = 'markdown'`): the ribbon decides the
-colour depth, and the renderer produces the raster the spooler prints.
+colour depth, the renderer produces the raster the spooler prints, and the pane
+shows that same server artifact like every other back. Nothing about a back is
+rendered in the browser.
 
-- The SPA renders it live while typing (`web/src/lib/backText.ts`, `marked` plus
-  DOMPurify against an allowlist of exactly the subset), so the customer can see
-  what they wrote. That pane is the **editing view only**: the print queue
-  carries no HTML any more, and the spooler prints the server's raster.
-- The server-side renderer is the only thing that decides what prints, and it is
-  still a **stub** — `render::render_back_markdown_stub` reports `failed` with
-  its reason, so a markdown-backed card is visibly not printable rather than
-  coming out with a blank side. A real renderer (an external markdown→image
-  binary such as Markie) lands behind the same signature, which already takes
-  the ribbon's `BackDepth`.
-- The subset is small: headings, bold, italic and lists. Links are just text on
-  a card, never an `<a>`, so a `javascript:` href is inert; raw HTML is dropped
-  whole, tag and text. Images are **refused outright** — the whole construct is
-  dropped, alt text included — and the editor says so rather than leaving a gap
-  where the artwork was. CommonMark only on both sides: no GFM tables,
+- The server-side renderer is the only renderer, and it is still a **stub** —
+  `render::render_back_markdown_stub` reports `failed` with its reason, so a
+  markdown-backed card is visibly not printable rather than coming out with a
+  blank side. A real renderer (an external markdown→image binary such as Markie)
+  lands behind the same signature, which already takes the ribbon's `BackDepth`.
+- The subset it will render is small: headings, bold, italic and lists. Links are
+  just text on a card, never an `<a>`, so a `javascript:` href is inert; raw HTML
+  is dropped whole, tag and text. Images are **refused outright** — the whole
+  construct is dropped, alt text included — and the editor *says* so rather than
+  leaving a gap where the artwork was. CommonMark only: no GFM tables,
   strikethrough or autolinks.
+- The back-text editor is the only place the text is laid out for the customer,
+  and it is due to become WYSIWYG; the pane stays the server's render.
+  `web/src/lib/backText.ts` now holds nothing but what that editor has to say
+  about the typed text.
 
 ## Done — both ribbons are the same except in the print raster
 

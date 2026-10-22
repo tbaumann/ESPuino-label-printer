@@ -9,7 +9,7 @@
     type CardPatch,
     type Ribbon,
   } from './api'
-  import { hasImageSyntax, renderBackText } from './backText'
+  import { hasImageSyntax } from './backText'
   import CardFields from './cards/CardFields.svelte'
 
   // One card: its header, its two sides, and the back choice that decides what
@@ -80,6 +80,14 @@
   // re-assigned when the pane becomes (or stops being) an image back.
   let fileInput = $state<HTMLInputElement | undefined>()
 
+  // What the pane has to show for the back this row *has*. The server owns every
+  // back artifact: the picture, a copy of the front and the rendered text all
+  // come from the one `display/back` route, re-rendered at the ribbon's depth —
+  // so the row shows that artifact's status rather than drawing a back itself.
+  // While a source write is in flight the server still holds the previous back,
+  // so its artifact is suppressed rather than standing in for the new one.
+  const rendered = $derived(changingSource ? undefined : card.display_back)
+
   // An `image` back is the only one with a picture to choose or replace, so it
   // is the only one whose pane takes a file. Dropping onto artwork already there
   // is a deliberate "use this instead".
@@ -90,11 +98,6 @@
   // file dialog on a stray click. A filled pane is replaced through the chooser
   // in it, which is right there.
   const pickOnClick = $derived(dropTarget && !hasBackImage)
-
-  // The preview renders the markdown through the sanitiser, so `{@html}` on it
-  // is safe. What the *printer* gets is the server's raster; this is the editing
-  // preview, and the two are kept in step by `backText.ts`.
-  const backHtml = $derived(backText ? renderBackText(backText) : '')
 
   // Not a rendering rule, a courtesy: the markdown back renderer drops an image
   // construct whole, so the author is told instead of left wondering where their
@@ -219,62 +222,38 @@
       <div class="side no-back-side muted"></div>
     {:else}
       <div class="side">
-        <div
-          class="preview back"
-          class:black-only={back === 'markdown'}
-          class:color-ink={back === 'markdown' && depth === 'color'}
-          class:color-back={back === 'image'}
-          class:droppable={pickOnClick}
-          class:over
-        >
+        <div class="preview back" class:droppable={pickOnClick} class:over>
           <div class="back-body">
-            {#if back === 'markdown'}
-              <!-- The preview has to be honest about the medium: on a black-only
-                   back the pane renders paper white with pure black ink (never
-                   the theme's colours, never a grey the printer cannot make). -->
-              <div class="panel">{@html backHtml || '—'}</div>
-            {:else if back === 'image'}
-              {#if hasBackImage}
-                <img
-                  class="backart"
-                  src={api.cardBackDisplayUrl(prefix, card.id, `${card.updated_at}-${ribbon}`)}
-                  alt={`back of ${card.name}`}
-                />
-              {:else}
-                <div class="no-back-image">
-                  <span>no back image yet</span>
-                  {#if pickOnClick}
-                    <span class="hint">drop a picture here, or click to choose one</span>
-                  {/if}
-                </div>
-              {/if}
-            {:else}
-              <!-- A copy of the front: the same panel, so it is shown as the same
-                   picture rather than a blank pane that looks like missing
-                   artwork. -->
+            {#if rendered === 'ready'}
+              <!-- The one artifact a back has, whatever its source is: the
+                   server's `display/back`, at the ribbon's depth. The row never
+                   draws a back itself, so the pane cannot promise a card the
+                   printer would not produce. -->
               <img
                 class="backart"
-                src={api.cardFrontDisplayUrl(prefix, card.id, card.updated_at)}
-                alt={`back of ${card.name}, the same as its front`}
+                src={api.cardBackDisplayUrl(prefix, card.id, `${card.updated_at}-${ribbon}`)}
+                alt={`back of ${card.name}`}
               />
+            {:else if rendered === 'failed'}
+              <!-- The server could not render this back (the text renderer is
+                   still a stub), so the card is visibly not printable rather
+                   than showing a picture that would never print. -->
+              <div class="no-back-image">
+                <span>this back is not printable yet</span>
+              </div>
+            {:else if back === 'image' && !hasBackImage}
+              <div class="no-back-image">
+                <span>no back image yet</span>
+                {#if pickOnClick}
+                  <span class="hint">drop a picture here, or click to choose one</span>
+                {/if}
+              </div>
+            {:else}
+              <div class="no-back-image">
+                <span>nothing rendered for this back yet</span>
+              </div>
             {/if}
           </div>
-
-          {#if back === 'image' && !readonly}
-            <!-- The file chooser lives in the pane, over the drop target so it
-                 stays clickable. -->
-            <div class="back-choose">
-              <label for={`back-image-${card.id}`}>Back image</label>
-              <input
-                bind:this={fileInput}
-                id={`back-image-${card.id}`}
-                type="file"
-                accept="image/*"
-                onchange={chooseImage}
-                disabled={!writable || busy || changingSource}
-              />
-            </div>
-          {/if}
 
           {#if dropTarget}
             <!-- The whole pane is a drop area: a button laid over it, so a
@@ -293,6 +272,23 @@
           {/if}
         </div>
         <div class="caption muted">{backCaption}</div>
+
+        {#if back === 'image' && !readonly}
+          <!-- The file chooser sits *under* the pane, with the caption: the pane
+               is the picture and stays unobstructed, while the whole of it
+               remains a drop area — the chooser is not in the pane's way. -->
+          <div class="back-choose">
+            <label for={`back-image-${card.id}`}>Back image</label>
+            <input
+              bind:this={fileInput}
+              id={`back-image-${card.id}`}
+              type="file"
+              accept="image/*"
+              onchange={chooseImage}
+              disabled={!writable || busy || changingSource}
+            />
+          </div>
+        {/if}
       </div>
     {/if}
 

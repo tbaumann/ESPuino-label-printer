@@ -280,7 +280,19 @@ console.log('\nB. project page renders a card')
   // The serial number is an API-level field: it is not surfaced in the UI at all.
   check('no serial input in the UI', !w.document.querySelector('input#serial-1'))
   check('back textarea holds the text', w.document.querySelector('textarea#back-1')?.value === '01 Song One\n02 Song Two')
-  check('back preview shows the text', text.includes('02 Song Two'))
+  // The pane is the server's artifact for the back, whatever the back source is:
+  // the row never draws a back itself. This card's back is markdown, whose
+  // renderer is still a stub — so what the pane can honestly show is that there
+  // is nothing printable yet, not a client-side rendering of the song list.
+  {
+    const pane = w.document.querySelector('.preview.back')
+    check('the back pane draws nothing from the text itself',
+      !pane?.querySelector('.panel') && !/02 Song Two/.test(pane?.innerHTML ?? ''),
+      pane?.innerHTML ?? '')
+    check('the back pane reports the render the server could not make',
+      /not printable yet/i.test(pane?.textContent ?? ''),
+      (pane?.textContent ?? '').trim())
+  }
   // The preview shows the *processed* image the server derived, not the raw
   // upload — one renderer owns what a card looks like.
   check('front preview points at the display/front endpoint',
@@ -292,8 +304,13 @@ console.log('\nB. project page renders a card')
   check('shows 1 card', text.includes('1 card'))
   check('name input is editable', !w.document.querySelector('input#name-1')?.disabled)
 
-  // ---- scenario B2: markdown back_text renders sanitised in the preview ----
-  console.log('\nB2. markdown back_text renders sanitised in the back preview')
+  // ---- scenario B2: a markdown back is the server's to render --------------
+  // `back_text` is markdown, and markdown is just another back *source* — so the
+  // pane treats it like every other back: the server's `display/back` artifact,
+  // nothing else. The renderer on that side is still a stub, so the card reports
+  // itself not printable rather than the SPA drawing a preview of its own that
+  // no printer would reproduce.
+  console.log('\nB2. a markdown back is the server\'s to render')
   {
     const mdPrefix = (
       await api('/api/prefixes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -313,10 +330,9 @@ console.log('\nB. project page renders a card')
       '',
       '<script>alert(1)</script>',
       '',
-      // GFM and raw HTML: not in the subset. Both renderers have to treat them
-      // the same way or the preview promises a card the print does not deliver:
-      // `~~x~~` stays literal (no strikethrough is parsed) and an HTML block is
-      // dropped with its text (no DOMPurify-only "keep the content").
+      // GFM and raw HTML are not in the renderer's subset: `~~x~~` stays
+      // literal (no strikethrough is parsed) and an HTML block is dropped whole,
+      // text included. The text is stored exactly as typed either way.
       '~~struck~~',
       '',
       '<div>blocked</div>',
@@ -329,27 +345,32 @@ console.log('\nB. project page renders a card')
     await api(`/api/prefixes/${mdPrefix}/cards`, { method: 'POST', body: fd })
 
     const w = await mount(`/p/${mdPrefix}`, { bust: 'b2' })
-    // The markdown back's pane; its inner panel carries the sanitised markup.
-    const half = w.document.querySelector('.preview.back.black-only .panel')
-    const html = half?.innerHTML ?? ''
-    check('renders a heading', /<h1>Title<\/h1>/.test(html), html)
-    check('renders bold', /<strong>bold<\/strong>/.test(html))
-    check('renders italic', /<em>italic<\/em>/.test(html))
-    check('renders a list', /<ul>/.test(html) && /<li>one<\/li>/.test(html))
-    check('link is plain text, no <a>', !/<a\b/.test(html) && /link/.test(html))
-    check('image is refused', !/<img\b/.test(html))
-    check('raw HTML is stripped', !/<script\b/.test(html) && !/alert\(1\)/.test(html))
-    // Neither side parses GFM...
-    check('gfm strikethrough stays literal',
-      html.includes('~~struck~~') && !/<del\b/.test(html), html)
-    // ...and raw HTML goes whole, text included, not tag-only as DOMPurify
-    // alone would do it.
-    check('an HTML block is dropped with its text',
-      !/<div\b/.test(html) && !html.includes('blocked'), html)
+    const pane = w.document.querySelector('.preview.back')
+    // What the customer typed reached the server...
+    // ...modulo line endings. A multipart text field carries its newlines as
+    // CRLF, whatever the sender's convention — that is the transport's, not the
+    // author's. Markdown reads CR, LF and CRLF alike, and nothing here renders
+    // or hashes the text, so the only thing that must match is the text itself.
+    // Compare on a canonical line ending rather than on the wire bytes.
+    const canonical = (s) => (s ?? '').replace(/\r\n?/g, '\n')
+    check('the text is stored on the card',
+      canonical((await api(`/api/prefixes/${mdPrefix}/cards/1`)).back_text) === canonical(md))
+    // ...and the pane draws no card of its own: no client-side markdown, no
+    // panel of its own markup, just the server's artifact. For a stub renderer
+    // that artifact does not exist, so the honest thing to show is why.
+    // The typed markdown is not rendered here: no heading, no list, nothing the
+    // browser drew from `back_text`.
+    check('the pane renders no markup from the text',
+      !/<(h1|h2|strong|em|ul|ol|li)\b/.test(pane?.innerHTML ?? ''), pane?.innerHTML ?? '')
+    check('no picture is shown for a back the server could not render',
+      !pane?.querySelector('img'), pane?.innerHTML ?? '')
+    check('the pane reports the render the server could not make',
+      /not printable yet/i.test(pane?.textContent ?? ''), (pane?.textContent ?? '').trim())
+    check('the pane is captioned as black only',
+      /printed in black only/i.test(w.document.body.textContent ?? ''))
 
-    // The print queue carries no rendering any more: the spooler prints the
-    // server's raster, and the pane above is only the editing view. What the
-    // queue does carry is what the card's back *is*.
+    // The print queue carries no rendering: the spooler prints the server's
+    // raster. What the queue does carry is what the card's back *is*.
     const queue = await api(`/api/prefixes/${mdPrefix}/print-queue`, {
       headers: { authorization: `Bearer ${TOKEN}` },
     })
@@ -457,7 +478,15 @@ console.log('\nF. admin: list, status change, print preview, delete')
   check('print preview renders the card', !!w2.document.querySelector('.card.preview-only'))
   check('preview shows the front image',
     !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/front"]`))
-  check('preview shows the back text', t2.includes('01 Admin Song'))
+  // The back panel is the same single artifact the customer's pane shows, so the
+  // operator previews what prints — for this card a markdown back whose renderer
+  // is stubbed, which the pane says rather than drawing the text itself.
+  check('preview shows the back panel',
+    !!w2.document.querySelector('.preview.back'))
+  check('the previewed back is the server\'s, and says it could not be rendered',
+    !w2.document.querySelector('.preview.back .panel') &&
+      /not printable yet/i.test(w2.document.querySelector('.preview.back')?.textContent ?? ''),
+    (w2.document.querySelector('.preview.back')?.textContent ?? '').trim())
   check('preview shows the name as text', t2.includes('Admin Preview Card'))
   check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
   check('preview has no upload dropzone', !w2.document.querySelector('.dropzone'))
@@ -758,9 +787,9 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     pick(w, 'image')
     // Svelte renders asynchronously, so even the DOM has to be waited for.
     check(
-      'the file chooser is inside the back pane',
+      'the file chooser sits under the pane, not in it',
       (await waitForEl(w.document, 'input#back-image-1[type=file]')) !== null &&
-        !!w.document.querySelector('.preview.back input#back-image-1[type=file]'),
+        !w.document.querySelector('.preview.back input#back-image-1[type=file]'),
     )
     check(
       'the pane is a drop area while it has no picture',
@@ -890,6 +919,45 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     check('a matching If-None-Match answers 304', cond.status === 304, String(cond.status))
   }
 
+  // --- a ribbon switch repaints a *front-copy* back too -------------------
+  // Every back source renders at the ribbon's depth, so the pane has to show the
+  // depth-accurate `display/back` artifact — not the front's colour display,
+  // which never changes with the ribbon. Pointing that pane at the front is the
+  // bug: on a black panel a copy of the front prints in black and white, while
+  // the pane keeps advertising it in colour.
+  {
+    const prefix = await makePrefix('ymcko')
+    await addCard(prefix)
+    const w = await mount(`/p/${prefix}`, { bust: 'i4f' })
+    pick(w, 'front')
+    check('the front-copy back is stored',
+      await waitFor(async () => (await api(`/api/prefixes/${prefix}/cards/1`)).back === 'front'))
+
+    const backArt = () => w.document.querySelector('.preview.back .backart')
+    const backSrc = () => backArt()?.getAttribute('src') ?? ''
+    // The row re-renders from the card the PATCH returned, so the picture is not
+    // in the DOM the instant the server has the write — wait for the element, or
+    // this reads an empty src and the check fails on the race, not on the code.
+    const el = await waitForEl(w.document, '.preview.back .backart')
+    const beforeSrc = el?.getAttribute('src') ?? ''
+    check('a front-copy back previews the back artifact, not the front',
+      beforeSrc.startsWith(`/api/prefixes/${prefix}/cards/1/display/back`), beforeSrc)
+    // ...and the version carries the ribbon, because the depth is the only thing
+    // about a back the ribbon decides.
+    check('that version names the ribbon the depth came from',
+      beforeSrc.endsWith('-ymcko'), beforeSrc)
+
+    const blackRadio = [...w.document.querySelectorAll('.mode input')].find(
+      (i) => i.value === 'ymckoko',
+    )
+    check('the ribbon chooser offers the black-panel ribbon', !!blackRadio)
+    blackRadio.checked = true
+    blackRadio.dispatchEvent(new w.Event('change', { bubbles: true }))
+    check('switching to the black panel repaints the front-copy back',
+      await waitFor(() => backSrc() !== beforeSrc && backSrc().endsWith('-ymckoko')),
+      `${beforeSrc} -> ${backSrc()}`)
+  }
+
   // --- a black-panel ribbon: the same choices, rendered in 1 bit ----------
   // The unification, asserted end to end: a YMCKOKO project offers every back,
   // the server stores a picture back on it, and what differs is the raster the
@@ -952,19 +1020,23 @@ console.log('\nI. one panel, the same back choices on either ribbon')
         ((await api(`/api/prefixes/${prefix}/cards/1`)).back_text ?? '').includes('## Songs'),
       ),
     )
-    check(
-      'the markdown is rendered into the pane',
-      await waitFor(() => /<h2>Songs<\/h2>/.test(w.document.querySelector('.preview.back')?.innerHTML ?? '')),
-    )
-
-    const pane = w.document.querySelector('.preview.back.black-only')
+    const paneText = () =>
+      w.document.querySelector('.preview.back')?.textContent ?? ''
+    // The pane is the server's artifact for this back and nothing else: the
+    // markdown is not rendered in the browser, so there is no heading to find.
+    // The renderer is a stub, so the pane says the card is not printable rather
+    // than drawing the song list the printer would never produce.
+    check('the pane draws no markdown of its own',
+      !w.document.querySelector('.preview.back .panel'))
+    check('the pane reports the render the server could not make',
+      await waitFor(() => /not printable yet/i.test(paneText())), paneText().trim())
+    check('no picture is shown for a back the server could not render',
+      !w.document.querySelector('.preview.back img'))
     const t = w.document.body.textContent ?? ''
-    check('the back renders its text pane', !!pane)
     check('the pane is captioned as black only',
       /printed in black only/i.test(t), t.slice(0, 200))
     // A text back needs no picture, so its pane is not a drop area.
     check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
-    check('no image is rendered on the text back', !/<img\b/.test(pane?.innerHTML ?? ''))
     // The renderer drops an image construct whole, so the editor says so
     // instead of leaving a gap where the customer's artwork would have been.
     check('the editor says image markup is not printed',

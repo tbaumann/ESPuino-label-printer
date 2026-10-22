@@ -30,10 +30,10 @@ anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 hmac = "0.12"
 sha2 = "0.10"
-# Markdown for the black-only card back (server side of the render contract in
-# web/src/lib/backText.ts). CommonMark parsing only; the HTML writer is our own
-# (server/src/backtext.rs), so the `html`/`getopts` default features are off and
-# the tree stays small.
+# Markdown for the text on a card's back — the only renderer for it, so this is
+# where the subset and its refusals live (documented in TODO.md). CommonMark
+# parsing only; the HTML writer is our own (server/src/backtext.rs), so the
+# `html`/`getopts` default features are off and the tree stays small.
 pulldown-cmark = { version = "0.13", default-features = false }
 # Image decode/resize/encode for the canonical display image and printer rasters.
 # PNG encoding only (no webp) to keep the dependency tree small.

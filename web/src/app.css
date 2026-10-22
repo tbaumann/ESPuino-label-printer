@@ -406,19 +406,22 @@ section.panel {
   display: block;
 }
 
-/* Back side. The two two-sided modes render it differently: the black-back mode
-   from markdown, client-side; the colour mode from the uploaded image. */
+/* Back side. One artifact per back, whatever its source is: the server renders
+   it at the ribbon's depth and the pane shows those bytes — an uploaded
+   picture, a copy of the front, or the rendered text. Nothing here draws a back
+   itself, so the pane cannot show something the printer would not produce.
+   No padding: a back's picture is the server's artifact and fills the pane
+   exactly as the front's fills its own, or the two sides of one card come out
+   at different sizes. What the pane says *instead* of a picture pads itself. */
 .preview.back {
   background: #fff;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 6px 8px;
-  overflow: auto;
+  overflow: hidden;
 }
 
-/* The colour back is the uploaded artwork, shown as it will be printed: in
-   colour, on a full panel. */
+/* The back's picture, as it will be printed: the server's display artifact —
+   in colour on a colour back, reduced to black and white on a black panel. */
 .preview.back .backart {
   width: 100%;
   height: 100%;
@@ -426,62 +429,19 @@ section.panel {
   display: block;
 }
 
+/* What the pane says instead of a picture: an `image` back with nothing dropped
+   on it yet, a back the server has not rendered, or one it could not render
+   (the text back is still a stub, so such a card is not printable). It pads
+   itself, because the pane no longer does. */
 .preview.back .no-back-image {
   display: flex;
   align-items: center;
   justify-content: center;
   height: 100%;
+  padding: 6px 8px;
+  text-align: center;
   color: var(--muted);
   font-size: 12px;
-}
-
-/* The black-only back. Paper white and pure black ink — never the theme's
-   colours, and never a grey: the medium is 1 bit per pixel, so what the pane
-   shows is what the black panel can produce. The panel is the full back, not
-   half of it (half-panel ribbons can only do the inverse of what these modes
-   need — see TODO.md). */
-.preview.back.black-only {
-  color: #000;
-  font-family: var(--mono);
-  font-size: 10px;
-  line-height: 1.25;
-  white-space: pre-wrap;
-  -webkit-font-smoothing: none;
-  font-smooth: never;
-}
-
-.preview.back .panel {
-  border: 1px dashed #bbb;
-  border-radius: 4px;
-  padding: 4px 5px;
-  flex: 1;
-  overflow: auto;
-}
-
-/* Markdown rendered into the black-only back. The subset is small (headings,
-   bold, italic, lists) and the medium is 1-bit black, so keep it flat: no
-   margins between blocks, tight lists, and the same mono face as the rest of
-   the back. */
-.preview.back .panel h1,
-.preview.back .panel h2,
-.preview.back .panel h3,
-.preview.back .panel h4,
-.preview.back .panel h5,
-.preview.back .panel h6 {
-  font-size: inherit;
-  font-weight: 700;
-  margin: 0;
-}
-.preview.back .panel p {
-  margin: 0;
-}
-.preview.back .panel ul,
-.preview.back .panel ol {
-  margin: 0;
-  padding-left: 14px;
-}
-.preview.back .panel li {
-  margin: 0;
 }
 
 /* Fields a mode adds to the shared ones. */
@@ -811,14 +771,16 @@ select:focus {
   margin-top: 1px;
 }
 
-/* The back pane carries the picture an `image` back needs: the file chooser sits
-   *in* the pane, and the whole pane is a drop area for one. */
+/* The back pane: the server's artifact for whatever back the card has. For an
+   `image` back the whole pane is a drop area, and the file chooser sits under it
+   with the caption. */
 .preview.back {
   position: relative;
   overflow: hidden;
 }
 
-/* What the back is made of, or the prompt to supply the picture it needs. */
+/* What the back is made of, or the prompt to supply the picture it needs. It
+   fills the pane, so the picture inside it *is* the pane. */
 .preview.back .back-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -836,10 +798,6 @@ select:focus {
   flex: 1 1 auto;
 }
 
-.preview.back .back-body .panel {
-  overflow: auto;
-}
-
 .preview.back .no-back-image {
   flex-direction: column;
   gap: 4px;
@@ -849,27 +807,27 @@ select:focus {
   margin-top: 0;
 }
 
-/* The file chooser, inside the pane and above the drop target, centred across
-   the pane so it reads as part of the picture's own frame. */
-.preview.back .back-choose {
-  position: relative;
-  z-index: 2;
-  flex: none;
+/* The file chooser for an `image` back: under the pane, with the caption. The
+   pane stays the picture, with nothing laid over the artwork, and the whole of
+   it stays the drop area — the chooser is a sibling of the pane, not an overlay
+   on it. */
+.back-choose {
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
+  margin-top: 6px;
 }
 
-.preview.back .back-choose input[type='file'] {
+.back-choose input[type='file'] {
   font-size: 11px;
 }
 
-.preview.back .back-choose label {
+.back-choose label {
   margin-bottom: 2px;
 }
 
-/* A real button laid over the whole pane: focusable, answers Enter/Space,
-   transparent, and *under* the chooser so the file input stays clickable. */
+/* A real button laid over the whole pane: focusable, answers Enter/Space, and
+   transparent — the drop target *is* the pane. */
 .preview.back .back-drop {
   position: absolute;
   inset: 0;
@@ -895,9 +853,3 @@ select:focus {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
-/* A markdown back on a colour ribbon: the same text, but the medium is not
-   1 bit, so the pane must not pretend to be the black panel. */
-.preview.back.black-only.color-ink {
-  font-family: var(--sans);
-  font-size: 11px;
-}

@@ -167,27 +167,30 @@ spooler is handed. `CardRow.svelte` renders each card — the front, the back th
 chosen source produces, and the editor beside them — and puts the two controls in
 two places on purpose: which back the card *has* is chosen in the editor (one
 button per source, all four on either ribbon, with what that source needs under
-it), while the **file chooser for an `image` back sits in the back pane**, because
-that pane is the picture it chooses. `cards/CardFields.svelte` holds the shared header (name, delete and the
+it), while the **file chooser for an `image` back sits under the back pane**,
+beside its caption — the pane is the picture it chooses, and stays unobstructed.
+`cards/CardFields.svelte` holds the shared header (name, delete and the
 debounced save).
 
 | `back` | Printed on the back | The pane shows | The editor offers |
 |--------|---------------------|----------------|-------------------|
 | `none` | nothing — a single-sided card | no back pane at all | nothing to supply |
-| `front` | the front image again | the front picture | nothing to supply |
-| `image` | a second uploaded picture | the uploaded picture, or the drop prompt | the file chooser, in the pane |
-| `markdown` | text, rendered to an image | the rendered markdown | the back-text textarea |
+| `front` | the front image again | the server's render of it | nothing to supply |
+| `image` | a second uploaded picture | the server's render, or the drop prompt | the file chooser, under the pane |
+| `markdown` | text, rendered to an image | the server's render | the back-text textarea |
 
-The pane shows the *depth-accurate* render, which is the server's output: on a
-colour-back ribbon that is the picture, on a black-back one the same picture
-reduced to black and white. Switching the project's ribbon therefore repaints
-the back previews — and nothing else about the card changes.
+Every back has exactly one picture in the UI, and it is the server's:
+`display/back`, rendered at the ribbon's colour depth. The row never draws a back
+itself, so the pane shows what comes out of the printer — the same picture
+reduced to black and white on a black-back ribbon, and nothing to show at all
+where the server could not render the back. Switching the project's ribbon
+therefore repaints the back previews, and nothing else about the card changes.
 
 While an `image` pane holds no picture yet, the **whole pane is a file drop
 area**: a picture dropped anywhere on it becomes that card's back, and clicking
 the empty area opens the picker. A pane already showing artwork still takes a drop
 — a deliberate replace — but no longer opens a file dialog on a click, since the
-chooser inside it is right there.
+chooser under it is right there.
 
 Everything but `none` makes the card double-sided. All four sources are on offer
 on either ribbon: the ribbon is not a permission, only a rendering choice. A
@@ -203,19 +206,18 @@ button stays disabled while any are: the checkout refuses such an order with
 `409` as well, because a card with one side missing cannot be printed.
 Completing it needs no new state — the badge and the button follow the write.
 
-The markdown preview is deliberately honest about the medium: paper white, pure
-black ink, no greys and no theme colours, because that is what a 1-bit black
-panel can produce. The renderer drops images whole (see "Markdown in the back
-text" in TODO.md), so the editor *says* that image markup will not be printed
-rather than showing a gap where the artwork was. The pane is the editing view
-only: the print queue carries no HTML, and the spooler prints the server's
-raster.
+A markdown back is no exception: it prints from the server's renderer, which
+drops images whole (see "Markdown in the back text" in TODO.md), so the editor
+*says* that image markup will not be printed rather than leaving a gap where the
+artwork was. That renderer is still a stub, so such a card reports itself not
+printable instead of the pane laying the song list out itself — the pane shows
+what would print, never a picture of its own. The print queue carries no HTML
+either way.
 
-The panes load the **server-derived display images** (`display/front`,
-`display/back`), so the aspect and any normalization are the server's. The one
-exception is a markdown back's pane, which lays `back_text` out client-side for
-editing; what the spooler prints is the server's raster either way, so no
-preview is the source of truth for print.
+The panes load the **server-derived display images** — `display/front` for the
+front, `display/back` for every back whatever its source — so the aspect, the
+normalization and the colour depth are all the server's. Nothing in the SPA draws
+a card, so no preview can be the source of truth for print.
 
 A derived artifact's *path* never changes while its *bytes* can (a re-upload, a
 back-source change, a ribbon switch that moves the back between colour and
