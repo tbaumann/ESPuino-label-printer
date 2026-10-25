@@ -32,6 +32,7 @@ nix run .#card-printer-cli -- --help     # CLI
 nix build .#                             # default = the spooler (card-printer)
 nix build .#card-printer-cli
 nix build .#oci-card-printer-server      # the server as a nix-oci image (see "OCI image" below)
+nix run .#markie -- --help               # markdown→image renderer, behind a card's markdown back
 ```
 
 The SPA is built from `web/` **in the Nix store** by `buildNpmPackage` and baked
@@ -142,6 +143,9 @@ DATA_DIR=/tmp/esplp-smoke ADMIN_TOKEN=secret BIND_ADDR=127.0.0.1:8099 \
 ADMIN_TOKEN=secret npm --prefix web test
 ```
 
+Run that from `nix develop`: the markdown scenarios render a back through `markie`,
+which the dev shell puts on `PATH` (`MARKIE_BIN` points somewhere else if set).
+
 A *debug* server re-renders the print rasters synchronously on every card write,
 and an unoptimised Lanczos resize to the 2032x1296 default takes seconds — hence
 the small raster size above. It is server config either way, and a release build
@@ -195,9 +199,8 @@ chooser under it is right there.
 Everything but `none` makes the card double-sided. All four sources are on offer
 on either ribbon: the ribbon is not a permission, only a rendering choice. A
 picture on YMCKOKO's second black panel comes out black and white rather than
-being refused — a poor choice, and the customer's to make. On a `markdown` back
-the editor *does* say when image markup will be dropped, and on a black-back
-ribbon when a picture will be reduced, but neither is a refusal.
+being refused — a poor choice, and the customer's to make, which the editor says
+where the choice is made.
 
 The drop zone uploads **fronts** — one file, one card — so a new card is
 single-sided, and one with an `image` back starts without its picture. The page
@@ -206,13 +209,13 @@ button stays disabled while any are: the checkout refuses such an order with
 `409` as well, because a card with one side missing cannot be printed.
 Completing it needs no new state — the badge and the button follow the write.
 
-A markdown back is no exception: it prints from the server's renderer, which
-drops images whole (see "Markdown in the back text" in TODO.md), so the editor
-*says* that image markup will not be printed rather than leaving a gap where the
-artwork was. That renderer is still a stub, so such a card reports itself not
-printable instead of the pane laying the song list out itself — the pane shows
-what would print, never a picture of its own. The print queue carries no HTML
-either way.
+A markdown back is no exception: the server renders the text with the `markie`
+backend the flake packages (`MARKIE_BIN`, see "Markdown in the back text" in
+TODO.md), then fits that picture to the printer's bitmap and reduces it to the
+ribbon's depth — the same path an uploaded picture takes. So the pane shows what
+would print, never a picture of its own, and a markdown back whose render fails
+reports the card not printable with the reason the backend gave. The print queue
+carries no rendering either way.
 
 The panes load the **server-derived display images** — `display/front` for the
 front, `display/back` for every back whatever its source — so the aspect, the
@@ -434,6 +437,7 @@ that a *replayed* webhook delivery sends no second email.
 | `RUST_LOG`     | `info,tower_http=info`         | tracing filter                       |
 | `STATIC_DIR`   | `server/static`                | built SPA to serve at `/`            |
 | `PRINT_RASTER_WIDTH` / `PRINT_RASTER_HEIGHT` | `2032` / `1296` | the printer's internal bitmap, in pixels — read once at startup, and what every print raster and back preview is rendered at (600-dpi Primacy default; overscan past the card outline is deliberate) |
+| `MARKIE_BIN`   | `markie` (from `PATH`)         | the markdown→image backend a `markdown` back is rendered with; the package points it at its own store path |
 | `ADMIN_TOKEN`  | *(unset)*                      | operator bearer token; unset switches the admin API off |
 | `SESSION_COOKIE_SECURE` | *(unset)*             | force the `Secure` flag on the admin session cookie; unset = infer from `X-Forwarded-Proto` |
 | `STRIPE_SECRET_KEY` | *(unset)*                 | Stripe API key; unset switches checkout and the webhook off (`503`) |
@@ -457,6 +461,7 @@ data/
   cards.db                   # prefix + card metadata (the single index)
   blobs/<prefix>/<id>.<ext>       # card front images
   blobs/<prefix>/<id>-back.<ext>  # back images (an `image` back only)
+  tmp/                        # scratch for the markdown backend: one file, deleted after each render
 ```
 
 ## Data model

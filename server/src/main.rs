@@ -39,6 +39,11 @@ pub struct AppState {
     /// test (or a future per-printer setting) can hand the renderer a size
     /// without the process environment standing in for a parameter.
     pub raster: render::RasterSize,
+    /// The markdown backend and its scratch directory, resolved the same way and
+    /// for the same reason as `raster`. A missing backend is not fatal: every
+    /// other back source renders, and a markdown card reports itself
+    /// unprintable with the reason.
+    pub markdown: render::MarkdownRenderer,
     /// Bearer token granting operator rights. `None` disables the admin API.
     pub admin_token: Option<Arc<str>>,
     /// Live admin UI logins (the session cookie), persisted in the database.
@@ -223,10 +228,20 @@ async fn main() -> anyhow::Result<()> {
     // from the caller's point of view.
     let notifier = notify::Notifier::from_env().map(Arc::new);
 
+    // Markdown backs are rendered by an external backend (`MARKIE_BIN`, else
+    // `markie` on `PATH`). A missing one costs only the markdown backs, so it is
+    // a warning naming what will not render — like the SPA warning below, and
+    // unlike the payment path, which must never look like it works.
+    let markdown = render::MarkdownRenderer::from_env(&data_dir);
+    if let Err(why) = markdown.probe() {
+        tracing::warn!("{why}: markdown backs will report themselves unprintable");
+    }
+
     let state = AppState {
         pool: pool.clone(),
         data_dir: Arc::new(data_dir),
         raster: render::RasterSize::from_env(),
+        markdown,
         admin_token,
         sessions: auth::Sessions::new(pool),
         login_limiter: auth::LoginLimiter::default(),

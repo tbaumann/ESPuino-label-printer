@@ -50,7 +50,12 @@
           config.rust-project.crates.card-printer-server.crane.outputs.drv.crate
           self'.packages.card-printer-cli
         ];
-        make-shells.default.packages = [self'.packages.card-printer];
+        make-shells.default.packages = [
+          self'.packages.card-printer
+          # The markdown backend the server package wraps. In the shell it is
+          # on PATH, which is where MARKIE_BIN's default looks for it.
+          self'.packages.markie
+        ];
       };
     };
 }

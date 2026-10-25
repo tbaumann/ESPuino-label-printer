@@ -25,21 +25,41 @@ colour depth, the renderer produces the raster the spooler prints, and the pane
 shows that same server artifact like every other back. Nothing about a back is
 rendered in the browser.
 
-- The server-side renderer is the only renderer, and it is still a **stub** —
-  `render::render_back_markdown_stub` reports `failed` with its reason, so a
-  markdown-backed card is visibly not printable rather than coming out with a
-  blank side. A real renderer (an external markdown→image binary such as Markie)
-  lands behind the same signature, which already takes the ribbon's `BackDepth`.
-- The subset it will render is small: headings, bold, italic and lists. Links are
-  just text on a card, never an `<a>`, so a `javascript:` href is inert; raw HTML
-  is dropped whole, tag and text. Images are **refused outright** — the whole
-  construct is dropped, alt text included — and the editor *says* so rather than
-  leaving a gap where the artwork was. CommonMark only: no GFM tables,
-  strikethrough or autolinks.
+- The backend is **`markie`** (`nix/packages/markie.nix`, upstream
+  [lsj5031/MarkieCli](https://github.com/lsj5031/MarkieCli)) — a native
+  markdown→PNG renderer, handed the text on stdin and asked for one picture.
+  `render::MarkdownRenderer` is the whole integration: `MARKIE_BIN` (the server
+  package's wrapper points it at its store path) and `DATA_DIR/tmp` for the one
+  file it writes.
+- There is deliberately **no subset**, and nothing in this repo parses markdown
+  any more (the `pulldown-cmark` dependency is gone with the old approach). The
+  backend lays out whatever it is given and the card prints what came out; the
+  earlier list of allowed constructs, and the refusals that went with it, were
+  the wrong layer for the job.
+- The document is laid out **as wide as the card is long** (`render::MARKDOWN_WIDTH`:
+  the CR80 long edge at the scale where the backend's fixed 16 px body text lands
+  around 2.7 mm on the card) and rasterised from there at whatever `--png-scale`
+  reaches the printer's bitmap. Text size and wrapping are therefore properties of
+  the *card*, not of the print DPI: a change of raster size re-renders sharper, it
+  does not re-flow the text.
+- What the backend returns is then just an image — the same `fit_to` framing and
+  the same depth reduction (`render_back_display` / `render_back_raster`) as an
+  uploaded picture, which is what makes the pane, the raster and the spooler agree.
+- **A linked picture is fetched by the backend**, not by this server: a remote
+  `![x](https://…)` makes the render issue one HTTP GET to a host the customer
+  names (10 s timeout, 10 MiB cap). One that cannot be fetched does *not* fail
+  the render — the backend warns and lays out the alt text in its place, so the
+  card prints without the picture, and the warning is logged (`markdown render:
+  …`) because nothing on the card says the artwork went missing. Blocking or
+  rewriting remote references is an open decision; nothing blocks them today.
+- **Fonts are the runtime's, not the package's.** The backend renders with the
+  fonts it can find (`/etc/fonts`, plus `./fonts`) and refuses to start without
+  any, so a fontconfig host is fine and the OCI image is not: a markdown back
+  there fails with "No usable fonts found" until a font is wired into the image.
 - The back-text editor is the only place the text is laid out for the customer,
-  and it is due to become WYSIWYG; the pane stays the server's render.
-  `web/src/lib/backText.ts` now holds nothing but what that editor has to say
-  about the typed text.
+  and it is due to become WYSIWYG; the pane stays the server's render, so
+  `web/src/lib/backText.ts` is gone along with the image-refusal courtesy it
+  carried.
 
 ## Done — both ribbons are the same except in the print raster
 

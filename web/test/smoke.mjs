@@ -281,17 +281,17 @@ console.log('\nB. project page renders a card')
   check('no serial input in the UI', !w.document.querySelector('input#serial-1'))
   check('back textarea holds the text', w.document.querySelector('textarea#back-1')?.value === '01 Song One\n02 Song Two')
   // The pane is the server's artifact for the back, whatever the back source is:
-  // the row never draws a back itself. This card's back is markdown, whose
-  // renderer is still a stub — so what the pane can honestly show is that there
-  // is nothing printable yet, not a client-side rendering of the song list.
+  // the row never draws a back itself. This card's back is markdown, which the
+  // server renders into a picture like any other back — so the pane shows that
+  // picture, not the song list laid out in the browser.
   {
     const pane = w.document.querySelector('.preview.back')
     check('the back pane draws nothing from the text itself',
       !pane?.querySelector('.panel') && !/02 Song Two/.test(pane?.innerHTML ?? ''),
       pane?.innerHTML ?? '')
-    check('the back pane reports the render the server could not make',
-      /not printable yet/i.test(pane?.textContent ?? ''),
-      (pane?.textContent ?? '').trim())
+    check('the back pane shows the server-rendered markdown back',
+      !!pane?.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`),
+      pane?.innerHTML ?? '')
   }
   // The preview shows the *processed* image the server derived, not the raw
   // upload — one renderer owns what a card looks like.
@@ -307,9 +307,9 @@ console.log('\nB. project page renders a card')
   // ---- scenario B2: a markdown back is the server's to render --------------
   // `back_text` is markdown, and markdown is just another back *source* — so the
   // pane treats it like every other back: the server's `display/back` artifact,
-  // nothing else. The renderer on that side is still a stub, so the card reports
-  // itself not printable rather than the SPA drawing a preview of its own that
-  // no printer would reproduce.
+  // nothing else. What that artifact holds is the *backend's* layout of the text,
+  // so the card carries a picture rather than the SPA drawing a preview of its own
+  // that no printer would reproduce. The text is stored exactly as typed.
   console.log('\nB2. a markdown back is the server\'s to render')
   {
     const mdPrefix = (
@@ -326,16 +326,10 @@ console.log('\nB. project page renders a card')
       '',
       '[link](https://example.com)',
       '',
-      '![img](https://example.com/x.png)',
-      '',
-      '<script>alert(1)</script>',
-      '',
-      // GFM and raw HTML are not in the renderer's subset: `~~x~~` stays
-      // literal (no strikethrough is parsed) and an HTML block is dropped whole,
-      // text included. The text is stored exactly as typed either way.
+      // A strikethrough is GFM, which the backend lays out like anything else —
+      // there is no list of constructs here that is parsed and constructs that
+      // are not.
       '~~struck~~',
-      '',
-      '<div>blocked</div>',
     ].join('\n')
     const fd = new NodeFormData()
     fd.append('name', 'MD Card')
@@ -356,18 +350,21 @@ console.log('\nB. project page renders a card')
     check('the text is stored on the card',
       canonical((await api(`/api/prefixes/${mdPrefix}/cards/1`)).back_text) === canonical(md))
     // ...and the pane draws no card of its own: no client-side markdown, no
-    // panel of its own markup, just the server's artifact. For a stub renderer
-    // that artifact does not exist, so the honest thing to show is why.
+    // panel of its own markup, just the server's artifact.
     // The typed markdown is not rendered here: no heading, no list, nothing the
     // browser drew from `back_text`.
     check('the pane renders no markup from the text',
       !/<(h1|h2|strong|em|ul|ol|li)\b/.test(pane?.innerHTML ?? ''), pane?.innerHTML ?? '')
-    check('no picture is shown for a back the server could not render',
-      !pane?.querySelector('img'), pane?.innerHTML ?? '')
-    check('the pane reports the render the server could not make',
-      /not printable yet/i.test(pane?.textContent ?? ''), (pane?.textContent ?? '').trim())
+    check('the pane shows the server\'s render of the text',
+      !!pane?.querySelector(`img[src^="/api/prefixes/${mdPrefix}/cards/1/display/back"]`),
+      pane?.innerHTML ?? '')
+    check('the card is not reported unprintable',
+      !/not printable yet/i.test(pane?.textContent ?? ''), (pane?.textContent ?? '').trim())
     check('the pane is captioned as black only',
       /printed in black only/i.test(w.document.body.textContent ?? ''))
+    // What prints is a raster from that same picture, at the ribbon's depth.
+    check('the markdown back rasterises to 1 bit on this ribbon',
+      (await rasterBits(mdPrefix)) === 1, String(await rasterBits(mdPrefix)))
 
     // The print queue carries no rendering: the spooler prints the server's
     // raster. What the queue does carry is what the card's back *is*.
@@ -479,14 +476,14 @@ console.log('\nF. admin: list, status change, print preview, delete')
   check('preview shows the front image',
     !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/front"]`))
   // The back panel is the same single artifact the customer's pane shows, so the
-  // operator previews what prints — for this card a markdown back whose renderer
-  // is stubbed, which the pane says rather than drawing the text itself.
+  // operator previews what prints — for this card a markdown back, which the
+  // server rendered from the card's text.
   check('preview shows the back panel',
     !!w2.document.querySelector('.preview.back'))
-  check('the previewed back is the server\'s, and says it could not be rendered',
-    !w2.document.querySelector('.preview.back .panel') &&
-      /not printable yet/i.test(w2.document.querySelector('.preview.back')?.textContent ?? ''),
-    (w2.document.querySelector('.preview.back')?.textContent ?? '').trim())
+  check('the previewed back is the server\'s render of the text',
+    !!w2.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`) &&
+      !w2.document.querySelector('.preview.back .panel'),
+    (w2.document.querySelector('.preview.back')?.innerHTML ?? '').slice(0, 200))
   check('preview shows the name as text', t2.includes('Admin Preview Card'))
   check('preview has no card editor inputs', !w2.document.querySelector('input#name-1'))
   check('preview has no upload dropzone', !w2.document.querySelector('.dropzone'))
@@ -1008,7 +1005,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     // be sent for a back the server still reads as single-sided.
     check('the editor becomes usable', ta !== null && (await waitFor(() => ta.disabled === false)))
 
-    const md = '## Songs\n\n- one\n- two\n\n![art](https://example.com/a.png)\n'
+    const md = '## Songs\n\n- one\n- two\n'
     if (ta) {
       ta.value = md
       ta.dispatchEvent(new w.Event('input', { bubbles: true }))
@@ -1022,25 +1019,25 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     )
     const paneText = () =>
       w.document.querySelector('.preview.back')?.textContent ?? ''
+    const backArt = () => w.document.querySelector('.preview.back .backart')
     // The pane is the server's artifact for this back and nothing else: the
-    // markdown is not rendered in the browser, so there is no heading to find.
-    // The renderer is a stub, so the pane says the card is not printable rather
-    // than drawing the song list the printer would never produce.
+    // markdown is not rendered in the browser, so there is no heading to find —
+    // what replaces it is the picture the backend laid the text out into.
     check('the pane draws no markdown of its own',
       !w.document.querySelector('.preview.back .panel'))
-    check('the pane reports the render the server could not make',
-      await waitFor(() => /not printable yet/i.test(paneText())), paneText().trim())
-    check('no picture is shown for a back the server could not render',
-      !w.document.querySelector('.preview.back img'))
+    check('the pane shows the server\'s render of the text',
+      await waitFor(() => !!backArt() && !/not printable yet/i.test(paneText())),
+      paneText().trim())
+    // ...and that render is versioned with the ribbon, so a ribbon switch
+    // repaints it: the depth is the only thing the ribbon decides about a back.
+    check('the text back\'s preview names the ribbon it was rendered for',
+      backArt()?.getAttribute('src')?.endsWith('-ymckoko') === true,
+      backArt()?.getAttribute('src') ?? '')
     const t = w.document.body.textContent ?? ''
     check('the pane is captioned as black only',
       /printed in black only/i.test(t), t.slice(0, 200))
     // A text back needs no picture, so its pane is not a drop area.
     check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
-    // The renderer drops an image construct whole, so the editor says so
-    // instead of leaving a gap where the customer's artwork would have been.
-    check('the editor says image markup is not printed',
-      /image markup/i.test(t) && /never\s+prints/i.test(t))
     // A markdown back with text is complete: the page stops counting it as
     // unfinished once that card's write has landed.
     check('a text back is complete with no upload at all',

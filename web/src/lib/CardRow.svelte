@@ -9,7 +9,6 @@
     type CardPatch,
     type Ribbon,
   } from './api'
-  import { hasImageSyntax } from './backText'
   import CardFields from './cards/CardFields.svelte'
 
   // One card: its header, its two sides, and the back choice that decides what
@@ -98,12 +97,6 @@
   // file dialog on a stray click. A filled pane is replaced through the chooser
   // in it, which is right there.
   const pickOnClick = $derived(dropTarget && !hasBackImage)
-
-  // Not a rendering rule, a courtesy: the markdown back renderer drops an image
-  // construct whole, so the author is told instead of left wondering where their
-  // artwork went. (The same courtesy as the black-and-white note on an `image`
-  // back: a choice can be a poor one without being refused.)
-  const imageRefused = $derived(back === 'markdown' && hasImageSyntax(backText))
 
   /** Apply a card patch, keeping the local state in step with the response. */
   async function apply(patch: CardPatch) {
@@ -235,9 +228,10 @@
                 alt={`back of ${card.name}`}
               />
             {:else if rendered === 'failed'}
-              <!-- The server could not render this back (the text renderer is
-                   still a stub), so the card is visibly not printable rather
-                   than showing a picture that would never print. -->
+              <!-- The server could not render this back, so the card is visibly
+                   not printable rather than showing a picture that would never
+                   print. A markdown back lands here when the backend is missing
+                   or refused the text. -->
               <div class="no-back-image">
                 <span>this back is not printable yet</span>
               </div>
@@ -326,19 +320,12 @@
           ></textarea>
           <div class="hint muted">
             {#if depth === 'color'}
-              Printed on the back in colour: headings, bold, italic and lists.
+              Printed on the back in colour.
             {:else}
-              Printed on the back in black only: headings, bold, italic and lists.
-              No colour, no images, no greys.
+              Printed on the back in black only — this project's ribbon has no
+              colour panel for the back.
             {/if}
           </div>
-          {#if imageRefused}
-            <div class="hint warn">
-              This text contains image markup, which the text back never prints —
-              the whole <code>![…]</code> construct is dropped, alt text included.
-              Choose “Second image” if the card should carry a picture.
-            </div>
-          {/if}
         {:else if back === 'image'}
           <div class="hint muted">
             {#if depth === 'color'}

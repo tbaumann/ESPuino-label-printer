@@ -386,19 +386,24 @@ async fn rerender_card(
             // empty back silently substituted.
             None => (None, None),
         },
+        // Markdown is just another back *source*: the backend renders the text
+        // into a picture, and everything after that is the ordinary back path —
+        // the same framing, the same depth reduction, the same artifacts. So the
+        // preview is the print's picture, one scale factor apart, exactly as for
+        // an uploaded one.
         BackSource::Markdown => match card.back_text.as_deref().filter(|t| !t.trim().is_empty()) {
-            // The markdown renderer is a stub until a real markdown→image
-            // backend lands; until then it always reports failed with the
-            // reason, so the card is visibly not printable rather than having a
-            // blank back silently substituted.
-            Some(text) => {
-                let res = render::render_back_markdown_stub(text, &raster, depth);
-                let (status, err) = match res {
-                    RenderResult::Ready(_) => (RenderStatus::Ready, None),
-                    RenderResult::Failed(e) => (RenderStatus::Failed, Some(e)),
-                };
-                (Some((status, err.clone())), Some((status, err)))
-            }
+            Some(text) => match st.markdown.render(text, &raster) {
+                RenderResult::Ready(picture) => (
+                    Some(back_display(st, prefix, id, &picture, depth)?),
+                    Some(back_raster(st, prefix, id, &picture, &raster, depth)?),
+                ),
+                // No picture at all: the backend is missing, or it refused the
+                // text. Both statuses carry the reason rather than a blank side.
+                RenderResult::Failed(e) => (
+                    Some((RenderStatus::Failed, Some(e.clone()))),
+                    Some((RenderStatus::Failed, Some(e))),
+                ),
+            },
             None => (None, None),
         },
     };
@@ -2642,6 +2647,9 @@ mod tests {
             pool: pool.clone(),
             data_dir: Arc::new(PathBuf::new()),
             raster: TEST_RASTER,
+            // Nothing in these tests renders markdown; the backend is whatever
+            // the environment offers.
+            markdown: crate::render::MarkdownRenderer::from_env(std::path::Path::new("")),
             admin_token: None,
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
@@ -3188,6 +3196,9 @@ mod tests {
             pool: pool.clone(),
             data_dir: Arc::new(dir.clone()),
             raster: TEST_RASTER,
+            // Nothing in these tests renders markdown; the backend is whatever
+            // the environment offers.
+            markdown: crate::render::MarkdownRenderer::from_env(&dir),
             admin_token: None,
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
@@ -3288,6 +3299,9 @@ mod tests {
             pool: pool.clone(),
             data_dir: Arc::new(dir.clone()),
             raster: TEST_RASTER,
+            // Nothing in these tests renders markdown; the backend is whatever
+            // the environment offers.
+            markdown: crate::render::MarkdownRenderer::from_env(&dir),
             admin_token: None,
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
@@ -3378,7 +3392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerender_marks_a_markdown_back_failed_until_a_renderer_lands() {
+    async fn rerender_marks_a_markdown_back_failed_when_the_backend_is_missing() {
         let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let pool = test_pool().await;
@@ -3419,6 +3433,10 @@ mod tests {
             pool: pool.clone(),
             data_dir: Arc::new(dir.clone()),
             raster: TEST_RASTER,
+            // An explicitly absent backend, not whatever the machine happens to
+            // have: this test is about a back whose render failed, and that must
+            // not depend on whether the suite runs where markie is installed.
+            markdown: crate::render::MarkdownRenderer::new("markie-not-installed", dir.join("tmp")),
             admin_token: None,
             sessions: crate::auth::Sessions::new(pool.clone()),
             cookie_secure: None,
@@ -3429,8 +3447,8 @@ mod tests {
         };
 
         let card = rerender_card(&st, p.uuid, 1).await.unwrap();
-        // Front renders; the markdown back is a stub until a real
-        // renderer lands.
+        // Front renders; the markdown back has no backend to render it with, so
+        // it fails and says why.
         assert_eq!(card.display_front, RenderStatus::Ready);
         assert_eq!(card.print_front, RenderStatus::Ready);
         assert_eq!(card.display_back, Some(RenderStatus::Failed));

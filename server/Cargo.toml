@@ -30,11 +30,11 @@ anyhow = "1"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 hmac = "0.12"
 sha2 = "0.10"
-# Markdown for the text on a card's back — the only renderer for it, so this is
-# where the subset and its refusals live (documented in TODO.md). CommonMark
-# parsing only; the HTML writer is our own (server/src/backtext.rs), so the
-# `html`/`getopts` default features are off and the tree stays small.
-pulldown-cmark = { version = "0.13", default-features = false }
+# A card's back text is markdown, and the markdown renderer is NOT in here: it
+# is an external native backend (`markie`, see the flake's `markie` package and
+# `render::MarkdownRenderer`), so a card's text is laid out as a *document*
+# rather than re-implemented as a subset in Rust. Nothing in this crate parses
+# markdown any more.
 # Image decode/resize/encode for the canonical display image and printer rasters.
 # PNG encoding only (no webp) to keep the dependency tree small.
 image = { version = "0.25", default-features = false, features = [

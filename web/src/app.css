@@ -430,9 +430,8 @@ section.panel {
 }
 
 /* What the pane says instead of a picture: an `image` back with nothing dropped
-   on it yet, a back the server has not rendered, or one it could not render
-   (the text back is still a stub, so such a card is not printable). It pads
-   itself, because the pane no longer does. */
+   on it yet, a back the server has not rendered, or one it could not render.
+   It pads itself, because the pane no longer does. */
 .preview.back .no-back-image {
   display: flex;
   align-items: center;
@@ -449,12 +448,6 @@ section.panel {
   font-size: 12px;
   line-height: 1.35;
   margin-top: 4px;
-}
-
-/* A note about something the chosen medium cannot print (an image on a 1-bit
-   black back). Amber, not red: it is not an error, it is the option's limit. */
-.hint.warn {
-  color: #b07000;
 }
 
 .hint code {

@@ -1,9 +1,9 @@
 //! Server-side image processing: normalize uploads into a canonical display
 //! image, and produce printer-native rasters the spooler consumes unchanged.
 //!
-//! One renderer owns the truth. The customer's edit preview stays in the SPA
-//! (fast markdown feedback while typing); what the print preview and the
-//! spooler both read is *this* module's output — the same bytes.
+//! One renderer owns the truth: what the preview shows and what the spooler
+//! prints are *this* module's output — the same bytes, one scale factor apart.
+//! Nothing about a back is drawn in the browser, markdown included.
 //!
 //! Rendering is deterministic and non-destructive: originals are never
 //! touched, and every function is `(size, source) -> bytes` so it can be unit
@@ -36,7 +36,12 @@
 //! [`render_back_raster`]). A 1-bit panel is a poor medium for a photograph,
 //! which is the customer's choice to make; nothing here refuses it.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
 use image::{DynamicImage, GrayImage, Rgb, RgbImage};
+use uuid::Uuid;
 
 use crate::models::BackDepth;
 
@@ -310,28 +315,197 @@ pub fn render_back_raster(original: &[u8], size: &RasterSize, depth: BackDepth) 
     }
 }
 
-/// A markdown back, rendered to a printer raster and a display PNG.
+/// A markdown back, rendered by the external backend into a picture.
 ///
-/// This is deliberately a STUB: a real renderer lands in a later pass (the
-/// intent is an external markdown→image binary such as Markie, shelled out with
-/// a `MARKIE_BIN`). Until then every markdown back reports `failed` with this
-/// reason rather than printing a blank side.
+/// The backend is `markie` (a native markdown→PNG/SVG renderer, packaged as this
+/// flake's `markie`): it is handed the text on stdin and writes one PNG, which
+/// this returns as-is. The picture is *not* framed or depth-reduced here — a
+/// rendered document is an image like any other, and the ordinary back path
+/// ([`render_back_display`], [`render_back_raster`]) fits it to the printer's
+/// bitmap and reduces it to the ribbon's depth. That is what keeps the preview
+/// and the print the same picture, one scale factor apart, for a markdown back
+/// exactly as for an uploaded one.
 ///
-/// `depth` is the ribbon's ([`crate::models::Ribbon::back_depth`]): the same
-/// markdown is a 24-bit colour raster on YMCKO and a 1-bit one on YMCKOKO, and
-/// that is a rendering choice the ribbon makes, never the card. The stub ignores
-/// it, but the signature carries it so the real renderer cannot be written
-/// without answering the question.
-pub fn render_back_markdown_stub(
-    _markdown: &str,
-    _size: &RasterSize,
-    _depth: BackDepth,
-) -> RenderResult {
-    RenderResult::Failed(
-        "the markdown back renderer is not wired up yet; a backend such as Markie is the \
-         intended implementation"
-            .into(),
-    )
+/// Markdown may reference pictures, and a **remote** one (`https://…`) is
+/// fetched by the backend — 10 s timeout, 10 MiB cap. So a card back can make
+/// the server issue one HTTP GET to a host the customer names. A picture that
+/// cannot be fetched does *not* fail the render: the backend warns and lays out
+/// the alt text in its place, so the card prints without the picture. That
+/// warning is relayed to the log rather than swallowed — the customer's artwork
+/// silently missing is worth a line somewhere, and it is nowhere on the card.
+/// A *local* reference resolves against the document's directory, of which this
+/// render has none, so it takes the same alt-text path.
+#[derive(Debug, Clone)]
+pub struct MarkdownRenderer {
+    /// `markie`, or an absolute path to one (`MARKIE_BIN`).
+    bin: PathBuf,
+    /// Where its output file goes: `<DATA_DIR>/tmp`. The data directory is the
+    /// one directory this process is entitled to write to — a container has no
+    /// writable `/tmp` and nothing else to lean on.
+    scratch: PathBuf,
+}
+
+/// The width a markdown back is laid out at, in the backend's pixels: the
+/// card's long edge (85.6 mm) at the scale where the backend's fixed 16 px body
+/// text lands around 2.7 mm tall — the size a card back is legible at. Laying
+/// it out at the printer's raster width instead would print 0.7 mm text.
+///
+/// The raster is rendered from this at whatever `--png-scale` reaches the
+/// raster's width, so the wrapping and the text size stay a property of the
+/// *card*: a change of print DPI re-renders sharper, it does not re-flow the
+/// text or shrink it.
+pub const MARKDOWN_WIDTH: u32 = 508;
+
+/// The theme a markdown back is drawn in: a flat white ground with dark text,
+/// which is what a card wants (and what the black panel's own threshold expects).
+/// Pinned by name because a backend's default is not a contract.
+const MARKDOWN_THEME: &str = "github_light";
+
+impl MarkdownRenderer {
+    pub fn new(bin: impl Into<PathBuf>, scratch: impl Into<PathBuf>) -> Self {
+        Self {
+            bin: bin.into(),
+            scratch: scratch.into(),
+        }
+    }
+
+    /// `MARKIE_BIN`, else `markie` from `PATH`; the scratch directory is
+    /// `DATA_DIR/tmp`.
+    ///
+    /// Resolved once at startup and handed to the renderer as a value, like
+    /// [`RasterSize`]: a renderer that read the process environment per card
+    /// would make what a card looks like depend on the ambient environment
+    /// rather than on its inputs.
+    pub fn from_env(data_dir: &Path) -> Self {
+        let bin =
+            std::env::var_os("MARKIE_BIN").map_or_else(|| PathBuf::from("markie"), PathBuf::from);
+        Self::new(bin, data_dir.join("tmp"))
+    }
+
+    /// Whether the backend can be run at all — a startup check, so that a
+    /// missing one is a line in the log rather than a discovery made one
+    /// customer's card at a time.
+    pub fn probe(&self) -> Result<(), String> {
+        let status = Command::new(&self.bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| self.cannot_run(&e))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("{} --version exited with {status}", self.bin.display()))
+    }
+
+    /// Render `markdown` into a picture as wide as the card is long.
+    pub fn render(&self, markdown: &str, size: &RasterSize) -> RenderResult {
+        match self.run(markdown, size) {
+            Ok(png) => RenderResult::Ready(png),
+            Err(e) => RenderResult::Failed(e),
+        }
+    }
+
+    fn run(&self, markdown: &str, size: &RasterSize) -> Result<Vec<u8>, String> {
+        std::fs::create_dir_all(&self.scratch)
+            .map_err(|e| format!("markdown scratch directory {}: {e}", self.scratch.display()))?;
+        // One render, one file, named for this call: a ribbon switch re-renders
+        // every card of a prefix, and two of them must not write over each
+        // other's picture.
+        let out = self
+            .scratch
+            .join(format!("markdown-{}.png", Uuid::new_v4()));
+
+        // The layout is the card's; the raster follows it at whatever scale
+        // reaches the printer's bitmap. So a test that renders at 400x256 gets
+        // the card's own text size rather than a re-flowed, shrunken one.
+        let scale = size.width as f32 / MARKDOWN_WIDTH as f32;
+
+        let mut child = Command::new(&self.bin)
+            .arg("-")
+            .arg("--output")
+            .arg(&out)
+            .arg("--width")
+            .arg(MARKDOWN_WIDTH.to_string())
+            .arg("--png-scale")
+            .arg(scale.to_string())
+            .arg("--theme")
+            .arg(MARKDOWN_THEME)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| self.cannot_run(&e))?;
+
+        // Hand the text over and close the pipe. The backend reads all of its
+        // input before it renders anything, so a write error means it is already
+        // gone — a broken installation, or something that killed it.
+        let handed_over = child
+            .stdin
+            .take()
+            .map(|mut stdin| stdin.write_all(markdown.as_bytes()));
+        if let Some(Err(e)) = handed_over {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&out);
+            return Err(format!(
+                "could not hand the markdown to {}: {e}",
+                self.bin.display()
+            ));
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("{}: {e}", self.bin.display()))?;
+
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&out);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let said = stderr.trim();
+            // The backend prefixes its one-line reasons with `Error:`.
+            let said = said.strip_prefix("Error: ").unwrap_or(said).trim();
+            return Err(if said.is_empty() {
+                "the markdown renderer failed without saying why".into()
+            } else {
+                format!("markdown render: {said}")
+            });
+        }
+
+        let png = std::fs::read(&out)
+            .map_err(|e| format!("markdown rendering {}: {e}", out.display()))?;
+        let _ = std::fs::remove_file(&out);
+
+        // A render that *succeeded* can still have something to say — a picture
+        // it could not fetch, laid out as its alt text instead. The card is
+        // printable either way, so this does not fail it; it is a line in the
+        // log, because nothing on the card says the artwork went missing.
+        //
+        // The backend writes its own progress there too ("PNG saved to: …"), so
+        // only the lines it prefixes with `Warning:` are relayed — a warning per
+        // card about a file the server itself is about to delete is noise.
+        let said = String::from_utf8_lossy(&output.stderr);
+        for warning in said
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("Warning:"))
+        {
+            tracing::warn!("markdown render: {warning}");
+        }
+        Ok(png)
+    }
+
+    /// Why the backend could not be started at all. Worth naming precisely: the
+    /// fix is configuration, not the customer's text.
+    fn cannot_run(&self, e: &std::io::Error) -> String {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "no markdown renderer at {} (set MARKIE_BIN)",
+                self.bin.display()
+            )
+        } else {
+            format!("could not run {}: {e}", self.bin.display())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -523,18 +697,31 @@ mod tests {
         ));
     }
 
+    /// A backend that is not there is a *reason* on the card, never a panic and
+    /// never a stray file: the fix is configuration, so the message says which
+    /// knob, and the scratch directory is left empty.
     #[test]
-    fn markdown_back_stub_reports_failed_not_ready() {
+    fn a_missing_markdown_backend_fails_and_leaves_nothing_behind() {
         let size = RasterSize {
-            width: 200,
-            height: 126,
+            width: 400,
+            height: 256,
         };
-        // Both depths: the stub is a stub on either ribbon.
-        for depth in [BackDepth::Color, BackDepth::Black] {
-            assert!(matches!(
-                render_back_markdown_stub("# Title", &size, depth),
-                RenderResult::Failed(_)
-            ));
-        }
+        let root = std::env::temp_dir().join(format!("esplp-md-{}", Uuid::new_v4()));
+        let renderer = MarkdownRenderer::new("markie-that-is-not-installed", root.join("tmp"));
+
+        let res = renderer.render("# Title", &size);
+        let RenderResult::Failed(why) = res else {
+            panic!("a backend that is not installed cannot render: {res:?}")
+        };
+        assert!(why.contains("MARKIE_BIN"), "{why}");
+        assert!(renderer.probe().is_err(), "the startup check agrees");
+
+        let left: Vec<_> = std::fs::read_dir(root.join("tmp"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "scratch holds {left:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
