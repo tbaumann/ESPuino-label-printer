@@ -781,7 +781,7 @@ pub async fn update_card_meta(
 
     if let Some(v) = patch.serial_number.as_deref() {
         let v = if v.trim().is_empty() { None } else { Some(v) };
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE cards SET serial_number = ?3, updated_at = datetime('now')
               WHERE prefix_uuid = ?1 AND id = ?2",
         )
@@ -789,7 +789,16 @@ pub async fn update_card_meta(
         .bind(id)
         .bind(v)
         .execute(pool)
-        .await?;
+        .await;
+        if let Err(e) = updated {
+            // A UID already on another card of this prefix is a 409 naming that
+            // card, not a 500 — the same shape as the print path, which writes
+            // the same column.
+            if let (true, Some(serial)) = (is_serial_conflict(&e), v) {
+                return Err(serial_conflict(pool, prefix, id, serial).await);
+            }
+            return Err(e.into());
+        }
     }
 
     get_card(pool, prefix, id).await
@@ -881,24 +890,82 @@ pub async fn set_card_render_status(
     get_card(pool, prefix, id).await
 }
 
+/// Whether a failed write is the serial-number uniqueness index refusing a
+/// second card of one prefix the same UID.
+///
+/// `serial_number` is a physical card's identity, so a collision is an
+/// operator-visible mistake, not a server fault: an unmapped `Db` error would
+/// reach the client as a 500 that says nothing, and the writer here is the print
+/// spooler, which cannot ask a question mid-run.
+fn is_serial_conflict(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
+/// The `409` for a UID another card of this prefix already carries, naming that
+/// card. Falls back to a plain conflict when the holder cannot be read back.
+async fn serial_conflict(pool: &SqlitePool, prefix: Uuid, id: i64, serial: &str) -> ApiError {
+    let holder: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT id FROM cards
+          WHERE prefix_uuid = ?1 AND serial_number = ?2 AND id <> ?3
+          ORDER BY id ASC",
+    )
+    .bind(prefix.to_string())
+    .bind(serial)
+    .bind(id)
+    .fetch_optional(pool)
+    .await;
+    match holder {
+        Ok(Some(other)) => ApiError::Conflict(format!(
+            "serial number {serial} already belongs to card {other} of this prefix"
+        )),
+        _ => ApiError::Conflict(format!("serial number {serial} is already used here")),
+    }
+}
+
 /// Mark a card printed, once. The spooler calls this only after the printer
 /// confirms the card was ejected.
 ///
-/// Idempotent on purpose: the `AND printed_at IS NULL` guard means a second
-/// call is a no-op, so a retried delivery can never print a card twice. (The
-/// spooler walks *unprinted* cards, so marking at queue time would silently
-/// skip a card if the process died in between — that is why the mark happens
-/// here, after ejection, and not when the card is queued.)
-pub async fn mark_card_printed(pool: &SqlitePool, prefix: Uuid, id: i64) -> Result<Card, ApiError> {
+/// `serial_number` is the physical RFID UID the spooler read from the chip, when
+/// it managed to read one; `None` records the ejection alone and leaves any
+/// stored UID alone. This is the only card write that still applies once the
+/// prefix is `printing`/`printed` (`ensure_writable` is false there), which is
+/// exactly when the UID becomes known — hence an argument on this call rather
+/// than a separate write path.
+///
+/// Idempotent on purpose: `printed_at` only fills when it is NULL, so a second
+/// call re-writes the same values and a retried delivery can never print a card
+/// twice. (The spooler walks *unprinted* cards, so marking at queue time would
+/// silently skip a card if the process died in between — that is why the mark
+/// happens here, after ejection, and not when the card is queued.) The UID may
+/// arrive with the mark or later, and a re-print on a different chip overwrites
+/// it — which is what "the card in this order is <that chip>" means.
+///
+/// The column is written directly, never through [`update_card_meta`]: nothing
+/// about a UID affects a rendered artifact, and that path bumps `updated_at` and
+/// makes the caller re-render the rasters.
+pub async fn mark_card_printed(
+    pool: &SqlitePool,
+    prefix: Uuid,
+    id: i64,
+    serial_number: Option<&str>,
+) -> Result<Card, ApiError> {
     get_card(pool, prefix, id).await?; // 404 if the card is unknown
-    sqlx::query(
-        "UPDATE cards SET printed_at = datetime('now')
-          WHERE prefix_uuid = ?1 AND id = ?2 AND printed_at IS NULL",
+    let updated = sqlx::query(
+        "UPDATE cards SET printed_at    = COALESCE(printed_at, datetime('now')),
+                          serial_number = COALESCE(?3, serial_number)
+          WHERE prefix_uuid = ?1 AND id = ?2",
     )
     .bind(prefix.to_string())
     .bind(id)
+    .bind(serial_number)
     .execute(pool)
-    .await?;
+    .await;
+    if let Err(e) = updated {
+        if let (true, Some(serial)) = (is_serial_conflict(&e), serial_number) {
+            return Err(serial_conflict(pool, prefix, id, serial).await);
+        }
+        return Err(e.into());
+    }
     get_card(pool, prefix, id).await
 }
 
@@ -1210,6 +1277,19 @@ mod tests {
         )
         .await
         .expect("upsert card");
+    }
+
+    /// `printed_at` is operator-only state: it lives on the print queue's card,
+    /// never on the public [`Card`].
+    async fn printed_at(pool: &SqlitePool, prefix: Uuid, id: i64) -> Option<String> {
+        print_queue(pool, prefix)
+            .await
+            .expect("queue")
+            .cards
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("card in the queue")
+            .printed_at
     }
 
     // -----------------------------------------------------------------------
@@ -1812,8 +1892,12 @@ mod tests {
         let p = create_prefix(&pool, None, None).await.expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
         card(&pool, p.uuid, 2, BackSource::None).await;
-        mark_card_printed(&pool, p.uuid, 1).await.expect("printed");
-        mark_card_printed(&pool, p.uuid, 2).await.expect("printed");
+        mark_card_printed(&pool, p.uuid, 1, None)
+            .await
+            .expect("printed");
+        mark_card_printed(&pool, p.uuid, 2, None)
+            .await
+            .expect("printed");
         assert_eq!(print_queue(&pool, p.uuid).await.unwrap().unprinted_count, 0);
 
         // Somewhere that is not `queued` leaves the marks alone.
@@ -1837,7 +1921,9 @@ mod tests {
 
         // Re-applying `queued` is not a transition: a card printed from this
         // queue stays marked, so a retried call cannot reprint a whole order.
-        mark_card_printed(&pool, p.uuid, 1).await.expect("printed");
+        mark_card_printed(&pool, p.uuid, 1, None)
+            .await
+            .expect("printed");
         set_status(&pool, p.uuid, PrefixStatus::Queued, None, true)
             .await
             .expect("queued again");
@@ -2014,11 +2100,111 @@ mod tests {
         assert_eq!(q.unprinted_count, 2);
         assert!(q.resume);
 
-        mark_card_printed(&pool, p.uuid, 1).await.expect("mark 1");
-        mark_card_printed(&pool, p.uuid, 2).await.expect("mark 2");
+        mark_card_printed(&pool, p.uuid, 1, None)
+            .await
+            .expect("mark 1");
+        mark_card_printed(&pool, p.uuid, 2, None)
+            .await
+            .expect("mark 2");
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert_eq!(q.unprinted_count, 0);
         assert!(!q.resume, "nothing left to print, so nothing to resume");
+    }
+
+    /// The card's RFID UID arrives with the mark that records its ejection.
+    ///
+    /// Two things about that write are load-bearing: it never bumps `updated_at`
+    /// (nothing about a UID changes a rendered artifact, so the customer's
+    /// preview must not repaint for it), and a UID that arrives later still
+    /// lands — while `printed_at` keeps its first value.
+    #[tokio::test]
+    async fn the_uid_arrives_with_the_print_mark() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        let before = get_card(&pool, p.uuid, 1).await.expect("card").updated_at;
+
+        // The bare call still records the ejection alone — the shape a spooler
+        // without a reader sends.
+        let c = mark_card_printed(&pool, p.uuid, 1, None)
+            .await
+            .expect("printed");
+        assert!(c.serial_number.is_none(), "no reader, no UID");
+        let first_mark = printed_at(&pool, p.uuid, 1).await;
+        assert!(first_mark.is_some());
+
+        // A UID that only becomes known later fills in, without moving
+        // `printed_at` (first write wins) and without a re-render.
+        let c = mark_card_printed(&pool, p.uuid, 1, Some("012345678901"))
+            .await
+            .expect("printed with uid");
+        assert_eq!(c.serial_number.as_deref(), Some("012345678901"));
+        assert_eq!(
+            printed_at(&pool, p.uuid, 1).await,
+            first_mark,
+            "a retry must not re-stamp the ejection"
+        );
+        assert_eq!(
+            c.updated_at, before,
+            "the UID is not a material change: no re-render, no repaint"
+        );
+    }
+
+    /// A UID identifies one physical card, so two cards of one prefix may not
+    /// share it — and the refused write is a 409 naming the card that holds it,
+    /// never a 500, so the spooler's operator can see what to do about it. The
+    /// card that was refused stays unprinted, so a rerun picks it up.
+    #[tokio::test]
+    async fn a_uid_can_only_belong_to_one_card_of_a_prefix() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, p.uuid, 1, BackSource::None).await;
+        card(&pool, p.uuid, 2, BackSource::None).await;
+        mark_card_printed(&pool, p.uuid, 1, Some("123456789012"))
+            .await
+            .expect("card 1 takes the chip");
+
+        let dup = mark_card_printed(&pool, p.uuid, 2, Some("123456789012"))
+            .await
+            .expect_err("the same chip in one prefix");
+        assert!(
+            matches!(dup, ApiError::Conflict(ref m) if m.contains("card 1")),
+            "got {dup:?}"
+        );
+        let c = get_card(&pool, p.uuid, 2).await.expect("card 2");
+        assert!(c.serial_number.is_none());
+        assert!(
+            printed_at(&pool, p.uuid, 2).await.is_none(),
+            "a refused mark writes nothing, so a rerun still picks the card up"
+        );
+
+        // A hand-edit through PATCH hits the same constraint, and answers the
+        // same way rather than as an unmapped database error.
+        let patch = CardPatch {
+            serial_number: Some("123456789012".into()),
+            ..Default::default()
+        };
+        let dup = update_card_meta(&pool, p.uuid, 2, &patch)
+            .await
+            .expect_err("PATCH onto a taken UID");
+        assert!(
+            matches!(dup, ApiError::Conflict(ref m) if m.contains("card 1")),
+            "got {dup:?}"
+        );
+
+        // The index is scoped to the prefix on purpose: the same chip
+        // re-personalised in a second order is not a duplicate.
+        let other = create_prefix(&pool, None, None).await.expect("create");
+        card(&pool, other.uuid, 1, BackSource::None).await;
+        mark_card_printed(&pool, other.uuid, 1, Some("123456789012"))
+            .await
+            .expect("another order may use the same chip");
+
+        // And "not known yet" is not a value: any number of unread cards coexist.
+        card(&pool, p.uuid, 3, BackSource::None).await;
+        mark_card_printed(&pool, p.uuid, 3, None)
+            .await
+            .expect("a second card without a UID");
     }
 
     // -----------------------------------------------------------------------

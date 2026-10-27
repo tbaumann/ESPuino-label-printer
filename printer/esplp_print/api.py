@@ -90,8 +90,23 @@ class Client:
         the spooler can react to 404/423/500 with their distinct meaning."""
         return self._request("GET", path, accept="image/bmp")
 
-    def mark_printed(self, prefix: str, card_id: int) -> None:
-        self._json("POST", f"/api/prefixes/{prefix}/cards/{card_id}/printed")
+    def mark_printed(
+        self, prefix: str, card_id: int, serial_number: str | None = None
+    ) -> None:
+        """Mark a card printed (admin).
+
+        `serial_number` is the physical RFID UID the print process read off the
+        card's chip, when it managed to read one. It is carried on this call
+        rather than a separate write because the server refuses every other card
+        write once the order is `printing`/`printed` — which is exactly when the
+        UID becomes known — and because it is the same moment the card's ejection
+        is recorded. Omitted, the call records the ejection alone and the server
+        leaves any stored UID alone (the old shape, still valid).
+        """
+        body = {"serial_number": serial_number} if serial_number is not None else None
+        self._json(
+            "POST", f"/api/prefixes/{prefix}/cards/{card_id}/printed", body=body
+        )
 
     def set_prefix_status(self, prefix: str, status: str) -> dict[str, Any]:
         """Advance a prefix's status (admin). The transition is validated

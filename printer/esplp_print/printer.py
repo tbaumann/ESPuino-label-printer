@@ -19,6 +19,11 @@ The printer does not care what a back is *made of*, only what depth its raster
 is: both ribbons print the same set of card backs, and the server's raster is
 what differs — a 24-bit colour BMP on YMCKO, a 1-bit one on YMCKOKO. Whichever
 it sends is fed verbatim (see `print_card`).
+
+A card's RFID UID is read before it is printed, with the card parked under the
+contactless station (`read_card_uid`). That reader is separate hardware from the
+print engine and is not installed yet, so the read itself is a stub today — the
+card handling around it is real, and the spooler runs it for every card.
 """
 
 from __future__ import annotations
@@ -35,6 +40,12 @@ RIBBON_YMCKOKO = "ymckoko"
 BACK_NONE = "none"
 BACK_COLOR = "color"
 BACK_BLACK = "black"
+
+# The RFID UID as an ESPuino reports it: four bytes, each formatted `%03d`, so
+# exactly 12 decimal digits and often with a leading zero. The server stores it
+# in the card's `serial_number`; an external client (MediaHub) promotes its own
+# card per UID, so a card without one is a card that never gets promoted.
+UID_DIGITS = 12
 
 
 class PrinterError(Exception):
@@ -135,6 +146,59 @@ class Printer:
             capacity=getattr(info, "capacity", None),
         )
 
+    # -- the card's RFID UID ------------------------------------------------
+
+    def read_card_uid(self) -> str | None:
+        """Park the card under the contactless reader and read its RFID UID.
+
+        The sequence is the point of this method: the card is pulled from the
+        feeder and moved to the contactless station
+        (`evolis.CardPos.CONTACTLESS`), where the reader can see it, and it stays
+        there — the print job then takes it from that position to the print
+        station itself. Feeding the card HERE rather than letting the print
+        session do it is what makes the UID the id of *this* card.
+
+        Returns the UID as the 12 decimal digits an ESPuino reports (see
+        `UID_DIGITS`), or None when there is nothing to read. None means "not
+        known yet": the card prints without one, the server's `serial_number`
+        stays NULL, and a client that promotes cards by UID will report this one
+        as printed with an unusable id rather than silently assigning it.
+
+        Raises PrinterError when the printer cannot be driven to the reader at
+        all — a caller may either treat that as fatal or fall back to None (the
+        spooler does the latter: the card prints anyway, and the run names it).
+
+        STUB: the contactless reader is not installed yet. `_read_uid` returns
+        None without touching the hardware, so this parses nothing today; the
+        card handling above it is real and runs for every card, which leaves the
+        reader to `_read_uid` and nothing else.
+        """
+        if self._co is None:
+            raise PrinterError("printer not open")
+        evolis = self._evolis
+        if not self._co.insert_card():
+            raise PrinterError(
+                f"cannot feed a card for the UID read: {self._co.get_last_error()}"
+            )
+        if not self._co.set_card_pos(evolis.CardPos.CONTACTLESS):
+            raise PrinterError(
+                "cannot park the card under the contactless station "
+                f"({self._co.get_last_error()}); is the reader installed?"
+            )
+        return self._read_uid()
+
+    def _read_uid(self) -> str | None:
+        """Read the UID of the card parked at the contactless station.
+
+        STUB — the reader hardware is not installed. What the real read has to
+        do: talk to the reader (PC/SC through the SDK — `evolis.PcscSession`,
+        `wait_card_present` then a Get-UID APDU through `send_apdu` — or the
+        reader's own interface) and answer the UID the way an ESPuino reports it:
+        the four bytes over `"%03d%03d%03d%03d"`, decimal, never hex, leading
+        zeros kept. None when the card is there but its chip cannot be read.
+        """
+        return None
+
     # -- printing -----------------------------------------------------------
 
     def print_card(self, front_bmp: bytes, back: str, back_bmp: bytes | None) -> None:
@@ -188,5 +252,6 @@ __all__ = [
     "BACK_NONE",
     "BACK_COLOR",
     "BACK_BLACK",
+    "UID_DIGITS",
     "RibbonStatus",
 ]

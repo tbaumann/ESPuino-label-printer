@@ -120,7 +120,9 @@ struct UploadArgs {
     /// Card name. Defaults to the file's stem.
     #[arg(long)]
     name: Option<String>,
-    /// Optional serial number.
+    /// The card's serial number — the value another system may key a card on.
+    /// On a card the print process reads a chip for, that is the physical RFID
+    /// UID (12 decimal digits); here it is a serial you assign yourself.
     #[arg(long)]
     serial_number: Option<String>,
     /// What the card's back is (none|front|image|markdown). Omitted = none, a
@@ -151,6 +153,7 @@ struct BatchArgs {
     #[arg(long, default_value = "{stem}")]
     name_template: String,
     /// Prefix for auto-generated serial numbers: "<serial-prefix><index>".
+    /// Those are operator-assigned serials, not RFID UIDs (see --serial-number).
     #[arg(long)]
     serial_prefix: Option<String>,
     /// Zero-padded width of the numeric part of the serial number.

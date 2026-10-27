@@ -371,6 +371,17 @@ pub enum BackAvailability {
 pub struct Card {
     pub id: i64,
     pub name: String,
+    /// The card's identity number: the physical RFID UID the print process read
+    /// from the card's chip — four UID bytes as `%03d` each, so exactly 12
+    /// decimal digits and often with a leading zero — or, on a card no reader
+    /// has seen, an operator-assigned serial (the CLI's `--serial-number` /
+    /// `--serial-prefix`, `SN-001`). NULL means "not known yet".
+    ///
+    /// Written by the print process (`POST .../cards/{id}/printed`), never by
+    /// the customer UI, which deliberately does not surface it: a value another
+    /// system keys on must not be hand-editable by whoever holds the prefix
+    /// uuid. A UID is unique per prefix (migration `0015`), because it is one
+    /// physical card.
     pub serial_number: Option<String>,
     /// What this card has on its back: the per-card single/double-sided choice.
     /// [`BackSource::None`] is a single-sided card.
@@ -501,6 +512,8 @@ pub struct PrefixRibbonPatch {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct CardPatch {
     pub name: Option<String>,
+    /// The card's serial / RFID UID — see [`Card::serial_number`]. A blank value
+    /// clears it to NULL ("not known yet").
     pub serial_number: Option<String>,
     /// The card's back side. Changing this is how a card becomes (or stops
     /// being) double-sided, and how its back material is chosen.
@@ -514,6 +527,21 @@ pub struct StatusInput {
     pub status: PrefixStatus,
     /// Optional external order reference (typically set when marking paid).
     pub order_ref: Option<String>,
+}
+
+/// Body for marking a card printed. Optional: the print spooler records the
+/// ejection alone when it has no UID to report, and that call carries no body.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PrintedInput {
+    /// The physical RFID UID the print process read from the card's chip, as the
+    /// 12 decimal digits an ESPuino reports (see [`Card::serial_number`]).
+    ///
+    /// Absent or blank means "not known yet": the stored UID is left alone, and
+    /// so is a card that never had one. The value is written as read — the
+    /// writer is the print process reading a real chip, so the server does not
+    /// second-guess its shape, and a refused write here would strand a card that
+    /// is already physically printed.
+    pub serial_number: Option<String>,
 }
 
 /// Operator token, exchanged for a session cookie. Sent once, over the wire,

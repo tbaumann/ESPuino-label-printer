@@ -516,6 +516,14 @@ data/
   The back image is uploaded per card **after** the front (the dropzone is a
   bulk flow), so a card can exist while its back is still missing — it is just
   not *complete*, and an order holding one is refused at the checkout (`409`).
+- **`serial_number` is the card's identity**: the physical RFID UID the print
+  process read off the card's chip — four UID bytes as `%03d` each, so exactly
+  12 decimal digits, often with a leading zero, and never hex — or an
+  operator-assigned serial on a card no reader has seen. It is written by the
+  print process with the print mark (`POST .../cards/{id}/printed`), never by the
+  customer UI, and it is unique per prefix: a UID is one physical chip, so a
+  second card claiming it answers `409` naming the card that has it. NULL means
+  "not known yet", and any number of cards may be in that state.
 
 ## Prefix lifecycle
 
@@ -535,7 +543,11 @@ draft ──Pay──▶ payment_pending ──paid──▶ paid ──▶ queu
   they get the read-only view. The operator may still edit while the prefix is
   `draft`, `payment_pending`, `paid` or `queued`; once it reaches `printing`
   even the operator's card writes (PUT/POST/DELETE) return `409`. Reads always
-  work.
+  work. The one write that still applies there is the print spooler's mark —
+  `POST .../cards/{id}/printed` — which is also where a card's RFID UID arrives
+  (`{"serial_number": "123456789012"}`, optional, like the whole body):
+  the write that records the ejection is the only one left at the moment the
+  chip has been read.
 - `GET /api/prefixes?status=paid` is the print queue's work list.
 - Transitions are validated; an invalid one returns `409`. Re-applying the
   current status is a no-op, so shop/queue callbacks can safely retry.
@@ -640,6 +652,8 @@ an admin session.
 | PUT    | `/api/prefixes/{prefix}/cards/{id}`    | create/replace card at id (image required) |
 | PATCH  | `/api/prefixes/{prefix}/cards/{id}`    | update name / serial / back / back text only |
 | DELETE | `/api/prefixes/{prefix}/cards/{id}`    | delete card + its blob        |
+| POST   | `/api/prefixes/{prefix}/cards/{id}/printed` | mark a card ejected, optionally with its RFID UID (`serial_number`) **(admin)** |
+| GET    | `/api/prefixes/{prefix}/print-queue`   | what to print, in card order, with `printed_at` **(admin)** |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image/front` | card front image bytes     |
 | GET    | `/api/prefixes/{prefix}/cards/{id}/image/back` | back image bytes (an `image` back only) |
 | PUT    | `/api/prefixes/{prefix}/cards/{id}/image/back` | upload or replace the back image, making that image the card's back |
@@ -663,7 +677,9 @@ optional `back_image` file part. `back` is one of `none`, `front`, `image` or
 `markdown`, and defaults to `none` (a single-sided card); sending a `back_image`
 part implies `back=image`. `back_text` is only accepted for a `markdown` back;
 no ribbon restricts a back *source*, so `400` is for a form that contradicts
-itself, never for a choice the ribbon dislikes.
+itself, never for a choice the ribbon dislikes. `serial_number` here is a serial
+you assign yourself; the card's RFID UID is written by the print process through
+`POST .../cards/{id}/printed`.
 
 `back_image` is optional even for an `image` back, because cards are created by
 the front-image dropzone, one file at a time. A card without one is simply not

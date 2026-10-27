@@ -12,8 +12,11 @@ import http.server
 import socketserver
 
 from esplp_print.api import Client
+from esplp_print.printer import Printer, PrinterError
 
 LOG = {"GET": [], "POST": [], "PATCH": []}
+# The parsed JSON body of each POST (None when the call sent none).
+POST_BODIES: list = []
 # Prefixes for the batch mode: two ymcko jobs (one paid, one queued), one
 # ymckoko job (should be excluded when filtering ymcko), one draft (excluded).
 PREFIXES = [
@@ -79,6 +82,9 @@ class H(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         LOG["POST"].append(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        POST_BODIES.append(json.loads(raw) if raw else None)
         self._send(200, {"id": int(self.path.rstrip("/").split("/")[-2])})
 
     def do_PATCH(self):
@@ -121,9 +127,17 @@ check("front raster 200", front1[0] == 200 and front1[1].startswith(b"BM"))
 check("back raster 200", back1[0] == 200 and back1[1].startswith(b"BM"))
 check("single-sided still fetches front", front2[0] == 200)
 
-# 3. mark printed
-c.mark_printed("P", 1)
+# 3. mark printed — carrying the card's RFID UID when the reader read one, and
+#    with no body at all when it did not (the shape a spooler without a reader
+#    sends, which the server has to keep accepting).
+c.mark_printed("P", 1, "123456789012")
 check("mark printed POST", LOG["POST"][-1].endswith("/cards/1/printed"))
+check(
+    "mark printed carries the uid",
+    POST_BODIES[-1] == {"serial_number": "123456789012"},
+)
+c.mark_printed("P", 2)
+check("mark printed without a uid sends no body", POST_BODIES[-1] is None)
 
 # 4. exercise run() queue selection via the module (import __main__ lazily)
 import importlib
@@ -167,6 +181,91 @@ jobs_ck = [
     if mm._ribbon(p) == "ymckoko" and p.get("status") in mm.PRINTABLE_STATUSES
 ]
 check("batch ymckoko picks C", [p["uuid"] for p in jobs_ck] == ["C"])
+
+# 9. the UID step. The card is fed and parked at the contactless station before
+#    it is printed — that is what makes the UID the id of THIS card — and the
+#    read at that station is a stub today (no reader installed), so it reports no
+#    UID rather than inventing one. A connection is faked here: no printer, no
+#    SDK, no wheel.
+class FakeEv:
+    class CardPos:
+        CONTACTLESS = 6
+
+
+class FakeCo:
+    def __init__(self, ok=True):
+        self.calls = []
+        self.ok = ok
+
+    def insert_card(self):
+        self.calls.append("insert_card")
+        return self.ok
+
+    def set_card_pos(self, pos):
+        self.calls.append(("set_card_pos", pos))
+        return self.ok
+
+    def get_last_error(self):
+        return "none"
+
+
+pr = Printer("socket://127.0.0.1?type=evolis")
+pr._evolis = FakeEv
+pr._co = FakeCo()
+uid = pr.read_card_uid()
+check(
+    "the card is fed and parked at the contactless station before printing",
+    pr._co.calls == ["insert_card", ("set_card_pos", FakeEv.CardPos.CONTACTLESS)],
+)
+check("the UID read is stubbed: no UID is invented", uid is None)
+
+pr._co = FakeCo(ok=False)
+failed = None
+try:
+    pr.read_card_uid()
+except PrinterError as e:
+    failed = str(e)
+check(
+    "a card that cannot be fed is a PrinterError",
+    failed is not None and "feed" in failed,
+)
+
+
+class NoStationCo(FakeCo):
+    """The card feeds fine; the printer has no contactless station to move it to."""
+
+    def set_card_pos(self, pos):
+        self.calls.append(("set_card_pos", pos))
+        return False
+
+
+pr._co = NoStationCo()
+failed = None
+try:
+    pr.read_card_uid()
+except PrinterError as e:
+    failed = str(e)
+check(
+    "a station that is not there is a PrinterError naming the reader",
+    failed is not None and "contactless" in failed,
+)
+
+
+class StubPrinter:
+    def __init__(self, uid=None, boom=False):
+        self.uid = uid
+        self.boom = boom
+
+    def read_card_uid(self):
+        if self.boom:
+            raise PrinterError("cannot park the card under the contactless station")
+        return self.uid
+
+
+check("a card with no UID still prints (the helper never raises)",
+      mm._card_uid(StubPrinter(boom=True), 7) is None)
+check("and a card WITH a UID hands it over", mm._card_uid(StubPrinter("012345678901"), 7)
+      == "012345678901")
 
 srv.shutdown()
 print("RESULT:", "OK" if ok else "FAILED")

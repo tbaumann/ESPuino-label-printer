@@ -152,6 +152,7 @@ impl utoipa::Modify for SecurityAddon {
                 models::CardIndex,
                 models::CardInput,
                 models::CardPatch,
+                models::PrintedInput,
                 models::BackSource,
                 models::PrintQueue,
                 models::PrintQueueCard,

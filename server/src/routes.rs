@@ -14,9 +14,9 @@ use crate::db;
 use crate::error::ApiError;
 use crate::models::{
     AdminLogin, AdminSession, BackSource, Card, CardIndex, CardPatch, NeedsAttentionItem,
-    NeedsAttentionKind, Prefix, PrefixInput, PrefixRibbonPatch, PrefixStatus, PrintQueue, Ribbon,
-    RibbonPrice, RibbonPricePatch, RibbonStock, RibbonStockPatch, ShippingAddress, ShopConfig,
-    StatusInput,
+    NeedsAttentionKind, Prefix, PrefixInput, PrefixRibbonPatch, PrefixStatus, PrintQueue,
+    PrintedInput, Ribbon, RibbonPrice, RibbonPricePatch, RibbonStock, RibbonStockPatch,
+    ShippingAddress, ShopConfig, StatusInput,
 };
 use crate::notify;
 use crate::render;
@@ -1154,24 +1154,55 @@ pub async fn get_print_queue(
 /// Mark one card printed. **Admin only.** The spooler calls this once the
 /// printer confirms the card was ejected; it is idempotent, so a retried
 /// delivery can never print a card twice.
+///
+/// The body is optional and carries the physical RFID UID the print process
+/// read off the card's chip (`{"serial_number": "123456789012"}`). The spooler
+/// knows it at exactly this moment, and this is the only card write that still
+/// applies while the order is `printing`/`printed` — a `PUT`/`PATCH` is refused
+/// there by `ensure_writable`. A call with no body, which is what a client that
+/// only records the ejection sends, marks the card and leaves any stored UID
+/// alone.
 #[utoipa::path(post, path = "/api/prefixes/{prefix}/cards/{id}/printed", tag = "cards",
         params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
+        request_body = PrintedInput,
         security(("bearerAuth" = []), ("sessionCookie" = [])),
         responses(
             (status = 200, body = Card),
+            (status = 400, description = "a non-empty body that is not this JSON", body = crate::error::ErrorBody),
             (status = 401, description = "admin token required", body = crate::error::ErrorBody),
             (status = 404, body = crate::error::ErrorBody),
+            (status = 409, description = "this UID already belongs to another card of the prefix", body = crate::error::ErrorBody),
             (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
         ))]
 pub async fn mark_card_printed(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((prefix, id)): Path<(String, i64)>,
+    body: Bytes,
 ) -> Result<Json<Card>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
     caller.require_admin()?;
-    Ok(Json(db::mark_card_printed(&st.pool, prefix, id).await?))
+    // An EMPTY body is the only way to say "no UID": a non-empty one has to be
+    // this JSON, or it is a 400. `Option<Json<PrintedInput>>` would answer 200
+    // here for a malformed body and for a missing content type as well, and
+    // silently drop a UID the caller believes it just stored — and since the
+    // card is marked printed by the same call, and nothing else may write a card
+    // once the order is `printing`/`printed`, a silently dropped UID is the one
+    // mistake this endpoint cannot let through.
+    let serial = if body.is_empty() {
+        None
+    } else {
+        let parsed: PrintedInput = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::BadRequest(format!("invalid body: {e}")))?;
+        // A blank UID is "not known yet", exactly as the multipart and PATCH
+        // paths read it: NULL in the column. Storing `''` would be a value the
+        // uniqueness index counts, so two unread cards would collide.
+        parsed.serial_number.filter(|s| !s.trim().is_empty())
+    };
+    Ok(Json(
+        db::mark_card_printed(&st.pool, prefix, id, serial.as_deref()).await?,
+    ))
 }
 
 /// Set a prefix's status. **Admin only.**
@@ -3043,6 +3074,86 @@ mod tests {
         assert!(
             matches!(second, Err(ApiError::TooManyRequests(_))),
             "second use inside the window should be throttled, got {second:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The print spooler's "printed" call
+    // -----------------------------------------------------------------------
+
+    /// The spooler's mark-printed call takes the card's UID from an optional
+    /// body, and every shape of that call has to keep working: the bare call a
+    /// client without a reader sends, the body carrying a UID, and a blank one.
+    ///
+    /// A non-empty body that is not this JSON is a `400` rather than a silently
+    /// dropped UID: the same call marks the card printed, and once the order is
+    /// `printing`/`printed` no other write can put the UID back.
+    ///
+    /// Run through the handler directly, like the other route tests. The
+    /// extractor itself (`Bytes` takes any content type, and an absent body is
+    /// an empty one) is checked against a live server — see the `curl` sequence
+    /// in `MEDIAHUB-INTEGRATION.md`.
+    #[tokio::test]
+    async fn mark_printed_takes_the_uid_from_an_optional_body() {
+        let pool = test_pool().await;
+        let mut st = state_with(
+            rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+            pool.clone(),
+        );
+        st.admin_token = Some(Arc::from("secret"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+
+        let p = db::create_prefix(&pool, None, None).await.expect("create");
+        insert_card(&pool, p.uuid, 1, BackSource::None).await;
+        insert_card(&pool, p.uuid, 2, BackSource::None).await;
+        let path = |id: i64| Path((p.uuid.to_string(), id));
+
+        // No body at all: the ejection is recorded and no UID is invented.
+        let Json(c) = mark_card_printed(State(st.clone()), headers.clone(), path(1), Bytes::new())
+            .await
+            .expect("bare call");
+        assert!(c.serial_number.is_none());
+        // `printed_at` is operator-only state: it answers on the print queue,
+        // never on the public Card.
+        let q = db::print_queue(&pool, p.uuid).await.expect("queue");
+        let marked = q.cards.iter().find(|c| c.id == 1).expect("card 1");
+        assert!(marked.printed_at.is_some());
+
+        // A later call fills the UID in — the moment a reader would report it.
+        let body = Bytes::from_static(br#"{"serial_number": "012345678901"}"#);
+        let Json(c) = mark_card_printed(State(st.clone()), headers.clone(), path(1), body)
+            .await
+            .expect("uid call");
+        assert_eq!(c.serial_number.as_deref(), Some("012345678901"));
+
+        // A blank field means "not known yet", not an empty-string UID: the two
+        // would collide in the uniqueness index, and `''` is not a chip id.
+        let body = Bytes::from_static(br#"{"serial_number": "  "}"#);
+        let Json(c) = mark_card_printed(State(st.clone()), headers.clone(), path(2), body)
+            .await
+            .expect("blank uid");
+        assert_eq!(c.serial_number, None);
+
+        // A body nobody can read is refused, so no caller can believe it stored
+        // a UID while the card was marked printed without one.
+        let bad = mark_card_printed(
+            State(st.clone()),
+            headers.clone(),
+            path(2),
+            Bytes::from_static(b"{\"serial_number\":"),
+        )
+        .await
+        .expect_err("truncated json");
+        assert!(matches!(bad, ApiError::BadRequest(_)), "got {bad:?}");
+
+        // A customer may not mark anything printed.
+        let denied = mark_card_printed(State(st), HeaderMap::new(), path(2), Bytes::new())
+            .await
+            .expect_err("customer call");
+        assert!(
+            matches!(denied, ApiError::Unauthorized(_)),
+            "got {denied:?}"
         );
     }
 

@@ -13,6 +13,14 @@ does not send a print job and does not mark any card printed.
 operator loads that ribbon once, and between jobs the tool pauses and asks them
 to empty the output tray before the next prefix starts.
 
+Each card's RFID UID is read before it is printed: the card is fed, parked under
+the contactless station and read, and the print job takes it from there. The UID
+goes onto the card with the print mark. The read itself is still a stub (the
+reader is not installed yet), so cards print with a NULL `serial_number` and the
+run names them at the end — a card the reader cannot see is never fatal, since
+the card prints either way. `--dry-run` skips the read: feeding a card is a
+physical action, and nothing would print it afterwards.
+
 Exit codes:
   0  complete (all unprinted printable cards printed, or a dry run)
   1  an error stopped the run (cards before it were printed and marked; rerun
@@ -105,6 +113,21 @@ def _is_printed(card: dict[str, Any]) -> bool:
     return card.get("printed_at") is not None
 
 
+def _card_uid(printer: Printer, card_id: int) -> str | None:
+    """The RFID UID of the card about to be printed, or None when there is none.
+
+    Best effort on purpose: a card the reader cannot see still prints, with the
+    server's `serial_number` left NULL, and the end of the run names it. Stopping
+    the run instead would strand a paid order half-printed over a read nothing
+    else depends on.
+    """
+    try:
+        return printer.read_card_uid()
+    except PrinterError as e:
+        print(f"  [uid] WARNING: card {card_id} not read: {e}", file=sys.stderr)
+        return None
+
+
 def _ribbon(prefix: dict[str, Any]) -> str | None:
     """The ribbon a prefix prints with: its own `ribbon`.
 
@@ -178,6 +201,9 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
         _ribbon_capacity_warning(loaded)
         if ribbon:
             _ribbon_check(loaded, ribbon, args.ignore_ribbon)
+        # Cards that printed with no UID read: reported together at the end, so
+        # they cannot disappear into a NULL column unnoticed.
+        no_uid: list[int] = []
 
         for i, card in enumerate(todo, 1):
             cid = card["id"]
@@ -208,12 +234,25 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
                         flush=True,
                     )
                     continue
+                # The card is fed and parked under the contactless station for
+                # the UID read, and the print job takes it from there. A dry run
+                # reads nothing: feeding a card is a physical action like
+                # printing is.
+                uid = None if args.dry_run else _card_uid(printer, cid)
                 printer.print_card(front, back, back_bmp)
                 # The print call returned OK: the card is ejected to the hopper.
                 # Mark it NOW so a crash cannot reprint it, and so a parallel
-                # run does not pull it. The server endpoint is idempotent.
-                client.mark_printed(prefix, cid)
-                print(f"  -> card {cid} printed and marked", flush=True)
+                # run does not pull it. The server endpoint is idempotent, and it
+                # takes the UID with the mark — the only card write that still
+                # applies once the order is being printed.
+                client.mark_printed(prefix, cid, uid)
+                if not args.dry_run and uid is None:
+                    no_uid.append(cid)
+                print(
+                    f"  -> card {cid} printed and marked"
+                    + (f" (uid {uid})" if uid else ""),
+                    flush=True,
+                )
             except (PrinterError, ApiError, RuntimeError) as e:
                 print(f"error: card {cid} failed: {e}", file=sys.stderr)
                 print(
@@ -223,6 +262,17 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
                 return 1
 
     print(f"done: {len(todo)} card(s) {'inspected' if args.dry_run else 'printed'}")
+
+    # A UID that was never read is a card nothing can map back to a chip: an
+    # external client promotes its cards by UID, so a run that produced any has
+    # to name them rather than let them disappear into a NULL column.
+    if no_uid:
+        ids = ", ".join(str(i) for i in no_uid)
+        print(
+            f"[uid] NOTE: {len(no_uid)} card(s) printed without a UID read: {ids} — "
+            "nothing maps those cards to a chip",
+            file=sys.stderr,
+        )
 
     # The whole run succeeded: flush the work list to `printed`. The server
     # forces any transition for the admin token, so this works whatever state
