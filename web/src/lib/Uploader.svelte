@@ -14,15 +14,6 @@
     disabled?: boolean
   } = $props()
 
-  // This uploads *fronts* — one file, one card, and a new card starts
-  // single-sided. The back is chosen per card below, so the hint says where a
-  // back comes from rather than letting the customer find out at the checkout.
-  const hint = $derived(
-    ribbon === 'ymckoko'
-      ? 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — a back on this project prints in black and white, chosen on the card below.'
-      : 'uploads each image as a card; the name defaults to the file name. Cards start single-sided — choose and fill in a back on each card below.',
-  )
-
   let over = $state(false)
   let busy = $state(false)
   let done = $state(0)
@@ -150,7 +141,6 @@
   ondrop={onDrop}
 >
   <div style="font-weight:600">Drag images or a folder here</div>
-  <div class="hint">{hint}</div>
   <div class="row" style="justify-content:center;margin-top:12px">
     <button
       onclick={(e) => {

@@ -3,7 +3,6 @@
     api,
     backDepth,
     BACK_SOURCES,
-    DEPTH_NOTE,
     type BackSource,
     type Card,
     type CardPatch,
@@ -11,20 +10,6 @@
   } from './api'
   import CardFields from './cards/CardFields.svelte'
 
-  // One card: its header, its two sides, and the back choice that decides what
-  // the second one is.
-  //
-  // The card's back is entirely its own choice — nothing at all (a single-sided
-  // card), a copy of the front, a second uploaded picture, or markdown. The
-  // *ribbon* changes nothing about the choice; it decides only the colour depth
-  // the chosen back is rendered in, which the preview shows and the caption
-  // says.
-  //
-  // Two controls, deliberately apart: which back the card *has* is chosen in the
-  // editor beside the pane (it is the same choice for every card, so it belongs
-  // with the other fields), while the picture that an `image` back needs is
-  // chosen *in* the pane — that pane is the picture, so the file chooser sits on
-  // it, and the whole pane is a drop area for one.
   let {
     prefix,
     card,
@@ -206,32 +191,21 @@
       <div class="preview">
         <img src={api.cardFrontDisplayUrl(prefix, card.id, card.updated_at)} alt={`front of ${card.name}`} />
       </div>
-      <div class="caption muted">front · full colour</div>
     </div>
 
     {#if back === 'none'}
-      <!-- Nothing is printed on the back of a single-sided card, so there is no
-           back pane at all: one would imply a side that does not exist. -->
       <div class="side no-back-side muted"></div>
     {:else}
       <div class="side">
         <div class="preview back" class:droppable={pickOnClick} class:over>
           <div class="back-body">
             {#if rendered === 'ready'}
-              <!-- The one artifact a back has, whatever its source is: the
-                   server's `display/back`, at the ribbon's depth. The row never
-                   draws a back itself, so the pane cannot promise a card the
-                   printer would not produce. -->
               <img
                 class="backart"
                 src={api.cardBackDisplayUrl(prefix, card.id, `${card.updated_at}-${ribbon}`)}
                 alt={`back of ${card.name}`}
               />
             {:else if rendered === 'failed'}
-              <!-- The server could not render this back, so the card is visibly
-                   not printable rather than showing a picture that would never
-                   print. A markdown back lands here when the backend is missing
-                   or refused the text. -->
               <div class="no-back-image">
                 <span>this back is not printable yet</span>
               </div>
@@ -250,9 +224,6 @@
           </div>
 
           {#if dropTarget}
-            <!-- The whole pane is a drop area: a button laid over it, so a
-                 picture dropped anywhere on it lands. While the pane is empty it
-                 is the click-to-choose affordance as well. -->
             <button
               class="back-drop"
               type="button"
@@ -265,7 +236,6 @@
             ></button>
           {/if}
         </div>
-        <div class="caption muted">{backCaption}</div>
 
         {#if back === 'image' && !readonly}
           <!-- The file chooser sits *under* the pane, with the caption: the pane
@@ -318,32 +288,6 @@
             disabled={!writable || changingSource}
             placeholder="song list"
           ></textarea>
-          <div class="hint muted">
-            {#if depth === 'color'}
-              Printed on the back in colour.
-            {:else}
-              Printed on the back in black only — this project's ribbon has no
-              colour panel for the back.
-            {/if}
-          </div>
-        {:else if back === 'image'}
-          <div class="hint muted">
-            {#if depth === 'color'}
-              Printed on the back in full colour.
-            {:else}
-              Printed on the back in black and white — this project's ribbon has no
-              colour panel for the back, so the picture is reduced to pure black
-              and white. A colour-back project keeps it in colour.
-            {/if}
-            Every double-sided card needs one before the project can be paid for —
-            choose it in the pane, or drop a picture on the pane.
-          </div>
-        {:else if back === 'front'}
-          <div class="hint muted">
-            Nothing to supply: the back is the front picture again.
-          </div>
-        {:else}
-          <div class="hint muted">Nothing to supply: a single-sided card has no back.</div>
         {/if}
 
         <div class="row" style="margin-top:6px">

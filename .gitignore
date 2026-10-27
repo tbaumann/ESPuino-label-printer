@@ -13,3 +13,4 @@ server/static/
 result*
 .worktrees/
 scripts/__pycache__/
+pycache/

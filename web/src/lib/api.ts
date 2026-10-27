@@ -169,13 +169,13 @@ export const RIBBONS: { ribbon: Ribbon; label: string; summary: string }[] = [
     ribbon: 'ymckoko',
     label: 'Black back',
     summary:
-      'Full-colour front, black-and-white back. Any back a card can have prints there in black only — text is what it is good at. Billed per card.',
+      'Full-colour front, black-and-white back. Budget double sided option. Billed per card.',
   },
   {
     ribbon: 'ymcko',
     label: 'Colour back',
     summary:
-      'Full-colour front, and a back in full colour: a second picture, a copy of the front, or text. Billed per printed side.',
+      'Full-colour. Optional double sided. Billed per printed side.',
   },
 ]
 
@@ -187,17 +187,17 @@ export const BACK_SOURCES: { source: BackSource; label: string; summary: string 
   {
     source: 'none',
     label: 'Single-sided',
-    summary: 'Front only, blank back. One ribbon panel per card.',
+    summary: 'Front only.',
   },
   {
     source: 'front',
     label: 'Copy of the front',
-    summary: 'The same picture printed on the back. Costs a second panel.',
+    summary: 'The same picture printed on the back.',
   },
   {
     source: 'image',
     label: 'Second image',
-    summary: 'A picture of its own, uploaded per card.',
+    summary: 'A picture of its own.',
   },
   {
     source: 'markdown',

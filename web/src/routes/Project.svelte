@@ -276,9 +276,6 @@
       <div class="row">
         <h2>Ribbon</h2>
         <span style="flex:1"></span>
-        <span class="muted">
-          one ribbon per project — it decides how a card's back is printed
-        </span>
       </div>
       <div class="modes">
         {#each ribbons as r (r.ribbon)}
@@ -308,8 +305,7 @@
               <span class="muted summary">{r.summary}</span>
               {#if !r.available}
                 <span class="muted summary">
-                  This ribbon is out of stock. It comes back as soon as we restock —
-                  it is not gone for good.
+                  This ribbon is out of stock.
                 </span>
               {/if}
             </span>
@@ -320,7 +316,7 @@
         <p class="muted" style="margin-top:12px">
           This project is set to <strong>{chosen.label}</strong>, whose ribbon is out
           of stock, so it cannot be paid for right now. Pick the other one, or come
-          back once we have restocked.
+          back once it is restocked.
         </p>
       {/if}
     </section>
@@ -388,15 +384,13 @@
         <h2>Cards</h2>
         <span style="flex:1"></span>
         {#if missingBacks > 0}
-          <!-- Shown whether or not this deployment takes money: a card without
-               its back is not printable either way. -->
           <span class="badge status-cancelled">
             {missingBacks} without a finished back
           </span>
         {/if}
       </div>
       {#if cards.length === 0}
-        <div class="empty">No cards yet — drop some images above.</div>
+        <div class="empty">No cards yet - drop some images above.</div>
       {:else}
         <div class="cards">
           {#each cards as card (card.id)}
