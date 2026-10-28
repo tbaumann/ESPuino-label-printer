@@ -36,10 +36,11 @@
 //!
 //! The ribbon fixes the back's depth ([`crate::models::Ribbon::back_depth`]):
 //! YMCKO's back is a colour panel set (24-bit raster), YMCKOKO's is the second
-//! black panel (1-bit raster). Both accept every back source — the picture is
-//! simply reduced to black or white for the black panel (see
-//! [`render_back_raster`]). A 1-bit panel is a poor medium for a photograph,
-//! which is the customer's choice to make; nothing here refuses it.
+//! black panel (1-bit raster). Both accept every back source, and a black panel
+//! needs the picture *reduced* to ink — a plain cut at mid-grey for line art, or
+//! Floyd–Steinberg error diffusion for a photograph, which is [`Reduction`] and
+//! arrives as part of the [`Picture`]. A 1-bit panel is a poor medium for a
+//! photograph, which is the customer's choice to make; nothing here refuses it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -111,6 +112,56 @@ pub enum Placement {
     TopLeft,
 }
 
+/// How a colour picture becomes the black panel's ink.
+///
+/// A black panel has no grey: every pixel is wax or paper. There are two honest
+/// ways to get there and which one is right depends on what the picture *is* —
+/// which is why this travels with [`Placement`] in a [`Picture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reduction {
+    /// Cut at mid-grey: a pixel that looks darker than 50% is ink. Edges land
+    /// exactly where the picture put them, which is what *line art* needs — a
+    /// stippled glyph edge reads as a heavier, softer letter, and a hairline
+    /// whose stroke is half white can vanish into the paper.
+    Threshold,
+    /// Floyd–Steinberg error diffusion: each pixel is snapped to ink or paper
+    /// and its error is carried into the neighbours, so a mid-tone becomes a
+    /// locally correct *density* of dots. What a photograph needs — cut
+    /// instead, everything below mid-grey prints as a flat black shape and
+    /// everything above as flat white, which is how a portrait becomes a
+    /// silhouette.
+    Dither,
+}
+
+/// What kind of picture this is, as far as the card's panel is concerned: where
+/// it lands ([`Placement`]) and how it becomes ink on a black panel
+/// ([`Reduction`]). The two travel together because they answer one question —
+/// *what is this?* — and because the call site is the only place that knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Picture {
+    pub placement: Placement,
+    pub reduction: Reduction,
+}
+
+impl Picture {
+    /// A photograph: the card's front, a second uploaded picture, or a copy of
+    /// the front. Framed whole, and dithered on a black panel.
+    pub const PHOTOGRAPH: Self = Self {
+        placement: Placement::Fit,
+        reduction: Reduction::Dither,
+    };
+
+    /// A document laid out for the card: a markdown render. Anchored at the
+    /// panel's top-left at the width it was laid out for, and **cut** rather
+    /// than dithered — its ink is line art, so there is no mid-tone to trade
+    /// for dots, and the only thing a dither would do to a glyph is stipple its
+    /// anti-aliased edge.
+    pub const DOCUMENT: Self = Self {
+        placement: Placement::TopLeft,
+        reduction: Reduction::Threshold,
+    };
+}
+
 /// Scale an image to *fit inside* `w`×`h`, preserving aspect, on a white
 /// background (the card is a white panel). Used for both the display image and
 /// the print raster: the whole picture is visible, letterboxed if the aspect
@@ -165,11 +216,28 @@ fn luma(p: &Rgb<u8>) -> u32 {
     (299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000
 }
 
-/// Threshold a colour canvas to 1 bit: dark pixels are ink, everything else is
-/// the card's white. A plain 50% cut, deliberately — no dithering, no greys; a
-/// black panel can make neither.
-fn to_ink(canvas: &RgbImage) -> Vec<bool> {
-    canvas.pixels().map(|p| luma(p) < 128).collect()
+/// The card's ink: which pixels a black panel puts wax on.
+///
+/// Rec. 601 luma is the "how dark does this look" figure both reductions start
+/// from — deliberately not `image`'s own `to_luma8` (Rec. 709 weights), so a
+/// cut lands on exactly the pixels it always did.
+fn to_ink(canvas: &RgbImage, how: Reduction) -> Result<Vec<bool>, String> {
+    let (w, h) = canvas.dimensions();
+    let mut grey: Vec<u8> = canvas.pixels().map(|p| luma(p) as u8).collect();
+
+    if how == Reduction::Dither {
+        // The same bytes, told what they are: `dithr`'s buffer is a width, a
+        // height and a stride over a mutable grey slice. Error diffusion to two
+        // levels leaves nothing between ink and paper.
+        let mut buffer = dithr::gray_u8(&mut grey, w as usize, h as usize, w as usize)
+            .map_err(|e| format!("dither buffer: {e}"))?;
+        let levels =
+            dithr::QuantizeMode::gray_bits(1).map_err(|e| format!("dither levels: {e}"))?;
+        dithr::diffusion::floyd_steinberg_in_place(&mut buffer, levels)
+            .map_err(|e| format!("dither: {e}"))?;
+    }
+
+    Ok(grey.iter().map(|&v| v < 128).collect())
 }
 
 /// A 1-bit canvas as a greyscale image: pure black where the printer puts ink,
@@ -323,67 +391,83 @@ pub fn render_front_raster(original: &[u8], size: &RasterSize) -> RenderResult {
 }
 
 /// A back display image (PNG, at the display panel), at the depth the ribbon
-/// prints it in: the colour picture on a colour back, the same picture
-/// thresholded to black and white on a black panel.
+/// prints it in: the colour picture on a colour back, the same picture reduced
+/// to ink on a black panel.
 ///
 /// The preview is deliberately the depth-accurate render rather than always the
 /// colour picture: what the customer sees on the back panel is what comes out
-/// of the printer, so changing the ribbon repaints the back previews.
+/// of the printer, so changing the ribbon repaints the back previews — and a
+/// dithered back previews as the speckle it will print as, not as the smooth
+/// picture the colour panel would have made of it. The dots are not the
+/// printer's: this one is dithered at display size, where the panel-width ratio
+/// makes them ~2.4× coarser than the raster's.
 ///
-/// `placement` is the picture's own ([`Placement`]): the preview frames an
-/// uploaded picture exactly as the raster does, so the two are one picture at
-/// two sizes.
-pub fn render_back_display(
-    original: &[u8],
-    depth: BackDepth,
-    placement: Placement,
-) -> RenderResult {
-    match decode(original) {
-        Ok(img) => {
-            let canvas = place(&img, DISPLAY_WIDTH, DISPLAY_HEIGHT, placement);
-            let encoded = match depth {
-                BackDepth::Color => encode_png(&canvas),
-                BackDepth::Black => encode_gray_png(&ink_to_gray(
-                    &to_ink(&canvas),
-                    DISPLAY_WIDTH,
-                    DISPLAY_HEIGHT,
-                )),
-            };
-            match encoded {
-                Ok(bytes) => RenderResult::Ready(bytes),
-                Err(e) => RenderResult::Failed(e),
-            }
-        }
+/// `picture` is what the picture *is* ([`Picture`]) — where it lands and how it
+/// is reduced. The raster is rendered from the same one, so the two artifacts
+/// stay one picture at two sizes.
+pub fn render_back_display(original: &[u8], depth: BackDepth, picture: Picture) -> RenderResult {
+    match decode(original).and_then(|img| back_display_png(&img, depth, picture)) {
+        Ok(bytes) => RenderResult::Ready(bytes),
         Err(e) => RenderResult::Failed(e),
+    }
+}
+
+/// The display-sized artifact: the picture placed on the display panel, then the
+/// ribbon's depth applied to it.
+fn back_display_png(
+    img: &DynamicImage,
+    depth: BackDepth,
+    picture: Picture,
+) -> Result<Vec<u8>, String> {
+    let canvas = place(img, DISPLAY_WIDTH, DISPLAY_HEIGHT, picture.placement);
+    match depth {
+        BackDepth::Color => encode_png(&canvas),
+        BackDepth::Black => encode_gray_png(&ink_to_gray(
+            &to_ink(&canvas, picture.reduction)?,
+            DISPLAY_WIDTH,
+            DISPLAY_HEIGHT,
+        )),
     }
 }
 
 /// A back print raster at the printer DPI, at the depth the ribbon prints it
 /// in: a 24-bit colour BMP on a colour back, a 1-bit BMP on a black panel.
 ///
-/// Both depths take the same picture; the black one is reduced by
-/// [`to_ink`]. A picture is not what a black panel is good at, and it is not
-/// this module's business to stop anyone printing one.
+/// Both depths take the same picture; the black one is reduced to ink, by a cut
+/// or by error diffusion, as the picture says. A picture is not what a black
+/// panel is good at, and it is not this module's business to stop anyone
+/// printing one — dithering it is.
 ///
-/// `placement` decides where the picture lands on the panel — see
-/// [`Placement`], and [`render_back_display`] for the same framing at preview
-/// size.
+/// `picture` decides where it lands and how it is reduced; see [`Picture`], and
+/// [`render_back_display`] for the same at preview size.
 pub fn render_back_raster(
     original: &[u8],
     size: &RasterSize,
     depth: BackDepth,
-    placement: Placement,
+    picture: Picture,
 ) -> RenderResult {
-    match decode(original) {
-        Ok(img) => {
-            let canvas = place(&img, size.width, size.height, placement);
-            RenderResult::Ready(match depth {
-                BackDepth::Color => bmp_24(canvas.as_raw(), size.width, size.height),
-                BackDepth::Black => bmp_1(&to_ink(&canvas), size.width, size.height),
-            })
-        }
+    match decode(original).and_then(|img| back_raster_bmp(&img, size, depth, picture)) {
+        Ok(bytes) => RenderResult::Ready(bytes),
         Err(e) => RenderResult::Failed(e),
     }
+}
+
+/// The printer-sized artifact: the same two steps, at the printer's bitmap.
+fn back_raster_bmp(
+    img: &DynamicImage,
+    size: &RasterSize,
+    depth: BackDepth,
+    picture: Picture,
+) -> Result<Vec<u8>, String> {
+    let canvas = place(img, size.width, size.height, picture.placement);
+    Ok(match depth {
+        BackDepth::Color => bmp_24(canvas.as_raw(), size.width, size.height),
+        BackDepth::Black => bmp_1(
+            &to_ink(&canvas, picture.reduction)?,
+            size.width,
+            size.height,
+        ),
+    })
 }
 
 /// A markdown back, rendered by the external backend into a picture.
@@ -392,10 +476,10 @@ pub fn render_back_raster(
 /// flake's `markie`): it is handed the text on stdin and writes one PNG, which
 /// this returns as-is. The picture is *not* framed or depth-reduced here — the
 /// ordinary back path ([`render_back_display`], [`render_back_raster`]) places
-/// it at the panel's top-left and reduces it to the ribbon's depth, at
-/// [`Placement::TopLeft`] rather than by fitting it. That is what keeps the
-/// preview and the print the same picture, one scale factor apart, for a
-/// markdown back exactly as for an uploaded one.
+/// it at the panel's top-left and reduces it to the ribbon's depth, as
+/// [`Picture::DOCUMENT`]: anchored rather than fitted, and cut rather than
+/// dithered. That is what keeps the preview and the print the same picture, one
+/// scale factor apart, for a markdown back exactly as for an uploaded one.
 ///
 /// Markdown may reference pictures, and a **remote** one (`https://…`) is
 /// fetched by the backend — 10 s timeout, 10 MiB cap. So a card back can make
@@ -735,7 +819,7 @@ mod tests {
         let bytes = png_of(doc);
 
         let RenderResult::Ready(bmp) =
-            render_back_raster(&bytes, &size, BackDepth::Color, Placement::TopLeft)
+            render_back_raster(&bytes, &size, BackDepth::Color, Picture::DOCUMENT)
         else {
             panic!("raster failed")
         };
@@ -764,7 +848,7 @@ mod tests {
         // The preview is the same window, one scale factor apart: 856/400 of 600
         // document rows is 1284, of which the 540-row panel shows the top 252.
         let RenderResult::Ready(png) =
-            render_back_display(&bytes, BackDepth::Color, Placement::TopLeft)
+            render_back_display(&bytes, BackDepth::Color, Picture::DOCUMENT)
         else {
             panic!("display failed")
         };
@@ -785,6 +869,88 @@ mod tests {
         );
     }
 
+    /// A cut keeps a hard edge; error diffusion trades it for a locally correct
+    /// density of dots. That difference *is* the reason a document and a
+    /// photograph are reduced differently — so it is asserted, on a fixture
+    /// where it is a number and not an opinion.
+    #[test]
+    fn a_cut_keeps_a_hard_edge_where_a_dither_scatters_it() {
+        // Black on the left, white on the right, one step per pixel: a gradient
+        // has a mid-tone band to spend, which is what the two differ over.
+        let mut canvas = RgbImage::new(256, 8);
+        for (x, _y, p) in canvas.enumerate_pixels_mut() {
+            let v = x as u8;
+            *p = Rgb([v, v, v]);
+        }
+
+        let cut = to_ink(&canvas, Reduction::Threshold).expect("a cut");
+        let dithered = to_ink(&canvas, Reduction::Dither).expect("a dither");
+
+        // Ink-to-paper transitions per row: the cut has exactly one, at the
+        // 50% mark — that is what "crisp" means here. A dither spends the same
+        // ink on dots, so its rows cross back and forth.
+        let transitions = |ink: &[bool]| {
+            ink.chunks(256)
+                .map(|row| row.windows(2).filter(|w| w[0] != w[1]).count())
+                .sum::<usize>()
+                / 8
+        };
+        assert_eq!(transitions(&cut), 1, "a cut has one edge per row");
+        assert!(
+            transitions(&dithered) > 8,
+            "a dither scatters the transition: {}",
+            transitions(&dithered)
+        );
+
+        // Both spend the same ink overall: error diffusion moves the error into
+        // the neighbours, it does not lose it.
+        let ink_of = |ink: &[bool]| ink.iter().filter(|&&i| i).count();
+        let (a, b) = (ink_of(&cut), ink_of(&dithered));
+        let spread = (a as i32 - b as i32).abs();
+        assert!(spread < 256, "the dither keeps the tone: {a} vs {b}");
+    }
+
+    /// A mid-tone is where the two reductions part company for good: a cut has
+    /// to call the whole area paper or ink, while error diffusion spends it on
+    /// dots — and the same on every run, because the same card must print the
+    /// same card twice.
+    #[test]
+    fn a_mid_grey_band_is_dots_on_a_photograph_and_nothing_on_a_document() {
+        // Light grey: darker than the paper, lighter than mid. A cut throws it
+        // away completely, which is how a photograph becomes a silhouette.
+        let canvas = tiny_rgb(64, 64, 190);
+
+        let cut = to_ink(&canvas, Reduction::Threshold).expect("a cut");
+        assert!(cut.iter().all(|&ink| !ink), "a cut flattens it to paper");
+
+        let dithered = to_ink(&canvas, Reduction::Dither).expect("a dither");
+        assert_eq!(
+            dithered,
+            to_ink(&canvas, Reduction::Dither).expect("a dither"),
+            "the same picture dithers the same way twice"
+        );
+
+        let density = dithered.iter().filter(|&&ink| ink).count() as f64 / dithered.len() as f64;
+        assert!(
+            (0.15..0.35).contains(&density),
+            "a dither keeps the tone: {density}"
+        );
+
+        // ...and it is spread over the whole area rather than one band of it.
+        for tile_y in (0..64).step_by(16) {
+            for tile_x in (0..64).step_by(16) {
+                let tile: Vec<bool> = (tile_y..tile_y + 16)
+                    .flat_map(|y| (tile_x..tile_x + 16).map(move |x| (x, y)))
+                    .map(|(x, y)| dithered[(y * 64 + x) as usize])
+                    .collect();
+                assert!(
+                    tile.iter().any(|&ink| ink) && tile.iter().any(|&ink| !ink),
+                    "the tile at {tile_x},{tile_y} is flat"
+                );
+            }
+        }
+    }
+
     /// A black-panel back is a 1-bit raster built from the same framing, and the
     /// display preview is that same reduction — ink stays ink, paper stays paper.
     #[test]
@@ -803,21 +969,21 @@ mod tests {
         let bytes = png_of(img);
 
         let RenderResult::Ready(bmp) =
-            render_back_raster(&bytes, &size, BackDepth::Black, Placement::Fit)
+            render_back_raster(&bytes, &size, BackDepth::Black, Picture::PHOTOGRAPH)
         else {
             panic!("black raster failed")
         };
         assert_eq!(bmp[28], 1, "one bit per pixel on a black back");
         assert!(!bmp.is_empty());
 
-        let color = render_back_raster(&bytes, &size, BackDepth::Color, Placement::Fit);
+        let color = render_back_raster(&bytes, &size, BackDepth::Color, Picture::PHOTOGRAPH);
         let RenderResult::Ready(color) = color else {
             panic!("colour raster failed")
         };
         assert_eq!(color[28], 24, "a colour back stays 24-bit");
 
         let RenderResult::Ready(display) =
-            render_back_display(&bytes, BackDepth::Black, Placement::Fit)
+            render_back_display(&bytes, BackDepth::Black, Picture::PHOTOGRAPH)
         else {
             panic!("black display failed")
         };
@@ -839,7 +1005,12 @@ mod tests {
             height: 126,
         };
         assert!(matches!(
-            render_back_raster(b"not an image", &size, BackDepth::Black, Placement::Fit),
+            render_back_raster(
+                b"not an image",
+                &size,
+                BackDepth::Black,
+                Picture::PHOTOGRAPH
+            ),
             RenderResult::Failed(_)
         ));
     }

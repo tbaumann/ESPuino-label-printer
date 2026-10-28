@@ -89,10 +89,19 @@ rendered in the browser.
 
 Neither ribbon restricts a back source any more. The ribbon decides one thing,
 the colour depth the back is rendered in, and both renderers take the same
-picture: 24-bit colour on YMCKO, a 1-bit thresholded raster on YMCKOKO's second
-black panel. A picture on a black back is allowed and comes out in black and
-white; the preview is the depth-accurate render, so the pane repaints when the
-ribbon changes.
+picture: 24-bit colour on YMCKO, a 1-bit raster on YMCKOKO's second black panel.
+A picture on a black back is allowed and comes out in black and white; the
+preview is the depth-accurate render, so the pane repaints when the ribbon
+changes.
+
+How a picture becomes that 1-bit raster is `render::Reduction`, and it follows
+from what the picture is (`render::Picture`, named at the call site):
+**Floyd–Steinberg error diffusion** for a photograph — the front, an upload, a
+copy of the front — so mid-tones print as a locally correct density of dots
+instead of as flat black or flat white, and a **cut at mid-grey** for a markdown
+render, whose ink is line art and whose edges are the whole picture. Until then
+everything was cut, which turned a flat mid-grey into a solid black rectangle
+and a black-to-white ramp into a hard split with no grey step surviving.
 
 Consequences worth keeping: switching ribbon is lossless and re-renders only
 the derived artifacts (`PATCH /api/prefixes/{prefix}`), `Ribbon::allows_back`,

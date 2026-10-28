@@ -217,6 +217,29 @@ picture on YMCKOKO's second black panel comes out black and white rather than
 being refused — a poor choice, and the customer's to make, which the editor says
 where the choice is made.
 
+Black and white is not one operation but two, and which one a back gets follows
+from what the back *is* (`render::Picture`):
+
+- A **photograph** — the front, a second uploaded picture, a copy of the front —
+  is **dithered** (Floyd–Steinberg error diffusion). A black panel has no grey,
+  so every mid-tone has to be spent somewhere: diffused into the neighbouring
+  pixels it prints as a locally correct density of dots, and the picture
+  survives as texture. Cut at mid-grey instead, everything darker than 50%
+  prints as a flat black shape and everything lighter as flat white: a ramp
+  keeps *none* of its 256 steps, and the test card (a flat mid-grey) prints as a
+  solid black rectangle.
+- A **document** — a markdown render — is **cut** at mid-grey. Its ink is line
+  art: the edge *is* the image, and stippling a glyph's anti-aliased edge trades
+  a crisp letter for one at the mercy of the printer's dot gain. (Measured at
+  600 dpi, a dither would move only ~2% of a text back's pixels and make no
+  isolated dots — so this is a choice about the edge, not a cliff: a cut also
+  fattens anti-aliased glyphs by ~28% in ink, printing them a little bolder than
+  they were laid out.)
+
+Both are the same code path and the same artifacts — the preview pane is
+dithered or cut exactly as the print is, so a black-panel back previews as the
+speckle it will print as.
+
 The drop zone uploads **fronts** — one file, one card — so a new card is
 single-sided, and one with an `image` back starts without its picture. The page
 badge says how many cards are still missing their back material, and the Pay

@@ -270,6 +270,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "dithr",
  "hmac",
  "image",
  "reqwest",
@@ -537,6 +538,12 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "dithr"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c410c12fa41e1c0efa5d310928475586c804c9916cb4e701b652c3d16571a6c1"
 
 [[package]]
 name = "dotenvy"

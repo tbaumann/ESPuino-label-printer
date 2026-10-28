@@ -363,12 +363,13 @@ async fn rerender_card(
     // picture on a black panel is reduced to black and white rather than
     // refused; the choice is the customer's.
     let depth = ribbon.back_depth();
-    // Where a back's picture lands on the panel: a rendered document is anchored
-    // at the panel's top-left, everything else is framed to fit it. The rule is
-    // stated once here rather than per arm — see `render::Placement`.
-    let placement = match card.back {
-        BackSource::Markdown => render::Placement::TopLeft,
-        BackSource::None | BackSource::Front | BackSource::Image => render::Placement::Fit,
+    // What each back source *is*, to the panel: a photograph (framed whole, and
+    // dithered on a black panel) or a document (anchored at the panel's
+    // top-left, and cut rather than dithered, because its ink is line art). The
+    // rule is stated once here rather than per arm — see `render::Picture`.
+    let picture = match card.back {
+        BackSource::Markdown => render::Picture::DOCUMENT,
+        BackSource::None | BackSource::Front | BackSource::Image => render::Picture::PHOTOGRAPH,
     };
     let (back_display, back_raster) = match card.back {
         // A single-sided card: no back side exists, so there is nothing to
@@ -378,20 +379,16 @@ async fn rerender_card(
         // original and it needs no upload of its own.
         BackSource::Front => match front_original.as_deref() {
             Some(orig) => (
-                Some(back_display(st, prefix, id, orig, depth, placement)?),
-                Some(back_raster(
-                    st, prefix, id, orig, &raster, depth, placement,
-                )?),
+                Some(back_display(st, prefix, id, orig, depth, picture)?),
+                Some(back_raster(st, prefix, id, orig, &raster, depth, picture)?),
             ),
             // The front failed to render above; nothing to derive a back from.
             None => (None, None),
         },
         BackSource::Image => match back_original.as_deref() {
             Some(orig) => (
-                Some(back_display(st, prefix, id, orig, depth, placement)?),
-                Some(back_raster(
-                    st, prefix, id, orig, &raster, depth, placement,
-                )?),
+                Some(back_display(st, prefix, id, orig, depth, picture)?),
+                Some(back_raster(st, prefix, id, orig, &raster, depth, picture)?),
             ),
             // Not uploaded yet: the card is incomplete rather than having an
             // empty back silently substituted.
@@ -400,15 +397,17 @@ async fn rerender_card(
         // Markdown is just another back *source*: the backend renders the text
         // into a picture, and everything after that is the ordinary back path —
         // the same depth reduction, the same artifacts at both sizes. What
-        // differs is where the picture lands: anchored at the panel's top-left
-        // at the card's own width, so the text keeps its size and a list that
-        // outruns the card is cut at its edge instead of shrunk to fit.
+        // differs is what the picture *is* (a document, not a photograph): it is
+        // anchored at the panel's top-left at the card's own width rather than
+        // fitted, so the text keeps its size and a list that outruns the card is
+        // cut at its edge instead of shrunk to fit — and it is cut rather than
+        // dithered, because its ink is line art.
         BackSource::Markdown => match card.back_text.as_deref().filter(|t| !t.trim().is_empty()) {
             Some(text) => match st.markdown.render(text, &raster) {
-                RenderResult::Ready(picture) => (
-                    Some(back_display(st, prefix, id, &picture, depth, placement)?),
+                RenderResult::Ready(rendered) => (
+                    Some(back_display(st, prefix, id, &rendered, depth, picture)?),
                     Some(back_raster(
-                        st, prefix, id, &picture, &raster, depth, placement,
+                        st, prefix, id, &rendered, &raster, depth, picture,
                     )?),
                 ),
                 // No picture at all: the backend is missing, or it refused the
@@ -437,20 +436,20 @@ async fn rerender_card(
 /// Render a back display image from `original`, write it and report. The
 /// preview is the depth-accurate render: on a black panel it is the same
 /// black-and-white reduction the raster is built from, so what the row shows is
-/// what the printer puts on the card. `placement` is the picture's own — see
-/// [`render::Placement`].
+/// what the printer puts on the card. `picture` is what the picture is, to the
+/// panel — see [`render::Picture`].
 fn back_display(
     st: &AppState,
     prefix: Uuid,
     id: i64,
     original: &[u8],
     depth: crate::models::BackDepth,
-    placement: render::Placement,
+    picture: render::Picture,
 ) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
     use crate::models::RenderStatus;
     use crate::render::RenderResult;
     Ok(
-        match render::render_back_display(original, depth, placement) {
+        match render::render_back_display(original, depth, picture) {
             RenderResult::Ready(bytes) => {
                 write_blob(
                     &st.data_dir,
@@ -468,8 +467,9 @@ fn back_display(
 /// Render a back print raster from `original`, write it and report. `size` is
 /// the printer's internal bitmap; `depth` is the ribbon's, which decides the
 /// format — a 24-bit colour BMP, or a 1-bit one for the second black panel.
-/// `placement` is the picture's own, and must be the one the preview was made
-/// with or the pane would show a framing the print does not have.
+/// `picture` is what the picture is, to the panel, and must be the one the
+/// preview was made with or the pane would show a framing and a reduction the
+/// print does not have.
 fn back_raster(
     st: &AppState,
     prefix: Uuid,
@@ -477,12 +477,12 @@ fn back_raster(
     original: &[u8],
     size: &crate::render::RasterSize,
     depth: crate::models::BackDepth,
-    placement: render::Placement,
+    picture: render::Picture,
 ) -> Result<(crate::models::RenderStatus, Option<String>), ApiError> {
     use crate::models::RenderStatus;
     use crate::render::RenderResult;
     Ok(
-        match render::render_back_raster(original, size, depth, placement) {
+        match render::render_back_raster(original, size, depth, picture) {
             RenderResult::Ready(bytes) => {
                 write_blob(
                     &st.data_dir,

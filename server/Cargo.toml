@@ -44,3 +44,9 @@ image = { version = "0.25", default-features = false, features = [
   "gif",
   "webp",
 ] }
+# Error diffusion for the black panel: a photograph has mid-tones and a 1-bit
+# panel has none, so a threshold turns it into a silhouette and a dither turns it
+# into texture. `dithr` supplies the classic kernels (Floyd-Steinberg among
+# them) over a byte buffer; its `image` feature is off because it builds `image`
+# 0.24, a second copy of the crate this one already carries.
+dithr = { version = "0.3", default-features = false, features = ["std"] }
