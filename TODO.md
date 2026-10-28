@@ -65,9 +65,11 @@ rendered in the browser.
   …`) because nothing on the card says the artwork went missing. Blocking or
   rewriting remote references is an open decision; nothing blocks them today.
 - **Fonts are the runtime's, not the package's.** The backend renders with the
-  fonts it can find (`/etc/fonts`, plus `./fonts`) and refuses to start without
-  any, so a fontconfig host is fine and the OCI image is not: a markdown back
-  there fails with "No usable fonts found" until a font is wired into the image.
+  fonts it can find (fontdb reading fontconfig's config, plus a `fonts` directory
+  beside its working directory) and refuses to start without any. A fontconfig
+  host therefore needs nothing, and the OCI image carries its own
+  `/etc/fonts/fonts.conf` naming the DejaVu it ships (`oci.nix`), so a markdown
+  back renders there too.
 - The back-text editor **is WYSIWYG** (`web/src/lib/cards/MarkdownEditor.svelte`,
   Tiptap v3): its value in and out is the markdown itself, its toolbar applies
   the constructs, and its schema carries everything a back can hold — the starter

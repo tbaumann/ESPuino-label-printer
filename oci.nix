@@ -13,6 +13,37 @@
     let
       # packages.card-printer-server is the crate binary with the SPA baked in.
       server = self'.packages.card-printer-server;
+
+      # A `markdown` back is laid out by markie, which renders with the fonts it
+      # finds and refuses to start when it finds none. Its only reader is
+      # fontdb's pure-Rust fontconfig parser (nothing here links libfontconfig),
+      # so this one file is the whole runtime contract: /etc/fonts/fonts.conf is
+      # where it looks when FONTCONFIG_FILE is unset, and the image root is a
+      # buildEnv that links each dependency's /etc. The <dir> store path is a
+      # reference of this derivation, so the font rides into the image with it.
+      #
+      # The aliases pin the generic families markie asks for to faces that
+      # exist: fontdb takes only the FIRST <prefer> of an <alias>, and the first
+      # one in fontconfig's own conf.d names a family this image does not carry.
+      fontsConf = pkgs.writeTextDir "etc/fonts/fonts.conf" ''
+        <?xml version="1.0"?>
+        <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+        <fontconfig>
+          <dir>${pkgs.dejavu_fonts}/share/fonts</dir>
+          <alias>
+            <family>sans-serif</family>
+            <prefer><family>DejaVu Sans</family></prefer>
+          </alias>
+          <alias>
+            <family>serif</family>
+            <prefer><family>DejaVu Serif</family></prefer>
+          </alias>
+          <alias>
+            <family>monospace</family>
+            <prefer><family>DejaVu Sans Mono</family></prefer>
+          </alias>
+        </fontconfig>
+      '';
     in
     {
       oci.containers.card-printer-server = {
@@ -30,7 +61,11 @@
         user = "card-printer";
         ports = [ "8080:8080" ];
         # cacert: the server verifies TLS when it talks to Stripe.
-        dependencies = [ pkgs.cacert ];
+        # fontsConf: /etc/fonts/fonts.conf + the font it names, for `markdown`.
+        dependencies = [
+          pkgs.cacert
+          fontsConf
+        ];
         environment = {
           DATA_DIR = "/data";
           BIND_ADDR = "0.0.0.0:8080";
