@@ -35,7 +35,7 @@
 //! # Colour depth
 //!
 //! The ribbon fixes the back's depth ([`crate::models::Ribbon::back_depth`]):
-//! YMCKO's back is a colour panel set (24-bit raster), YMCKOKO's is the second
+//! YMCKO's back is a colour panel set (24-bit raster), YMCKOK's is the second
 //! black panel (1-bit raster). Both accept every back source, and a black panel
 //! needs the picture *reduced* to ink — a plain cut at mid-grey for line art, or
 //! Floyd–Steinberg error diffusion for a photograph, which is [`Reduction`] and

@@ -228,7 +228,7 @@ impl Stripe {
     /// item quantity — and `price_cents` the price of one of them. What a unit
     /// *is* differs per ribbon, so `unit` names it for the line item: one
     /// printed side on YMCKO (which is what lets such an order mix single- and
-    /// double-sided cards), or one whole card on YMCKOKO (whose panel set is
+    /// double-sided cards), or one whole card on YMCKOK (whose panel set is
     /// spent whether or not the second black panel is used).
     pub async fn create_checkout_session(
         &self,
@@ -278,8 +278,8 @@ impl Stripe {
         form.push((
             "line_items[0][price_data][product_data][name]".into(),
             // The unit is named, not assumed: "printed side" on YMCKO, "card"
-            // on YMCKOKO. A receipt reading "printed side × 2" for a one-card
-            // YMCKOKO order would be a lie about what was bought.
+            // on YMCKOK. A receipt reading "printed side × 2" for a one-card
+            // YMCKOK order would be a lie about what was bought.
             format!("RFID/NFC card label ({unit})"),
         ));
 

@@ -213,7 +213,7 @@ chooser under it is right there.
 
 Everything but `none` makes the card double-sided. All four sources are on offer
 on either ribbon: the ribbon is not a permission, only a rendering choice. A
-picture on YMCKOKO's second black panel comes out black and white rather than
+picture on YMCKOK's second black panel comes out black and white rather than
 being refused — a poor choice, and the customer's to make, which the editor says
 where the choice is made.
 
@@ -388,7 +388,7 @@ line.
 5. set the prices: `ribbon_prices` holds one price per ribbon (seeded at 500
    cents each), alongside `STRIPE_SHIPPING_CENTS` and `STRIPE_CURRENCY`. The
    unit differs per ribbon — a printed side on YMCKO (a card costs one or two of
-   them), a whole card on YMCKOKO — and `Ribbon::billing_unit` is what says so.
+   them), a whole card on YMCKOK — and `Ribbon::billing_unit` is what says so.
    Taking a ribbon out of stock is the same kind of database state
    (`ribbon_stock`, both ribbons seeded in stock), flipped through
    `PUT /api/shop/ribbons/{ribbon}` with the operator token;
@@ -521,7 +521,7 @@ data/
   never part of the public prefix JSON, whose uuid is the customer's only
   credential. Empty until the payment settles, and on a checkout that collected
   no address.
-- **Ribbons** — `ymcko` (colour front and a full-colour back) and `ymckoko`
+- **Ribbons** — `ymcko` (colour front and a full-colour back) and `ymckok`
   (colour front, black-and-white back; the **default**). The one choice per
   *job*, because a batch cannot mix ribbon loads. Set at prefix creation or via
   `PATCH /api/prefixes/{prefix}` while the prefix is still writable. The switch
@@ -537,14 +537,14 @@ data/
   500 cents each), not the environment, and the *unit* that price is for differs
   per ribbon (`unit` in the shop config, `Ribbon::billing_unit`): YMCKO prices a
   printed *side* (one for a single-sided card, two for a double-sided one),
-  YMCKOKO prices a whole *card* whatever its back is, because its panel set is
+  YMCKOK prices a whole *card* whatever its back is, because its panel set is
   spent whether or not the second black panel is used. `Ribbon::billed_units`
   applies the rule at the checkout. The charge is settled there, when the
   checkout session opens; what a job is later produced on is the prefix's
   `ribbon` and nothing else, so an operator changing it is making a production
   decision, not a repricing.
 - **Ribbon availability** — two stock flags in the database (`ribbon_stock`,
-  `ymcko` and `ymckoko`, both seeded in stock), flipped through
+  `ymcko` and `ymckok`, both seeded in stock), flipped through
   `PUT /api/shop/ribbons/{ribbon}`. The shop config serves both flags and, per
   ribbon, the derived `available`; the customer UI renders an unavailable ribbon
   **disabled rather than absent**, and the checkout refuses it with `409` — a
@@ -707,7 +707,7 @@ an admin session.
 | GET    | `/api/prefixes/{prefix}/cards/{id}/print-raster/back` | back print raster (24-bit, or 1-bit on a black panel) |
 | GET    | `/api/prefixes/{prefix}/shipping`      | where the order ships, as Stripe collected it **(admin)** |
 | GET    | `/api/shop/config`                     | prices, currency, ribbon stock, shipping and countries |
-| PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckoko` **(admin)** |
+| PUT    | `/api/shop/ribbons/{ribbon}`           | set a ribbon's stock flag, `ymcko` or `ymckok` **(admin)** |
 | PUT    | `/api/shop/ribbons/{ribbon}/price`     | set a ribbon's price, in minor units, for its own unit **(admin)** |
 | POST   | `/api/prefixes/{prefix}/checkout`      | open a Stripe Checkout session (draft or payment_pending only) |
 | POST   | `/api/webhooks/stripe`                 | Stripe's payment callback (signature-authenticated) |

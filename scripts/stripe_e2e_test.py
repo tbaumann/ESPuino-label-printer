@@ -54,7 +54,7 @@ PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", BASE)
 # itself, so the expectation is a constant rather than the server's environment.
 CUSTOMER_EMAIL = "ada@example.test"
 # What section 3's order costs, and therefore what Stripe reports back and the
-# order confirmation states: two cards on the default YMCKOKO ribbon — that
+# order confirmation states: two cards on the default YMCKOK ribbon — that
 # ribbon prices a whole card, so that is two units, not four printed sides —
 # plus the flat shipping. Derived once so the amount assertions cannot drift
 # from the session they describe.
@@ -182,7 +182,7 @@ def payment_event(
             obj["metadata"] = {"prefix": prefix}
         else:
             obj["client_reference_id"] = prefix
-    # What section 3's session is priced at — two cards on the default YMCKOKO
+    # What section 3's session is priced at — two cards on the default YMCKOK
     # ribbon is two *cards* (that ribbon prices per card), plus shipping. Stripe
     # always reports both the amount and the currency, and the order confirmation
     # states the amount.
@@ -281,18 +281,18 @@ check("currency is eur", config.get("currency") == "eur", str(config.get("curren
 prices = {p.get("ribbon"): p.get("price_cents") for p in config.get("prices", [])}
 check(
     "one price per ribbon, the price of one billing unit",
-    set(prices) == {"ymcko", "ymckoko"},
+    set(prices) == {"ymcko", "ymckok"},
     str(prices),
 )
 check(
     "one card/printed side on the default ribbon is 500",
-    prices.get("ymckoko") == 500,
+    prices.get("ymckok") == 500,
     str(prices),
 )
 units = {p.get("ribbon"): p.get("unit") for p in config.get("prices", [])}
 check(
-    "each price says what its unit is: a side on YMCKO, a card on YMCKOKO",
-    units == {"ymcko": "side", "ymckoko": "card"},
+    "each price says what its unit is: a side on YMCKO, a card on YMCKOK",
+    units == {"ymcko": "side", "ymckok": "card"},
     str(units),
 )
 check("shipping is 250", config.get("shipping_cents") == 250, str(config.get("shipping_cents")))
@@ -397,7 +397,7 @@ else:
         field("metadata[prefix]") == prefix,
         str(field("metadata[prefix]")),
     )
-    # Two cards on the default YMCKOKO ribbon. That ribbon prices a whole card,
+    # Two cards on the default YMCKOK ribbon. That ribbon prices a whole card,
     # so the order is two units however its backs are filled in — one per card,
     # not two per card as the old always-two rule charged.
     check(
@@ -467,7 +467,7 @@ else:
 # --- 3b. the other ribbon prices per side ----------------------------------
 # Same price entry, applied differently: YMCKO's unit is one printed side, so a
 # single double-sided card is two units at the same 500 — the reverse of the
-# YMCKOKO case above, where two cards are two units.
+# YMCKOK case above, where two cards are two units.
 print("\n3b. a YMCKO order prices per printed side")
 if os.path.exists(MOCK_OUT):
     os.truncate(MOCK_OUT, 0)
@@ -657,8 +657,8 @@ else:
     ops = {"authorization": f"Bearer {ops_token}"}
     queue = json_request("GET", f"/api/prefixes/{prefix}/print-queue", headers=ops)[1]
     check(
-        "the paid order prints on the ribbon it was created with — ymckoko",
-        queue.get("ribbon") == "ymckoko",
+        "the paid order prints on the ribbon it was created with — ymckok",
+        queue.get("ribbon") == "ymckok",
         str(queue.get("ribbon")),
     )
     check(

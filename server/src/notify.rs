@@ -633,7 +633,7 @@ pub(crate) mod tests {
             card_count: 3,
             amount_cents: Some(1750),
             currency: Some("eur".into()),
-            ribbon: Some(Ribbon::Ymckoko),
+            ribbon: Some(Ribbon::Ymckok),
             customer_email: Some("ada@example.test".into()),
             customer_name: Some("Ada Lovelace".into()),
         }
@@ -674,7 +674,7 @@ pub(crate) mod tests {
             .unwrap()
             .contains("ada@example.test"));
         assert!(
-            operator["text"].as_str().unwrap().contains("ymckoko"),
+            operator["text"].as_str().unwrap().contains("ymckok"),
             "the operator is told which ribbon to load"
         );
     }

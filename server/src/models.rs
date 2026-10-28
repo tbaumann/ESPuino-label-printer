@@ -154,7 +154,7 @@ impl std::fmt::Display for BackSource {
 /// The ribbon-pass scheme a job is printed with.
 ///
 /// This is the one choice a user makes per *job*, and the only thing that cannot
-/// be mixed in one batch: a YMCKO job and a YMCKOKO job are different ribbon
+/// be mixed in one batch: a YMCKO job and a YMCKOK job are different ribbon
 /// loads, so they are different orders. Everything else about a card (single or
 /// double sided, and what the back is made of) is a per-card choice, carried by
 /// [`BackSource`].
@@ -169,28 +169,28 @@ pub enum Ribbon {
     Ymcko,
     /// YMCKO plus a second black panel for the back side. The back is 1-bit
     /// black whatever it is made of.
-    Ymckoko,
+    Ymckok,
 }
 
 impl Ribbon {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ymcko => "ymcko",
-            Self::Ymckoko => "ymckoko",
+            Self::Ymckok => "ymckok",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "ymcko" => Self::Ymcko,
-            "ymckoko" => Self::Ymckoko,
+            "ymckok" => Self::Ymckok,
             _ => return None,
         })
     }
 
     /// The colour depth a back side is rendered in. A consequence of the ribbon,
     /// never a separate choice — the same back is a 24-bit raster on YMCKO and a
-    /// 1-bit one on YMCKOKO.
+    /// 1-bit one on YMCKOK.
     ///
     /// Every back source is allowed on either ribbon. What the ribbon changes is
     /// only how the print data is generated; a picture on the second black panel
@@ -198,17 +198,17 @@ impl Ribbon {
     pub fn back_depth(self) -> BackDepth {
         match self {
             Self::Ymcko => BackDepth::Color,
-            Self::Ymckoko => BackDepth::Black,
+            Self::Ymckok => BackDepth::Black,
         }
     }
 
     /// What one unit of this ribbon's price *is*, for the customer-facing price
     /// display and the Stripe line item: one printed side (YMCKO) or one whole
-    /// card (YMCKOKO).
+    /// card (YMCKOK).
     pub fn billing_unit(self) -> &'static str {
         match self {
             Self::Ymcko => "side",
-            Self::Ymckoko => "card",
+            Self::Ymckok => "card",
         }
     }
 
@@ -217,13 +217,13 @@ impl Ribbon {
     /// The unit differs per ribbon ([`Self::billing_unit`]), so this is the
     /// multiplier applied to that ribbon's own price — not a count of panels.
     /// YMCKO bills per printed side: a single-sided card is one, a double-sided
-    /// one two. YMCKOKO bills per *card*, whatever its back: its panel set is
+    /// one two. YMCKOK bills per *card*, whatever its back: its panel set is
     /// spent whether or not the second black panel is used, so there is nothing
     /// for a blank back to save.
     pub fn billed_units(self, back: BackSource) -> i64 {
         match self {
             Self::Ymcko => 1 + i64::from(back.is_double_sided()),
-            Self::Ymckoko => 1,
+            Self::Ymckok => 1,
         }
     }
 }
@@ -240,7 +240,7 @@ impl std::fmt::Display for Ribbon {
 pub enum BackDepth {
     /// 24-bit colour — YMCKO's back panel set.
     Color,
-    /// 1-bit black — YMCKOKO's second K panel.
+    /// 1-bit black — YMCKOK's second K panel.
     Black,
 }
 
@@ -254,7 +254,7 @@ pub struct Prefix {
     pub status_changed_at: Option<String>,
     /// The ribbon this order is printed with — the one choice that has to be
     /// made per job, because a batch cannot mix ribbon loads. Defaults to
-    /// `ymckoko`. Changing it re-renders the cards' back sides; it is the only
+    /// `ymckok`. Changing it re-renders the cards' back sides; it is the only
     /// thing that decides what the printer is fed.
     pub ribbon: Ribbon,
     /// External shop/order reference, typically set when the order is paid.
@@ -497,7 +497,7 @@ pub struct CardInput {
 pub struct PrefixInput {
     pub uuid: Option<Uuid>,
     /// The ribbon this job is printed with. Omitted (or null) means the default
-    /// `ymckoko`.
+    /// `ymckok`.
     pub ribbon: Option<Ribbon>,
 }
 
@@ -566,7 +566,7 @@ pub struct RibbonPrice {
     /// Price of one billing unit on this ribbon, in the currency's minor unit
     /// (cents). What that unit is differs per ribbon ([`Ribbon::billing_unit`]):
     /// one printed side on YMCKO — a card costs [`Ribbon::billed_units`] of them
-    /// — or one whole card on YMCKOKO, whatever the card's back is.
+    /// — or one whole card on YMCKOK, whatever the card's back is.
     pub price_cents: i64,
     /// The unit `price_cents` is for: `side` or `card`. Served so the price can
     /// be shown honestly ("€2.50 per card") instead of the UI guessing.

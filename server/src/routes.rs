@@ -359,7 +359,7 @@ async fn rerender_card(
 
     // Back side, from the card's own choice. The *ribbon* decides the colour
     // depth every back source is rendered in — 24-bit colour on YMCKO, 1-bit
-    // black on YMCKOKO — and nothing else about the back depends on it. A
+    // black on YMCKOK — and nothing else about the back depends on it. A
     // picture on a black panel is reduced to black and white rather than
     // refused; the choice is the customer's.
     let depth = ribbon.back_depth();
@@ -1533,7 +1533,7 @@ pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>,
 /// immediately reports those modes as unavailable. YMCKO covers both
 /// single-sided and double-sided colour, so one flag moves both.
 #[utoipa::path(put, path = "/api/shop/ribbons/{ribbon}", tag = "shop",
-    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckoko")),
+    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckok")),
     request_body = RibbonStockPatch,
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
@@ -1575,7 +1575,7 @@ const MAX_PRICE_CENTS: i64 = 100_000;
 /// open was priced when it was created, and the operator changing the price
 /// does not re-price it.
 #[utoipa::path(put, path = "/api/shop/ribbons/{ribbon}/price", tag = "shop",
-    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckoko")),
+    params(("ribbon" = String, Path, description = "ribbon: ymcko or ymckok")),
     request_body = RibbonPricePatch,
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
@@ -1723,7 +1723,7 @@ pub async fn create_checkout(
     // checkout rather than pricing at zero.
     let price_cents = db::ribbon_price(&st.pool, p.ribbon).await?;
     // How many units this order actually costs, which is what is charged: one
-    // per printed side on YMCKO, one per card whatever its back is on YMCKOKO —
+    // per printed side on YMCKO, one per card whatever its back is on YMCKOK —
     // the two ribbons price the same order differently.
     let units = db::billed_units(&st.pool, prefix, p.ribbon).await?;
 
@@ -2727,10 +2727,10 @@ mod tests {
         assert!(matches!(err, ApiError::Conflict(_)), "got {err:?}");
         assert!(err.to_string().contains("ymcko"), "{err}");
 
-        // The other ribbon is untouched, so a YMCKOKO job still sells.
-        ensure_ribbon_orderable(&pool, Ribbon::Ymckoko)
+        // The other ribbon is untouched, so a YMCKOK job still sells.
+        ensure_ribbon_orderable(&pool, Ribbon::Ymckok)
             .await
-            .expect("YMCKOKO is still in stock");
+            .expect("YMCKOK is still in stock");
 
         // Restocking reopens the sale, with no state to reset.
         db::set_ribbon_stock(&pool, Ribbon::Ymcko, true)
@@ -2747,13 +2747,13 @@ mod tests {
 
         // The ribbon has no vote: a picture back is accepted on the black-panel
         // ribbon too, and reduced to black when it is rendered.
-        let black = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+        let black = db::create_prefix(&pool, None, Some(Ribbon::Ymckok))
             .await
             .unwrap();
         insert_card(&pool, black.uuid, 1, BackSource::None).await;
         ensure_back_image_writable(&pool, black.uuid, 1, false)
             .await
-            .expect("a picture back on a YMCKOKO card");
+            .expect("a picture back on a YMCKOK card");
 
         // ...but there must be a card to attach it to.
         let colour = db::create_prefix(&pool, None, Some(Ribbon::Ymcko))
@@ -2890,7 +2890,7 @@ mod tests {
     #[tokio::test]
     async fn shop_config_serves_both_stock_flags_and_derives_availability() {
         let pool = test_pool().await;
-        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymckoko, false)
+        db::set_ribbon_stock(&pool, crate::models::Ribbon::Ymckok, false)
             .await
             .unwrap();
         let Json(config) = shop_config(State(state_with(
@@ -2909,7 +2909,7 @@ mod tests {
         assert!(config
             .ribbons
             .iter()
-            .any(|r| r.ribbon == crate::models::Ribbon::Ymckoko && !r.in_stock));
+            .any(|r| r.ribbon == crate::models::Ribbon::Ymckok && !r.in_stock));
 
         // Every ribbon is still offered — an out-of-stock one is disabled in
         // the UI, never dropped from the list.
@@ -2917,7 +2917,7 @@ mod tests {
         assert!(config
             .prices
             .iter()
-            .all(|p| p.available == (p.ribbon != Ribbon::Ymckoko)));
+            .all(|p| p.available == (p.ribbon != Ribbon::Ymckok)));
     }
 
     #[tokio::test]
@@ -2965,7 +2965,7 @@ mod tests {
         let bad = put_ribbon_stock(
             State(st.clone()),
             headers.clone(),
-            Path("ymckokok".to_string()),
+            Path("ymckokk".to_string()),
             Json(crate::models::RibbonStockPatch { in_stock: false }),
         )
         .await
@@ -3015,7 +3015,7 @@ mod tests {
 
         // Unknown ribbon, and a price that is really a euro figure typed as
         // cents, are both refused before anything is written.
-        for (ribbon, price) in [("ymckokok", 500), ("ymcko", -1), ("ymcko", 999_999)] {
+        for (ribbon, price) in [("ymckokk", 500), ("ymcko", -1), ("ymcko", 999_999)] {
             let bad = put_ribbon_price(
                 State(st.clone()),
                 headers.clone(),
@@ -3038,17 +3038,17 @@ mod tests {
         let Json(updated) = put_ribbon_price(
             State(st),
             headers,
-            Path("ymckoko".to_string()),
+            Path("ymckok".to_string()),
             Json(RibbonPricePatch { price_cents: 720 }),
         )
         .await
         .expect("operator sets a price");
-        assert_eq!(updated.ribbon, crate::models::Ribbon::Ymckoko);
+        assert_eq!(updated.ribbon, crate::models::Ribbon::Ymckok);
         assert_eq!(updated.price_cents, 720);
         assert_eq!(updated.unit, "card");
         assert!(updated.available);
         assert_eq!(
-            db::ribbon_price(&pool, crate::models::Ribbon::Ymckoko)
+            db::ribbon_price(&pool, crate::models::Ribbon::Ymckok)
                 .await
                 .unwrap(),
             720
@@ -3469,14 +3469,14 @@ mod tests {
 
         // A ribbon switch: the rasters are re-rendered, and the queue reports
         // the same thing the raster is.
-        let updated = db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymckoko)
+        let updated = db::set_prefix_ribbon(&st.pool, prefix, Ribbon::Ymckok)
             .await
             .unwrap();
-        assert_eq!(updated.ribbon, Ribbon::Ymckoko);
+        assert_eq!(updated.ribbon, Ribbon::Ymckok);
         rerender_card(&st, prefix, 1).await.unwrap();
         assert_eq!(back_raster_bits(&dir, prefix), 1, "re-rendered in 1 bit");
         let queue = db::print_queue(&st.pool, prefix).await.unwrap();
-        assert_eq!(queue.ribbon, Ribbon::Ymckoko);
+        assert_eq!(queue.ribbon, Ribbon::Ymckok);
         assert_eq!(queue.cards[0].back, crate::models::BackAvailability::Black);
 
         // And back again, so the depth is a function of `ribbon` and nothing
@@ -3530,7 +3530,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("esplp-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let pool = test_pool().await;
-        let p = db::create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+        let p = db::create_prefix(&pool, None, Some(Ribbon::Ymckok))
             .await
             .unwrap();
 

@@ -40,7 +40,7 @@
   // A ribbon's price is the price of one *billing unit*, and the two ribbons
   // price the same order differently: YMCKO's unit is one printed side (so the
   // count is the sum over the cards, because a batch may mix single- and
-  // double-sided ones), YMCKOKO's is one whole card (its panel set is spent
+  // double-sided ones), YMCKOK's is one whole card (its panel set is spent
   // whether or not the second black panel is used). That rule is `billedUnits`,
   // mirroring the server's.
   const units = $derived(

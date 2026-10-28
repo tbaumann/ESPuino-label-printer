@@ -414,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ribbon",
         default=None,
-        help="ribbon to filter on in --batch mode (ymcko|ymckoko); "
+        help="ribbon to filter on in --batch mode (ymcko|ymckok); "
         "defaults to the ribbon loaded in the printer",
     )
     p.add_argument(

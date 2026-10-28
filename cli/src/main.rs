@@ -65,7 +65,7 @@ enum PrefixCmd {
         #[arg(long)]
         uuid: Option<String>,
         /// The ribbon this job prints with — the one choice per job, because a
-        /// batch cannot mix ribbon loads (ymcko|ymckoko).
+        /// batch cannot mix ribbon loads (ymcko|ymckok).
         #[arg(long, value_name = "RIBBON")]
         ribbon: Option<String>,
     },

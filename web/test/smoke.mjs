@@ -414,9 +414,9 @@ console.log('\nB. project page renders a card')
     })
     check('the queue reports the black back', queue.cards[0]?.back === 'black',
       JSON.stringify(queue.cards[0]))
-    check('the queue reports the ribbon to load', queue.ribbon === 'ymckoko',
+    check('the queue reports the ribbon to load', queue.ribbon === 'ymckok',
       String(queue.ribbon))
-    check('a YMCKOKO card is billed as one card, whatever its back',
+    check('a YMCKOK card is billed as one card, whatever its back',
       queue.cards[0]?.billed_units === 1, String(queue.cards[0]?.billed_units))
   }
 
@@ -630,7 +630,7 @@ console.log('\nG. pay button')
       text.slice(0, 160),
     )
     check('there is no submit button', !/Submit/.test(text), text.slice(0, 200))
-    // The default ribbon is YMCKOKO, whose price is per *card*: one card at 500
+    // The default ribbon is YMCKOK, whose price is per *card*: one card at 500
     // + 250 shipping = 750 minor units. Charging it as two printed sides (as the
     // old always-two rule did) would double it. Match the digits, not the
     // currency formatting, which depends on the host locale.
@@ -680,7 +680,7 @@ console.log('\nH. ribbon availability: disabled, not absent')
   const availability = Object.fromEntries(config.prices.map((p) => [p.ribbon, p.available]))
   check('the cleared ribbon is out of stock', availability.ymcko === false,
     JSON.stringify(availability))
-  check('the other ribbon is untouched', availability.ymckoko === true,
+  check('the other ribbon is untouched', availability.ymckok === true,
     JSON.stringify(availability))
   check('one price row per ribbon', config.prices?.length === 2,
     JSON.stringify(config.prices))
@@ -714,7 +714,7 @@ console.log('\nH. ribbon availability: disabled, not absent')
   check('an out-of-stock ribbon is rendered disabled',
     byRibbon('ymcko')?.querySelector('input')?.disabled === true)
   check('the in-stock ribbon is selectable',
-    byRibbon('ymckoko')?.querySelector('input')?.disabled === false)
+    byRibbon('ymckok')?.querySelector('input')?.disabled === false)
   check('the disabled option says it is out of stock',
     /out of stock/i.test(byRibbon('ymcko')?.textContent ?? ''))
   check('the unavailable option is marked, not hidden',
@@ -739,7 +739,7 @@ console.log('\nH. ribbon availability: disabled, not absent')
   }
 
   // Switching to an available ribbon goes through the real PATCH route.
-  const pick = byRibbon('ymckoko').querySelector('input')
+  const pick = byRibbon('ymckok').querySelector('input')
   pick.checked = true
   pick.dispatchEvent(new w.Event('change', { bubbles: true }))
   await settle(900)
@@ -747,7 +747,7 @@ console.log('\nH. ribbon availability: disabled, not absent')
     seen.some((r) => r.method === 'PATCH' && r.url.includes(`/api/prefixes/${prefix}`)),
     JSON.stringify(seen.slice(-3)))
   const after = await api(`/api/prefixes/${prefix}`)
-  check('the ribbon change took effect', after.ribbon === 'ymckoko', after.ribbon)
+  check('the ribbon change took effect', after.ribbon === 'ymckok', after.ribbon)
 
   // Restock: the options come back with no state to reset.
   check('operator can restock', (await setRibbon('ymcko', true)) === 200)
@@ -907,7 +907,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       ).status
 
     check('switching to the black-panel ribbon is accepted',
-      (await switchTo('ymckoko')) === 200)
+      (await switchTo('ymckok')) === 200)
     const after = await api(`/api/prefixes/${prefix}/cards/1`)
     check('the card keeps its back source and its picture',
       after.back === before.back &&
@@ -935,7 +935,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     check('the back preview URL is versioned against the render', /\?v=/.test(beforeSrc), beforeSrc)
 
     const blackRadio = [...wp.document.querySelectorAll('.mode input')].find(
-      (i) => i.value === 'ymckoko',
+      (i) => i.value === 'ymckok',
     )
     check('the ribbon chooser offers the black-panel ribbon', !!blackRadio)
     blackRadio.checked = true
@@ -986,22 +986,22 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       beforeSrc.endsWith('-ymcko'), beforeSrc)
 
     const blackRadio = [...w.document.querySelectorAll('.mode input')].find(
-      (i) => i.value === 'ymckoko',
+      (i) => i.value === 'ymckok',
     )
     check('the ribbon chooser offers the black-panel ribbon', !!blackRadio)
     blackRadio.checked = true
     blackRadio.dispatchEvent(new w.Event('change', { bubbles: true }))
     check('switching to the black panel repaints the front-copy back',
-      await waitFor(() => backSrc() !== beforeSrc && backSrc().endsWith('-ymckoko')),
+      await waitFor(() => backSrc() !== beforeSrc && backSrc().endsWith('-ymckok')),
       `${beforeSrc} -> ${backSrc()}`)
   }
 
   // --- a black-panel ribbon: the same choices, rendered in 1 bit ----------
-  // The unification, asserted end to end: a YMCKOKO project offers every back,
+  // The unification, asserted end to end: a YMCKOK project offers every back,
   // the server stores a picture back on it, and what differs is the raster the
   // spooler fetches — 1 bit here, 24-bit on a colour-back project.
   {
-    const prefix = await makePrefix('ymckoko')
+    const prefix = await makePrefix('ymckok')
     await addCard(prefix)
     const w = await mount(`/p/${prefix}`, { bust: 'i3' })
     const offered = [...w.document.querySelectorAll('.back-choice input')].map((i) => i.value)
@@ -1070,7 +1070,7 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     // ...and that render is versioned with the ribbon, so a ribbon switch
     // repaints it: the depth is the only thing the ribbon decides about a back.
     check('the text back\'s preview names the ribbon it was rendered for',
-      backArt()?.getAttribute('src')?.endsWith('-ymckoko') === true,
+      backArt()?.getAttribute('src')?.endsWith('-ymckok') === true,
       backArt()?.getAttribute('src') ?? '')
     // A text back needs no picture, so its pane is not a drop area.
     check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
@@ -1196,26 +1196,26 @@ console.log('\nJ. admin: ribbon prices and stock')
   check('each row shows its unit', /per printed side|per card/.test(
     w.document.body.textContent ?? ''))
   check('both price boxes are seeded from the server',
-    priceBox('ymcko')?.value === '5.00' && priceBox('ymckoko')?.value === '5.00',
-    `${priceBox('ymcko')?.value} / ${priceBox('ymckoko')?.value}`)
+    priceBox('ymcko')?.value === '5.00' && priceBox('ymckok')?.value === '5.00',
+    `${priceBox('ymcko')?.value} / ${priceBox('ymckok')?.value}`)
   check('an unchanged price cannot be re-saved', saveButton('ymcko')?.disabled === true)
 
   // A real edit: the box, then Save, then the server.
-  priceBox('ymckoko').value = '7.20'
-  priceBox('ymckoko').dispatchEvent(new w.Event('input', { bubbles: true }))
+  priceBox('ymckok').value = '7.20'
+  priceBox('ymckok').dispatchEvent(new w.Event('input', { bubbles: true }))
   await settle(150)
-  check('editing a price enables its Save button', saveButton('ymckoko')?.disabled === false)
-  saveButton('ymckoko').click()
+  check('editing a price enables its Save button', saveButton('ymckok')?.disabled === false)
+  saveButton('ymckok').click()
   check('the new price is stored', await waitFor(async () =>
-    (await priceOf('ymckoko'))?.price_cents === 720),
-  String((await priceOf('ymckoko'))?.price_cents))
+    (await priceOf('ymckok'))?.price_cents === 720),
+  String((await priceOf('ymckok'))?.price_cents))
   check('the stored unit is the ribbon\'s, not guessed',
-    (await priceOf('ymckoko'))?.unit === 'card', String((await priceOf('ymckoko'))?.unit))
+    (await priceOf('ymckok'))?.unit === 'card', String((await priceOf('ymckok'))?.unit))
   check('the button says it saved', await waitFor(() => /Saved/.test(
-    saveButton('ymckoko')?.textContent ?? '')))
+    saveButton('ymckok')?.textContent ?? '')))
   check('the other ribbon was left alone', (await priceOf('ymcko'))?.price_cents === 500)
 
-  // The customer pays the new price: one card on YMCKOKO, plus shipping.
+  // The customer pays the new price: one card on YMCKOK, plus shipping.
   //
   // The customer calls go out unauthenticated — the admin session cookie would
   // make them cookie-authenticated, and the test's own api() helper does not
@@ -1289,8 +1289,8 @@ console.log('\nJ. admin: ribbon prices and stock')
     return waitFor(async () => (await priceOf(ribbon)).price_cents === cents)
   }
   check('restoring a price through the same box works too',
-    await writePrice('ymckoko', original.ymckoko),
-    String((await priceOf('ymckoko')).price_cents))
+    await writePrice('ymckok', original.ymckok),
+    String((await priceOf('ymckok')).price_cents))
   await writePrice('ymcko', original.ymcko)
   stockBox('ymcko').checked = true
   stockBox('ymcko').dispatchEvent(new w.Event('change', { bubbles: true }))

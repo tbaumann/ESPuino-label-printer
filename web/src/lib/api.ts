@@ -11,7 +11,7 @@ export type PrefixStatus =
  * The ribbon a job is printed with: the one choice per job, because a batch
  * cannot mix ribbon loads. Everything else is chosen per card.
  */
-export type Ribbon = 'ymcko' | 'ymckoko'
+export type Ribbon = 'ymcko' | 'ymckok'
 
 /**
  * What a card has on its back side — the per-card single/double-sided choice.
@@ -136,7 +136,7 @@ export interface RibbonStock {
  *
  * `price_cents` is the price of one billing *unit*, and `unit` says what that
  * is: `side` (YMCKO, a card costs one or two of them — `billedUnits`) or `card`
- * (YMCKOKO, one per card whatever its back is). The two ribbons therefore price
+ * (YMCKOK, one per card whatever its back is). The two ribbons therefore price
  * the same order differently, which is why the unit is served rather than
  * assumed.
  */
@@ -166,7 +166,7 @@ export interface ShopConfig {
  */
 export const RIBBONS: { ribbon: Ribbon; label: string; summary: string }[] = [
   {
-    ribbon: 'ymckoko',
+    ribbon: 'ymckok',
     label: 'Black back',
     summary:
       'Full-colour front, black-and-white back. Budget double sided option. Billed per card.',
@@ -230,12 +230,12 @@ export function backDepth(ribbon: Ribbon): 'color' | 'black' {
  * ribbon's own price.
  *
  * YMCKO bills per printed side: a single-sided card is one, a double-sided one
- * two. YMCKOKO bills per card, whatever its back is: its panel set is spent
+ * two. YMCKOK bills per card, whatever its back is: its panel set is spent
  * whether or not the second black panel is used, so a blank back saves nothing.
  * Mirror of the server's `Ribbon::billed_units`, which is what actually charges.
  */
 export function billedUnits(ribbon: Ribbon, back: BackSource): number {
-  if (ribbon === 'ymckoko') return 1
+  if (ribbon === 'ymckok') return 1
   return back === 'none' ? 1 : 2
 }
 
@@ -513,7 +513,7 @@ export const adminApi = {
 
   /**
    * Set one ribbon's price, in minor units, for the ribbon's own billing unit
-   * (one printed side on YMCKO, one whole card on YMCKOKO — `RibbonPrice.unit`).
+   * (one printed side on YMCKO, one whole card on YMCKOK — `RibbonPrice.unit`).
    * Returns what was stored, so the caller need not re-derive it.
    */
   setRibbonPrice: (ribbon: Ribbon, priceCents: number): Promise<RibbonPrice> =>

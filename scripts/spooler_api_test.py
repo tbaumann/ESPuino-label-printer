@@ -18,17 +18,17 @@ LOG = {"GET": [], "POST": [], "PATCH": []}
 # The parsed JSON body of each POST (None when the call sent none).
 POST_BODIES: list = []
 # Prefixes for the batch mode: two ymcko jobs (one paid, one queued), one
-# ymckoko job (should be excluded when filtering ymcko), one draft (excluded).
+# ymckok job (should be excluded when filtering ymcko), one draft (excluded).
 PREFIXES = [
     {"uuid": "A", "status": "paid", "ribbon": "ymcko", "unprinted_count": 2},
     {"uuid": "B", "status": "queued", "ribbon": "ymcko", "unprinted_count": 1},
-    {"uuid": "C", "status": "paid", "ribbon": "ymckoko", "unprinted_count": 3},
+    {"uuid": "C", "status": "paid", "ribbon": "ymckok", "unprinted_count": 3},
     {"uuid": "D", "status": "draft", "ribbon": "ymcko", "unprinted_count": 0},
 ]
 QUEUE = {
     "prefix": "P",
     "status": "queued",
-    "ribbon": "ymckoko",
+    "ribbon": "ymckok",
     "unprinted_count": 2,
     "billed_units": 2,
     "resume": False,
@@ -115,7 +115,7 @@ def check(label, cond):
 # 1. queue pull
 c = Client(base, "tok")
 q = c.get_print_queue("P")
-check("queue ribbon ymckoko", q["ribbon"] == "ymckoko")
+check("queue ribbon ymckok", q["ribbon"] == "ymckok")
 check("queue has 4 cards", len(q["cards"]) == 4)
 check("print-queue called with bearer", LOG["GET"] == [f"/api/prefixes/P/print-queue"])
 
@@ -149,7 +149,7 @@ check("todo skips printed(3) and non-printable(4)", [x["id"] for x in todo] == [
 # 5. ribbon family mapping
 from esplp_print.printer import _family_of_sdk_name
 check("YMCKO->ymcko", _family_of_sdk_name("YMCKO") == "ymcko")
-check("YMCKOKOS->ymckoko", _family_of_sdk_name("YMCKOKOS") == "ymckoko")
+check("YMCKOKOS->ymckok", _family_of_sdk_name("YMCKOKOS") == "ymckok")
 check("KO->unknown", _family_of_sdk_name("KO") == "unknown")
 
 # 6. prefix status transition (the spooler's final flush to printed)
@@ -174,13 +174,13 @@ jobs = [
     p for p in prefixes
     if mm._ribbon(p) == "ymcko" and p.get("status") in mm.PRINTABLE_STATUSES
 ]
-check("batch ymcko picks A,B (not C ymckoko, not D draft)",
+check("batch ymcko picks A,B (not C ymckok, not D draft)",
       [p["uuid"] for p in jobs] == ["A", "B"])
 jobs_ck = [
     p for p in prefixes
-    if mm._ribbon(p) == "ymckoko" and p.get("status") in mm.PRINTABLE_STATUSES
+    if mm._ribbon(p) == "ymckok" and p.get("status") in mm.PRINTABLE_STATUSES
 ]
-check("batch ymckoko picks C", [p["uuid"] for p in jobs_ck] == ["C"])
+check("batch ymckok picks C", [p["uuid"] for p in jobs_ck] == ["C"])
 
 # 9. the UID step. The card is fed and parked at the contactless station before
 #    it is printed — that is what makes the UID the id of THIS card — and the

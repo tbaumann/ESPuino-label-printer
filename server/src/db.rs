@@ -85,7 +85,7 @@ pub async fn create_prefix(
     ribbon: Option<Ribbon>,
 ) -> Result<Prefix, ApiError> {
     let uuid = uuid.unwrap_or_else(Uuid::new_v4);
-    let ribbon = ribbon.unwrap_or(Ribbon::Ymckoko);
+    let ribbon = ribbon.unwrap_or(Ribbon::Ymckok);
     let res = sqlx::query(
         "INSERT INTO prefixes (uuid, status, status_changed_at, ribbon)
          VALUES (?1, 'draft', datetime('now'), ?2)",
@@ -265,7 +265,7 @@ pub async fn set_ribbon_stock(
 ///
 /// The stored figure is per unit, and the *unit* is the ribbon's own
 /// ([`Ribbon::billing_unit`]): one printed side on YMCKO, one whole card on
-/// YMCKOKO. How many units a card costs is [`Ribbon::billed_units`], applied at
+/// YMCKOK. How many units a card costs is [`Ribbon::billed_units`], applied at
 /// the checkout, not stored per price.
 pub async fn list_ribbon_prices(pool: &SqlitePool) -> Result<Vec<RibbonPrice>, ApiError> {
     let ribbons = list_ribbon_stock(pool).await?;
@@ -684,7 +684,7 @@ pub async fn cards_missing_back(pool: &SqlitePool, prefix: Uuid) -> Result<i64, 
 /// [`Ribbon::billed_units`] over the cards.
 ///
 /// The unit is the ribbon's own ([`Ribbon::billing_unit`]) — one printed side on
-/// YMCKO (one or two per card), one whole card on YMCKOKO — and it is the
+/// YMCKO (one or two per card), one whole card on YMCKOK — and it is the
 /// quantity the checkout's line item multiplies that ribbon's price by. Derived
 /// here from the stored back sources rather than from the request, so the figure
 /// the checkout locks into Stripe is the one the cards actually are.
@@ -1317,11 +1317,11 @@ mod tests {
 
     #[test]
     fn ribbon_parse_round_trips_both_ribbons() {
-        for (text, ribbon) in [("ymcko", Ribbon::Ymcko), ("ymckoko", Ribbon::Ymckoko)] {
+        for (text, ribbon) in [("ymcko", Ribbon::Ymcko), ("ymckok", Ribbon::Ymckok)] {
             assert_eq!(Ribbon::parse(text), Some(ribbon));
             assert_eq!(ribbon.as_str(), text);
         }
-        assert_eq!(Ribbon::parse("ymckokok"), None);
+        assert_eq!(Ribbon::parse("ymckokk"), None);
     }
 
     /// No ribbon rules out a back side: the only thing the ribbon changes is the
@@ -1343,20 +1343,20 @@ mod tests {
                 "{back} on ymcko"
             );
             assert_eq!(
-                Ribbon::Ymckoko.back_depth(),
+                Ribbon::Ymckok.back_depth(),
                 BackDepth::Black,
-                "{back} on ymckoko"
+                "{back} on ymckok"
             );
         }
     }
 
     /// The two ribbons price the same order differently, because their unit is
-    /// different: YMCKO charges per printed side, YMCKOKO per whole card —
+    /// different: YMCKO charges per printed side, YMCKOK per whole card —
     /// its panel set is spent whether or not the second black panel is used.
     #[test]
-    fn billing_units_are_sides_on_ymcko_and_cards_on_ymckoko() {
+    fn billing_units_are_sides_on_ymcko_and_cards_on_ymckok() {
         assert_eq!(Ribbon::Ymcko.billing_unit(), "side");
-        assert_eq!(Ribbon::Ymckoko.billing_unit(), "card");
+        assert_eq!(Ribbon::Ymckok.billing_unit(), "card");
 
         assert_eq!(Ribbon::Ymcko.billed_units(BackSource::None), 1);
         assert_eq!(Ribbon::Ymcko.billed_units(BackSource::Front), 2);
@@ -1372,7 +1372,7 @@ mod tests {
             BackSource::Image,
             BackSource::Markdown,
         ] {
-            assert_eq!(Ribbon::Ymckoko.billed_units(back), 1, "{back}");
+            assert_eq!(Ribbon::Ymckok.billed_units(back), 1, "{back}");
         }
     }
 
@@ -1429,10 +1429,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_defaults_to_ymckoko() {
+    async fn prefix_defaults_to_ymckok() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
-        assert_eq!(p.ribbon, Ribbon::Ymckoko);
+        assert_eq!(p.ribbon, Ribbon::Ymckok);
     }
 
     #[tokio::test]
@@ -1637,7 +1637,7 @@ mod tests {
     }
 
     /// What the checkout charges: the *same* four cards cost one thing on YMCKO
-    /// (per printed side) and another on YMCKOKO (per card), because each ribbon
+    /// (per printed side) and another on YMCKOK (per card), because each ribbon
     /// prices its own unit. Every back source counts on either ribbon — no card
     /// is unprintable, so no card has to be changed to switch.
     #[tokio::test]
@@ -1653,9 +1653,9 @@ mod tests {
 
         // YMCKO: 1 + 2 + 2 + 2 printed sides.
         assert_eq!(billed_units(&pool, p.uuid, Ribbon::Ymcko).await.unwrap(), 7);
-        // YMCKOKO: one card each, whatever the back is.
+        // YMCKOK: one card each, whatever the back is.
         assert_eq!(
-            billed_units(&pool, p.uuid, Ribbon::Ymckoko).await.unwrap(),
+            billed_units(&pool, p.uuid, Ribbon::Ymckok).await.unwrap(),
             4
         );
     }
@@ -1717,7 +1717,7 @@ mod tests {
         // A picture back on a black-panel ribbon is a poor choice, not a
         // refused one: it is stored, and rendered in black.
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymckok))
             .await
             .expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
@@ -1733,7 +1733,7 @@ mod tests {
                 },
             )
             .await
-            .unwrap_or_else(|e| panic!("{back} on YMCKOKO: {e:?}"));
+            .unwrap_or_else(|e| panic!("{back} on YMCKOK: {e:?}"));
             assert_eq!(ok.back, back);
         }
 
@@ -1748,7 +1748,7 @@ mod tests {
             },
         )
         .await
-        .expect("markdown on YMCKOKO");
+        .expect("markdown on YMCKOK");
         assert_eq!(ok.back, BackSource::Markdown);
     }
 
@@ -1803,7 +1803,7 @@ mod tests {
         }
         let ribbons: Vec<_> = prices.iter().map(|p| p.ribbon).collect();
         assert!(ribbons.contains(&Ribbon::Ymcko));
-        assert!(ribbons.contains(&Ribbon::Ymckoko));
+        assert!(ribbons.contains(&Ribbon::Ymckok));
     }
 
     #[tokio::test]
@@ -1813,9 +1813,9 @@ mod tests {
         assert_eq!(stock.len(), 2);
         assert!(stock.iter().all(|s| s.in_stock));
         assert!(ribbon_in_stock(&pool, Ribbon::Ymcko).await.expect("ymcko"));
-        assert!(ribbon_in_stock(&pool, Ribbon::Ymckoko)
+        assert!(ribbon_in_stock(&pool, Ribbon::Ymckok)
             .await
-            .expect("ymckoko"));
+            .expect("ymckok"));
     }
 
     #[tokio::test]
@@ -1836,7 +1836,7 @@ mod tests {
         };
         assert!(!available(Ribbon::Ymcko));
         // The other ribbon is independent.
-        assert!(available(Ribbon::Ymckoko));
+        assert!(available(Ribbon::Ymckok));
 
         // Setting it back restores it.
         set_ribbon_stock(&pool, Ribbon::Ymcko, true)
@@ -1849,19 +1849,19 @@ mod tests {
     #[tokio::test]
     async fn a_ribbon_with_no_flag_counts_as_out_of_stock() {
         let pool = test_pool().await;
-        sqlx::query("DELETE FROM ribbon_stock WHERE ribbon = 'ymckoko'")
+        sqlx::query("DELETE FROM ribbon_stock WHERE ribbon = 'ymckok'")
             .execute(&pool)
             .await
             .expect("delete flag");
-        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckoko)
+        assert!(!ribbon_in_stock(&pool, Ribbon::Ymckok)
             .await
-            .expect("ymckoko"));
+            .expect("ymckok"));
         // ...and the ribbon is not offered, rather than silently so.
         let prices = list_ribbon_prices(&pool).await.expect("list");
         assert!(
             !prices
                 .iter()
-                .find(|p| p.ribbon == Ribbon::Ymckoko)
+                .find(|p| p.ribbon == Ribbon::Ymckok)
                 .expect("ribbon")
                 .available
         );
@@ -1871,7 +1871,7 @@ mod tests {
     async fn ribbon_price_lookup_returns_the_configured_price() {
         let pool = test_pool().await;
         assert_eq!(
-            ribbon_price(&pool, Ribbon::Ymckoko).await.expect("price"),
+            ribbon_price(&pool, Ribbon::Ymckok).await.expect("price"),
             500
         );
         assert_eq!(
@@ -1946,19 +1946,19 @@ mod tests {
     #[tokio::test]
     async fn print_queue_reports_the_back_the_ribbon_prints() {
         let pool = test_pool().await;
-        let p = create_prefix(&pool, None, Some(Ribbon::Ymckoko))
+        let p = create_prefix(&pool, None, Some(Ribbon::Ymckok))
             .await
             .expect("create");
         card(&pool, p.uuid, 1, BackSource::Markdown).await;
         card(&pool, p.uuid, 2, BackSource::None).await;
 
         let q = print_queue(&pool, p.uuid).await.expect("queue");
-        assert_eq!(q.ribbon, Ribbon::Ymckoko);
-        // YMCKOKO's back is the black panel, so a markdown back is a 1-bit one.
+        assert_eq!(q.ribbon, Ribbon::Ymckok);
+        // YMCKOK's back is the black panel, so a markdown back is a 1-bit one.
         assert_eq!(q.cards[0].back, BackAvailability::Black);
         // A single-sided card has nothing to print on the back.
         assert_eq!(q.cards[1].back, BackAvailability::None);
-        // YMCKOKO bills one card per card, single-sided or not.
+        // YMCKOK bills one card per card, single-sided or not.
         assert_eq!(q.billed_units, 2);
         assert_eq!(q.cards[0].billed_units, 1);
         assert_eq!(q.cards[1].billed_units, 1);
@@ -1977,7 +1977,7 @@ mod tests {
 
         let q = print_queue(&pool, p.uuid).await.expect("queue");
         assert_eq!(q.ribbon, Ribbon::Ymcko);
-        // The same markdown back that is black on YMCKOKO is colour here: the
+        // The same markdown back that is black on YMCKOK is colour here: the
         // colour depth is the ribbon's, not the source's.
         assert_eq!(q.cards[0].back, BackAvailability::Color);
         assert_eq!(q.cards[1].back, BackAvailability::Color);

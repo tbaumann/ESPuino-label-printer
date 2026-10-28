@@ -89,7 +89,7 @@ rendered in the browser.
 
 Neither ribbon restricts a back source any more. The ribbon decides one thing,
 the colour depth the back is rendered in, and both renderers take the same
-picture: 24-bit colour on YMCKO, a 1-bit raster on YMCKOKO's second black panel.
+picture: 24-bit colour on YMCKO, a 1-bit raster on YMCKOK's second black panel.
 A picture on a black back is allowed and comes out in black and white; the
 preview is the depth-accurate render, so the pane repaints when the ribbon
 changes.
@@ -107,8 +107,8 @@ Consequences worth keeping: switching ribbon is lossless and re-renders only
 the derived artifacts (`PATCH /api/prefixes/{prefix}`), `Ribbon::allows_back`,
 `cards_incompatible_with_ribbon` and the SPA's `ribbonAllowsBack` are gone, and
 billing follows the ribbon's own unit — a printed side on YMCKO, a whole card on
-YMCKOKO (`Ribbon::billing_unit`/`billed_units`, `unit` in the shop config).
-The old always-two rule charged two card prices for a single-sided YMCKOKO card.
+YMCKOK (`Ribbon::billing_unit`/`billed_units`, `unit` in the shop config).
+The old always-two rule charged two card prices for a single-sided YMCKOK card.
 
 The rasters are scaled to fit the printer's internal bitmap (`fit_to`, letterboxed
 on white), which is what the preview shows, one scale factor apart; the overscan

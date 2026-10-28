@@ -9,7 +9,7 @@ gives as `socket://192.168.2.101?type=evolis`): see the SDK's own
 `Connection.open`. Everything here takes a single `ip` string.
 
 Ribbons: the server speaks two families — `ymcko` (full-colour front and back)
-and `ymckoko` (full-colour front, second black panel for the back). The SDK's
+and `ymckok` (full-colour front, second black panel for the back). The SDK's
 `RibbonType` enum has no single member named for each; it lists YMCKO variants
 and YMCKOK / YMCKOKOS variants. The ribbon check here is a **sanity check only**
 (skippable), so it compares the *family* by name prefix rather than pinning a
@@ -17,7 +17,7 @@ specific enum member that a given printer's firmware might report differently.
 
 The printer does not care what a back is *made of*, only what depth its raster
 is: both ribbons print the same set of card backs, and the server's raster is
-what differs — a 24-bit colour BMP on YMCKO, a 1-bit one on YMCKOKO. Whichever
+what differs — a 24-bit colour BMP on YMCKO, a 1-bit one on YMCKOK. Whichever
 it sends is fed verbatim (see `print_card`).
 
 A card's RFID UID is read before it is printed, with the card parked under the
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     import evolis  # deferred import; only for type checking
 
 RIBBON_YMCKO = "ymcko"
-RIBBON_YMCKOKO = "ymckoko"
+RIBBON_YMCKOK = "ymckok"
 
 BACK_NONE = "none"
 BACK_COLOR = "color"
@@ -56,7 +56,7 @@ class PrinterError(Exception):
 class RibbonStatus:
     """What the printer reports about its loaded ribbon."""
 
-    ribbon: str  # "ymcko" | "ymckoko" | "unknown"
+    ribbon: str  # "ymcko" | "ymckok" | "unknown"
     product_code: str
     remaining: int | None
     capacity: int | None
@@ -66,14 +66,14 @@ def _family_of_sdk_name(name: str) -> str:
     """Normalise an SDK RibbonType member name to one of our two families.
 
     YMCKO / YMCKOS / YMCKOS13 etc → ymcko; YMCKOK / YMCKOKOS / YMCKOKS13 etc →
-    ymckoko. Anything else (KO, KBLACK, HOLO, ...) → "unknown" so the spooler
+    ymckok. Anything else (KO, KBLACK, HOLO, ...) → "unknown" so the spooler
     can say "I don't recognise this ribbon" rather than assume.
     """
     n = name.lower()
     if n == "ymcko" or n.startswith("ymckos"):
         return RIBBON_YMCKO
     if n.startswith("ymckok"):
-        return RIBBON_YMCKOKO
+        return RIBBON_YMCKOK
     return "unknown"
 
 
@@ -248,7 +248,7 @@ __all__ = [
     "Printer",
     "PrinterError",
     "RIBBON_YMCKO",
-    "RIBBON_YMCKOKO",
+    "RIBBON_YMCKOK",
     "BACK_NONE",
     "BACK_COLOR",
     "BACK_BLACK",
