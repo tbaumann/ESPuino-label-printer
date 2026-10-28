@@ -1,0 +1,195 @@
+# ---------------------------------------------------------------------------
+# RFID reader/writer for the Evolis Primacy card slot.
+#
+#   M5Stack Atom Lite + PN532   13.56 MHz, I2C, reads and writes NDEF
+#
+# No custom component: the stock `pn532` component does the reading and writing,
+# and the entity REST API of `web_server` version 3 is the interface. Wiring,
+# URLs and payloads: ../README.md
+# ---------------------------------------------------------------------------
+
+substitutions:
+  name: evolis-rfid
+  friendly_name: Evolis RFID
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: RFID reader in the Evolis Primacy card slot
+
+esp32:
+  board: m5stack-atom
+
+logger:
+  # DEBUG while bringing the wiring up: it logs every tag the reader sees.
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  version: 3
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+    # Pinned on purpose: the default flips to digest in ESPHome 2027.1.0, and
+    # basic is what a plain HTTP client (the print spooler) can send.
+    type: basic
+
+# --- hardware --------------------------------------------------------------
+
+# PN532 on the Grove port: G26 = SDA, G32 = SCL (the board's own I2C default),
+# 5 V and GND from the same connector. DIP switches: SEL0 ON, SEL1 OFF (I2C),
+# address 0x24. G19, G21, G22, G23, G25 and G33 stay free.
+i2c:
+  sda: GPIO26
+  scl: GPIO32
+  scan: true
+
+pn532_i2c:
+  id: nfc_reader
+  # 500 ms is the tag-detection latency: a card parked at the antenna is seen
+  # within half a second.
+  update_interval: 500ms
+
+  on_tag:
+    - text_sensor.template.publish:
+        id: uid_13mhz
+        state: !lambda "return x;"  # ESPHome's own form: 04-A2-B3-C4
+    - binary_sensor.template.publish:
+        id: card_13mhz
+        state: ON
+    # The whole NDEF message, one record per line as "<type>:<payload>".
+    - text_sensor.template.publish:
+        id: ndef_13mhz
+        state: !lambda |-
+          std::string out;
+          if (tag.has_ndef_message()) {
+            for (const auto &record : tag.get_ndef_message()->get_records()) {
+              if (!out.empty())
+                out += "\n";
+              out += record->get_type() + ":" + record->get_payload();
+            }
+          }
+          return out;
+
+  on_tag_removed:
+    - binary_sensor.template.publish:
+        id: card_13mhz
+        state: OFF
+    - text_sensor.template.publish:
+        id: uid_13mhz
+        state: ""
+    - text_sensor.template.publish:
+        id: ndef_13mhz
+        state: ""
+
+  on_finished_write:
+    - logger.log:
+        format: "NDEF write finished - remove and re-tap the card to verify"
+        level: INFO
+
+# --- entities --------------------------------------------------------------
+#
+# The entity NAME is the URL segment of the REST API, so these are slugs on
+# purpose: GET /text_sensor/rfid_uid_13mhz. Renaming one changes its URL.
+
+text_sensor:
+  - platform: template
+    id: uid_13mhz
+    name: rfid_uid_13mhz
+    icon: mdi:card-account-details
+
+  - platform: template
+    id: ndef_13mhz
+    name: rfid_ndef_13mhz
+    icon: mdi:card-text
+
+binary_sensor:
+  - platform: template
+    id: card_13mhz
+    name: rfid_card_13mhz
+    icon: mdi:card-account-details-outline
+    device_class: presence
+
+# Setting one of these is what arms a write: POST /text/rfid_write_text/set?value=…
+# The PN532 writes it to the NEXT card presented (see ../README.md).
+text:
+  - platform: template
+    id: write_text
+    name: rfid_write_text
+    mode: text
+    optimistic: true
+    on_value:
+      - if:
+          condition:
+            - lambda: "return !x.empty();"
+          then:
+            - lambda: |-
+                auto *message = new nfc::NdefMessage();
+                message->add_text_record(x);
+                id(nfc_reader)->write_mode(message);
+            - script.execute: disarm_write
+
+  - platform: template
+    id: write_uri
+    name: rfid_write_uri
+    mode: text
+    optimistic: true
+    on_value:
+      - if:
+          condition:
+            - lambda: "return !x.empty();"
+          then:
+            - lambda: |-
+                auto *message = new nfc::NdefMessage();
+                message->add_uri_record(x);
+                id(nfc_reader)->write_mode(message);
+            - script.execute: disarm_write
+
+button:
+  - platform: template
+    id: format_tag
+    name: rfid_format_tag
+    icon: mdi:card-plus-outline
+    on_press:
+      - lambda: id(nfc_reader)->format_mode();
+      - script.execute: disarm_write
+
+  - platform: template
+    id: clean_tag
+    name: rfid_clean_tag
+    icon: mdi:card-remove-outline
+    on_press:
+      - lambda: id(nfc_reader)->clean_mode();
+      - script.execute: disarm_write
+
+script:
+  # An armed write stays armed until a tag is presented. Give up after 30 s, so a
+  # forgotten request does not rewrite whatever card is tapped next.
+  - id: disarm_write
+    mode: restart
+    then:
+      - delay: 30s
+      - if:
+          condition:
+            pn532.is_writing:
+          then:
+            - lambda: id(nfc_reader)->read_mode();
+            - logger.log:
+                format: "NDEF write request expired without a tag"
+                level: WARN
