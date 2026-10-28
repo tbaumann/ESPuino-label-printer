@@ -21,7 +21,13 @@
     "vite": "^8.3.0"
   },
   "dependencies": {
-    "dompurify": "^3.4.17",
-    "marked": "^18.1.1"
+    "@tiptap/core": "^3.32.0",
+    "@tiptap/extension-image": "^3.32.0",
+    "@tiptap/extension-list": "^3.32.0",
+    "@tiptap/extension-placeholder": "^3.32.0",
+    "@tiptap/extension-table": "^3.32.0",
+    "@tiptap/markdown": "^3.32.0",
+    "@tiptap/pm": "^3.32.0",
+    "@tiptap/starter-kit": "^3.32.0"
   }
 }

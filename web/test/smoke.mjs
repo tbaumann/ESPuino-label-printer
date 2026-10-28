@@ -177,6 +177,37 @@ async function waitForEl(root, sel, ms = 8000) {
   }
 }
 
+/** The editing surface of a card's markdown editor: the ProseMirror document. */
+const mdSurface = (w) => w.document.querySelector('.md-editor .ProseMirror')
+
+/** Whether the markdown editor is editable — it is held read-only while a write
+ * of the card is still in flight. */
+const mdEditable = (w) => mdSurface(w)?.getAttribute('contenteditable') === 'true'
+
+/**
+ * Put markdown into the editor the way a customer would: paste it.
+ *
+ * jsdom cannot type into a contenteditable — a browser synthesises
+ * beforeinput/input events for that and jsdom does not — but a paste is an
+ * ordinary DOM event carrying the text the editor parses itself. It is also the
+ * gesture a customer actually uses to get a song list onto a card.
+ */
+function pasteIntoEditor(w, markdown) {
+  const surface = mdSurface(w)
+  if (!surface) return false
+  const ev = new w.Event('paste', { bubbles: true, cancelable: true })
+  Object.defineProperty(ev, 'clipboardData', {
+    value: {
+      types: ['text/plain'],
+      files: [],
+      getData: (t) => (t === 'text/plain' ? markdown : ''),
+    },
+    configurable: true,
+  })
+  surface.dispatchEvent(ev)
+  return true
+}
+
 const api = async (path, init) => {
   const res = await fetch(BASE + path, init)
   const text = await res.text()
@@ -279,7 +310,16 @@ console.log('\nB. project page renders a card')
   check('name input holds the name', w.document.querySelector('input#name-1')?.value === 'Sample Card')
   // The serial number is an API-level field: it is not surfaced in the UI at all.
   check('no serial input in the UI', !w.document.querySelector('input#serial-1'))
-  check('back textarea holds the text', w.document.querySelector('textarea#back-1')?.value === '01 Song One\n02 Song Two')
+  // The back text is edited as the formatting it will have — the markdown is
+  // what leaves the editor, and it is what the backend renders the back from.
+  check('the markdown editor holds the text',
+    /01 Song One/.test(mdSurface(w)?.textContent ?? ''),
+    mdSurface(w)?.textContent ?? '')
+  // A WYSIWYG editor, not a plain box: the toolbar is what applies the
+  // constructs, and the value it hands back is markdown.
+  check('the editor offers the formatting controls',
+    w.document.querySelectorAll('.md-editor .md-toolbar button').length >= 6,
+    String(w.document.querySelectorAll('.md-editor .md-toolbar button').length))
   // The pane is the server's artifact for the back, whatever the back source is:
   // the row never draws a back itself. This card's back is markdown, which the
   // server renders into a picture like any other back — so the pane shows that
@@ -360,8 +400,9 @@ console.log('\nB. project page renders a card')
       pane?.innerHTML ?? '')
     check('the card is not reported unprintable',
       !/not printable yet/i.test(pane?.textContent ?? ''), (pane?.textContent ?? '').trim())
-    check('the pane is captioned as black only',
-      /printed in black only/i.test(w.document.body.textContent ?? ''))
+    // NB: the per-card caption that used to name the print depth here was
+    // removed on purpose ("Tone down the site verbosity"): the depth is named
+    // once, on the ribbon choice, and not repeated on every card.
     // What prints is a raster from that same picture, at the ribbon's depth.
     check('the markdown back rasterises to 1 bit on this ribbon',
       (await rasterBits(mdPrefix)) === 1, String(await rasterBits(mdPrefix)))
@@ -761,9 +802,9 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     check('the panel says the card is single-sided', /single-sided/i.test(t))
     check('no back pane for a single-sided card', !w.document.querySelector('.preview.back'))
     check(
-      'no back-image chooser and no text field yet',
+      'no back-image chooser and no text editor yet',
       !w.document.querySelector('input#back-image-1') &&
-        !w.document.querySelector('textarea#back-1'),
+        !w.document.querySelector('.md-editor'),
     )
     check(
       'the source chooser is in the editor, not the pane',
@@ -994,22 +1035,20 @@ console.log('\nI. one panel, the same back choices on either ribbon')
       !!wPic.document.querySelector(
         `img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`),
     )
-    check('the pane says the picture prints in black and white',
-      /black and white/.test(wPic.document.body.textContent ?? ''),
-      (wPic.document.body.textContent ?? '').slice(0, 200))
+    // NB: the per-card caption that used to say this here was removed on purpose
+    // ("Tone down the site verbosity"): the panel beside the pane shows the
+    // server's depth-accurate render, and the ribbon choice is where the depth
+    // is named, once — not repeated under every card.
 
     pick(w, 'markdown')
-    const ta = await waitForEl(w.document, 'textarea#back-1')
-    check('choosing text reveals the markdown editor', ta !== null)
-    // The editor stays disabled until the source write has landed: text may not
+    const surface = await waitForEl(w.document, '.md-editor .ProseMirror')
+    check('choosing text reveals the markdown editor', surface !== null)
+    // The editor stays read-only until the source write has landed: text may not
     // be sent for a back the server still reads as single-sided.
-    check('the editor becomes usable', ta !== null && (await waitFor(() => ta.disabled === false)))
+    check('the editor becomes usable', await waitFor(() => mdEditable(w)))
 
     const md = '## Songs\n\n- one\n- two\n'
-    if (ta) {
-      ta.value = md
-      ta.dispatchEvent(new w.Event('input', { bubbles: true }))
-    }
+    check('the text can be typed into it', pasteIntoEditor(w, md))
 
     check(
       'the text is stored on the card',
@@ -1033,9 +1072,6 @@ console.log('\nI. one panel, the same back choices on either ribbon')
     check('the text back\'s preview names the ribbon it was rendered for',
       backArt()?.getAttribute('src')?.endsWith('-ymckoko') === true,
       backArt()?.getAttribute('src') ?? '')
-    const t = w.document.body.textContent ?? ''
-    check('the pane is captioned as black only',
-      /printed in black only/i.test(t), t.slice(0, 200))
     // A text back needs no picture, so its pane is not a drop area.
     check('a text pane is not a drop area', !w.document.querySelector('.preview.back .back-drop'))
     // A markdown back with text is complete: the page stops counting it as
@@ -1077,6 +1113,46 @@ console.log('\nI. one panel, the same back choices on either ribbon')
           !!w.document.querySelector(`img[src^="/api/prefixes/${prefix}/cards/1/display/back"]`),
       ),
     )
+  }
+
+  // --- the text is written when the customer stops, not while they write ---
+  // Every write of a card re-renders its rasters, and the response used to be
+  // copied back into the box — which ate whatever had been typed while the
+  // request was in flight. So: nothing goes out mid-sentence, leaving the box
+  // writes at once, and what is in the box outlives the response.
+  {
+    const prefix = await makePrefix('ymcko')
+    await addCard(prefix)
+    const w = await mount(`/p/${prefix}`, { bust: 'i6' })
+    const stored = async () =>
+      (await api(`/api/prefixes/${prefix}/cards/1`)).back_text ?? ''
+
+    pick(w, 'markdown')
+    // Choosing the back is a write of its own, so wait for it to land before
+    // counting writes of the text.
+    await waitFor(async () => (await api(`/api/prefixes/${prefix}/cards/1`)).back === 'markdown')
+    check('the text editor is usable', await waitFor(() => mdEditable(w)))
+
+    check('the text can be typed into it', pasteIntoEditor(w, 'first line'))
+    await settle(400)
+    const midTyping = await stored()
+    check('nothing is written while the customer is still writing',
+      !midTyping.includes('first line'), midTyping)
+
+    // Leaving the box writes it, without waiting for the idle timer.
+    mdSurface(w).dispatchEvent(new w.Event('blur', { bubbles: true }))
+    check('leaving the editor writes the text',
+      await waitFor(async () => (await stored()).includes('first line')), await stored())
+
+    // Typing that stops is written on its own.
+    pasteIntoEditor(w, ' second')
+    check('typing that stops is written by itself',
+      await waitFor(async () => (await stored()).includes('second')), await stored())
+
+    // The response is never reflected back into the box: it holds what was
+    // typed, which is what the next write carries.
+    const inBox = mdSurface(w)?.textContent ?? ''
+    check('the box keeps what was typed', /first line[\s\S]*second/.test(inBox), inBox)
   }
 }
 

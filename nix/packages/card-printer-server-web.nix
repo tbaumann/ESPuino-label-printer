@@ -22,7 +22,7 @@ buildNpmPackage {
       ../../web/src
     ];
   };
-  npmDepsHash = "sha256-m7rIhYggK2Lp9kTGAxY+1to04nbgckNf69CvUumF0kI=";
+  npmDepsHash = "sha256-VA/1vWYdZcDuOEK8GSjUas7XjyAgDX+4ftXTyHlGkV0=";
   # vite would otherwise write to ../server/static, i.e. outside the source
   # tree. Keep the output inside and install it from there.
   buildPhase = ''

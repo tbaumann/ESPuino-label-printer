@@ -379,9 +379,12 @@ section.panel {
   gap: 6px;
 }
 
-.image-row .side.editor textarea {
-  min-height: 120px;
-  resize: vertical;
+/* The markdown editor is a column of its own, beside the back-side choice
+   instead of under it: on a markdown back the box is the thing being worked in,
+   and stacked under four option rows it has no width to write in. */
+.image-row .side.text-editor {
+  flex: 2 1 320px;
+  max-width: 560px;
 }
 
 @media (max-width: 860px) {
@@ -844,5 +847,154 @@ select:focus {
   border-style: solid;
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* ---------- the markdown back's editor ---------- */
+
+/* The text itself, edited as the formatting it will have. The toolbar applies
+   markdown constructs; the pane beside it stays the server's render, so nothing
+   here promises a card the printer would not produce. */
+.md-editor {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.md-editor.disabled {
+  background: var(--bg);
+}
+
+.md-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.md-toolbar button {
+  min-width: 32px;
+  padding: 3px 7px;
+  font-size: 13px;
+  line-height: 1.4;
+  border-color: transparent;
+  background: transparent;
+}
+
+.md-toolbar button.on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  color: var(--accent);
+}
+
+/* The editing surface scrolls inside a fixed height, so a long song list does
+   not push the card's other columns around. */
+.md-surface {
+  height: 240px;
+  overflow: auto;
+}
+
+.md-surface .ProseMirror {
+  /* The two rules prosemirror-view expects of its own element, from its
+     `style/prosemirror.css`: without them the text's spaces and line breaks are
+     not preserved. */
+  position: relative;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  min-height: 100%;
+  padding: 8px 10px;
+  outline: none;
+}
+
+.md-surface .ProseMirror p {
+  margin: 0 0 6px;
+}
+
+.md-surface .ProseMirror p:last-child {
+  margin-bottom: 0;
+}
+
+.md-surface .ProseMirror h1 {
+  font-size: 1.3em;
+  margin: 4px 0 6px;
+}
+
+.md-surface .ProseMirror h2 {
+  font-size: 1.15em;
+  margin: 4px 0 6px;
+}
+
+.md-surface .ProseMirror h3 {
+  font-size: 1.05em;
+  margin: 4px 0 6px;
+}
+
+.md-surface .ProseMirror ul,
+.md-surface .ProseMirror ol {
+  margin: 4px 0;
+  padding-left: 22px;
+}
+
+.md-surface .ProseMirror li p {
+  margin: 0;
+}
+
+.md-surface .ProseMirror blockquote {
+  margin: 4px 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+
+.md-surface .ProseMirror pre {
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow: auto;
+}
+
+.md-surface .ProseMirror code {
+  font-family: var(--mono);
+  font-size: 0.95em;
+}
+
+.md-surface .ProseMirror a {
+  color: var(--accent);
+}
+
+.md-surface .ProseMirror img {
+  max-width: 100%;
+}
+
+.md-surface .ProseMirror table {
+  border-collapse: collapse;
+}
+
+.md-surface .ProseMirror th,
+.md-surface .ProseMirror td {
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+}
+
+/* A selected picture or table cell, as prosemirror-view marks it. */
+.md-surface .ProseMirror .ProseMirror-selectednode {
+  outline: 2px solid var(--accent);
+}
+
+/* An empty box says what belongs in it (Tiptap's Placeholder). */
+.md-surface .ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--muted);
+  float: left;
+  height: 0;
+  pointer-events: none;
 }
 

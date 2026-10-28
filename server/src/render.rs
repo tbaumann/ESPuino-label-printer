@@ -19,13 +19,18 @@
 //! (`PRINT_RASTER_WIDTH`/`HEIGHT`), so a printer-specific correction is a config
 //! change, not a rebuild.
 //!
-//! A picture is **scaled to fit inside** that bitmap, centred on the card's
-//! white ground — the same framing the display preview shows, one scale factor
-//! apart. So what is printed is what the preview shows, and the only difference
-//! between the two is the overscan: the outer sliver of the bitmap falls just
-//! outside the card edge. (Centre-*cropping* to fill the bitmap instead was a
-//! bug: it silently ate the edges of every picture whose aspect differed from
-//! the panel's, so a portrait upload printed its middle band.)
+//! Where a picture lands on that bitmap is [`Placement`], and it is the picture's
+//! own business rather than the card's or the ribbon's. An **uploaded** picture
+//! (the front, a second image, a copy of the front) is **scaled to fit inside**
+//! the bitmap and centred on the card's white ground: the whole picture is
+//! visible, and the display preview shows the same framing one scale factor
+//! apart. A **markdown render** is anchored at the panel's top-left corner
+//! instead: it is a document laid out at the card's width from its first line,
+//! so the card is a window onto the top of it — the text keeps the size the
+//! layout gave it, and whatever runs past the panel's bottom edge is clipped.
+//! (Centre-*cropping* to fill the bitmap was a bug for an upload: it silently ate
+//! the edges of every picture whose aspect differed from the panel's, so a
+//! portrait upload printed its middle band.)
 //!
 //! # Colour depth
 //!
@@ -86,6 +91,26 @@ fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
     image::load_from_memory(bytes).map_err(|e| format!("unreadable image: {e}"))
 }
 
+/// How a picture is placed on the card's panel.
+///
+/// It is a property of what the picture *is*, so every caller names it rather
+/// than inheriting a default: a picture that is a photograph is framed, a
+/// picture that is a laid-out document is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Scale the picture to fit inside the panel, preserving aspect, and centre
+    /// it on the card's white ground: all of it is visible, letterboxed where
+    /// the aspect differs from the panel's. What an uploaded picture gets — the
+    /// picture *is* the card side, so none of it may go missing.
+    Fit,
+    /// Scale the picture to the panel's **width** and anchor it at the panel's
+    /// top-left corner (0, 0), clipping whatever runs past the panel's right or
+    /// bottom edge. What a markdown render gets: the text is laid out at the
+    /// card's own size from its first line, so a long song list is cut at the
+    /// card's edge rather than shrunk to fit it.
+    TopLeft,
+}
+
 /// Scale an image to *fit inside* `w`×`h`, preserving aspect, on a white
 /// background (the card is a white panel). Used for both the display image and
 /// the print raster: the whole picture is visible, letterboxed if the aspect
@@ -103,6 +128,35 @@ fn fit_to(img: &DynamicImage, w: u32, h: u32) -> RgbImage {
     let oy = (h - nh) / 2;
     image::imageops::overlay(&mut canvas, &scaled, ox as i64, oy as i64);
     canvas
+}
+
+/// Scale an image to the width `w`, preserving aspect, and draw it from the
+/// panel's top-left corner: the panel is a window onto the top of the picture,
+/// and what falls outside it is dropped rather than squeezed in.
+fn top_left(img: &DynamicImage, w: u32, h: u32) -> RgbImage {
+    let (iw, ih) = (img.width().max(1), img.height().max(1));
+    let scale = w as f32 / iw as f32;
+    let nw = ((iw as f32 * scale).round() as u32).max(1);
+    let nh = ((ih as f32 * scale).round() as u32).max(1);
+    let scaled = img
+        .resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+        .to_rgb8();
+    // The crop is explicit: the window is the panel, and a picture taller or
+    // wider than it is cut here rather than fitted to it.
+    let visible = image::imageops::crop_imm(&scaled, 0, 0, w.min(nw), h.min(nh)).to_image();
+    let mut canvas = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+    image::imageops::replace(&mut canvas, &visible, 0, 0);
+    canvas
+}
+
+/// Place a picture on a white `w`×`h` panel, the way `how` says. The only
+/// difference between the two placements is where the picture lands on the
+/// panel; the colour depth is applied afterwards, to the panel, by the caller.
+fn place(img: &DynamicImage, w: u32, h: u32, how: Placement) -> RgbImage {
+    match how {
+        Placement::Fit => fit_to(img, w, h),
+        Placement::TopLeft => top_left(img, w, h),
+    }
 }
 
 /// Rec. 601 luma, the "how dark does this look" figure the 1-bit reduction
@@ -268,17 +322,25 @@ pub fn render_front_raster(original: &[u8], size: &RasterSize) -> RenderResult {
     }
 }
 
-/// A back display image (PNG, fit to the display panel), at the depth the
-/// ribbon prints it in: the colour picture on a colour back, the same picture
+/// A back display image (PNG, at the display panel), at the depth the ribbon
+/// prints it in: the colour picture on a colour back, the same picture
 /// thresholded to black and white on a black panel.
 ///
 /// The preview is deliberately the depth-accurate render rather than always the
 /// colour picture: what the customer sees on the back panel is what comes out
 /// of the printer, so changing the ribbon repaints the back previews.
-pub fn render_back_display(original: &[u8], depth: BackDepth) -> RenderResult {
+///
+/// `placement` is the picture's own ([`Placement`]): the preview frames an
+/// uploaded picture exactly as the raster does, so the two are one picture at
+/// two sizes.
+pub fn render_back_display(
+    original: &[u8],
+    depth: BackDepth,
+    placement: Placement,
+) -> RenderResult {
     match decode(original) {
         Ok(img) => {
-            let canvas = fit_to(&img, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+            let canvas = place(&img, DISPLAY_WIDTH, DISPLAY_HEIGHT, placement);
             let encoded = match depth {
                 BackDepth::Color => encode_png(&canvas),
                 BackDepth::Black => encode_gray_png(&ink_to_gray(
@@ -302,10 +364,19 @@ pub fn render_back_display(original: &[u8], depth: BackDepth) -> RenderResult {
 /// Both depths take the same picture; the black one is reduced by
 /// [`to_ink`]. A picture is not what a black panel is good at, and it is not
 /// this module's business to stop anyone printing one.
-pub fn render_back_raster(original: &[u8], size: &RasterSize, depth: BackDepth) -> RenderResult {
+///
+/// `placement` decides where the picture lands on the panel — see
+/// [`Placement`], and [`render_back_display`] for the same framing at preview
+/// size.
+pub fn render_back_raster(
+    original: &[u8],
+    size: &RasterSize,
+    depth: BackDepth,
+    placement: Placement,
+) -> RenderResult {
     match decode(original) {
         Ok(img) => {
-            let canvas = fit_to(&img, size.width, size.height);
+            let canvas = place(&img, size.width, size.height, placement);
             RenderResult::Ready(match depth {
                 BackDepth::Color => bmp_24(canvas.as_raw(), size.width, size.height),
                 BackDepth::Black => bmp_1(&to_ink(&canvas), size.width, size.height),
@@ -319,12 +390,12 @@ pub fn render_back_raster(original: &[u8], size: &RasterSize, depth: BackDepth) 
 ///
 /// The backend is `markie` (a native markdown→PNG/SVG renderer, packaged as this
 /// flake's `markie`): it is handed the text on stdin and writes one PNG, which
-/// this returns as-is. The picture is *not* framed or depth-reduced here — a
-/// rendered document is an image like any other, and the ordinary back path
-/// ([`render_back_display`], [`render_back_raster`]) fits it to the printer's
-/// bitmap and reduces it to the ribbon's depth. That is what keeps the preview
-/// and the print the same picture, one scale factor apart, for a markdown back
-/// exactly as for an uploaded one.
+/// this returns as-is. The picture is *not* framed or depth-reduced here — the
+/// ordinary back path ([`render_back_display`], [`render_back_raster`]) places
+/// it at the panel's top-left and reduces it to the ribbon's depth, at
+/// [`Placement::TopLeft`] rather than by fitting it. That is what keeps the
+/// preview and the print the same picture, one scale factor apart, for a
+/// markdown back exactly as for an uploaded one.
 ///
 /// Markdown may reference pictures, and a **remote** one (`https://…`) is
 /// fetched by the backend — 10 s timeout, 10 MiB cap. So a card back can make
@@ -642,6 +713,78 @@ mod tests {
         assert!(luma(img.get_pixel(0, 100)) > 200, "left is white ground");
     }
 
+    /// A markdown render is a *document*, and the card is a window onto its top:
+    /// anchored at the panel's top-left, at the width the layout was made for,
+    /// with what runs past the panel clipped rather than shrunk to fit.
+    ///
+    /// The document here is the panel's own width and three times its height,
+    /// with black rules at its top, at a row inside the panel and at a row well
+    /// past it — so position, width and clipping are each visible in the result.
+    #[test]
+    fn a_markdown_render_is_anchored_at_the_panel_top_left() {
+        let size = RasterSize {
+            width: 400,
+            height: 200,
+        };
+        let mut doc = RgbImage::from_pixel(400, 600, Rgb([255, 255, 255]));
+        for y in [0, 1, 2, 150, 151, 400, 401] {
+            for x in 0..400 {
+                doc.put_pixel(x, y, Rgb([0, 0, 0]));
+            }
+        }
+        let bytes = png_of(doc);
+
+        let RenderResult::Ready(bmp) =
+            render_back_raster(&bytes, &size, BackDepth::Color, Placement::TopLeft)
+        else {
+            panic!("raster failed")
+        };
+        let raster = read_bmp(&bmp).to_rgb8();
+        assert_eq!(raster.dimensions(), (400, 200), "the panel is the raster");
+
+        // The document's first line is the panel's first line: no letterbox band
+        // above it, and the ink runs the panel's full width.
+        assert!(luma(raster.get_pixel(0, 0)) < 128, "starts at the top-left");
+        assert!(
+            luma(raster.get_pixel(399, 1)) < 128,
+            "spans the panel's width"
+        );
+        // The rule at the document's row 150 is at the raster's row 150: the
+        // text keeps the size the layout gave it, which is what "fitting" a
+        // 400x600 document into 400x200 would have halved.
+        assert!(
+            luma(raster.get_pixel(200, 151)) < 128,
+            "the document is not scaled down"
+        );
+        assert!(
+            luma(raster.get_pixel(200, 100)) > 200,
+            "and not repainted where the document is blank"
+        );
+
+        // The preview is the same window, one scale factor apart: 856/400 of 600
+        // document rows is 1284, of which the 540-row panel shows the top 252.
+        let RenderResult::Ready(png) =
+            render_back_display(&bytes, BackDepth::Color, Placement::TopLeft)
+        else {
+            panic!("display failed")
+        };
+        let shown = image::load_from_memory(&png).expect("png").to_rgb8();
+        assert!(
+            luma(shown.get_pixel(0, 0)) < 128,
+            "the preview is anchored too"
+        );
+        // Document row 150 lands at display row 321; the rows past the panel
+        // (from document row 252 on) are simply not there.
+        assert!(
+            luma(shown.get_pixel(400, 322)) < 128,
+            "the same rule, at preview scale"
+        );
+        assert!(
+            luma(shown.get_pixel(400, 500)) > 200,
+            "the bottom of the preview is the document's own blank paper"
+        );
+    }
+
     /// A black-panel back is a 1-bit raster built from the same framing, and the
     /// display preview is that same reduction — ink stays ink, paper stays paper.
     #[test]
@@ -659,19 +802,23 @@ mod tests {
         }
         let bytes = png_of(img);
 
-        let RenderResult::Ready(bmp) = render_back_raster(&bytes, &size, BackDepth::Black) else {
+        let RenderResult::Ready(bmp) =
+            render_back_raster(&bytes, &size, BackDepth::Black, Placement::Fit)
+        else {
             panic!("black raster failed")
         };
         assert_eq!(bmp[28], 1, "one bit per pixel on a black back");
         assert!(!bmp.is_empty());
 
-        let color = render_back_raster(&bytes, &size, BackDepth::Color);
+        let color = render_back_raster(&bytes, &size, BackDepth::Color, Placement::Fit);
         let RenderResult::Ready(color) = color else {
             panic!("colour raster failed")
         };
         assert_eq!(color[28], 24, "a colour back stays 24-bit");
 
-        let RenderResult::Ready(display) = render_back_display(&bytes, BackDepth::Black) else {
+        let RenderResult::Ready(display) =
+            render_back_display(&bytes, BackDepth::Black, Placement::Fit)
+        else {
             panic!("black display failed")
         };
         let shown = image::load_from_memory(&display).expect("png").to_luma8();
@@ -692,7 +839,7 @@ mod tests {
             height: 126,
         };
         assert!(matches!(
-            render_back_raster(b"not an image", &size, BackDepth::Black),
+            render_back_raster(b"not an image", &size, BackDepth::Black, Placement::Fit),
             RenderResult::Failed(_)
         ));
     }

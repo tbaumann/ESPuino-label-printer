@@ -1,7 +1,6 @@
 <script lang="ts">
   import {
     api,
-    backDepth,
     BACK_SOURCES,
     type BackSource,
     type Card,
@@ -9,6 +8,7 @@
     type Ribbon,
   } from './api'
   import CardFields from './cards/CardFields.svelte'
+  import MarkdownEditor from './cards/MarkdownEditor.svelte'
 
   let {
     prefix,
@@ -37,10 +37,6 @@
   // whatever the ribbon is.
   const choices = BACK_SOURCES
 
-  // The colour depth the server will render a back in. A property of the
-  // ribbon, so the preview can be honest about it.
-  const depth = $derived(backDepth(ribbon))
-
   // This row owns its editable copy of the back, resyncing from the PATCH
   // response. Rows are keyed by card id and the parent only re-fetches after an
   // upload or delete, so these initial values stay in step.
@@ -60,6 +56,11 @@
   // on any other source — so the editor waits for it.
   let changingSource = $state(false)
   let timer: ReturnType<typeof setTimeout> | undefined
+  // Text the server has not been told about yet. A write goes out when the
+  // customer stops typing or leaves the box — never mid-sentence, because every
+  // write of a card re-renders its rasters.
+  let textPending = false
+  const TEXT_IDLE_MS = 1200
   // $state because the input is bound under a condition, so the reference is
   // re-assigned when the pane becomes (or stops being) an image back.
   let fileInput = $state<HTMLInputElement | undefined>()
@@ -83,46 +84,70 @@
   // in it, which is right there.
   const pickOnClick = $derived(dropTarget && !hasBackImage)
 
-  /** Apply a card patch, keeping the local state in step with the response. */
-  async function apply(patch: CardPatch) {
+  /**
+   * Write a patch to this card, and hand the response to the page.
+   *
+   * Deliberately does NOT copy the response back into the fields being edited:
+   * the server stores what it was sent, so an echo can only overwrite what the
+   * customer typed while the request was in flight — which is exactly how the
+   * text editor used to eat keystrokes.
+   */
+  async function patch(p: CardPatch): Promise<Card | null> {
     errMsg = ''
     try {
-      const updated = await api.patchCard(prefix, card.id, patch)
-      back = updated.back
-      backText = updated.back_text ?? ''
-      hasBackImage = !!updated.back_image_content_type
+      const updated = await api.patchCard(prefix, card.id, p)
       onCardUpdated?.(updated)
-      return true
+      return updated
     } catch (e) {
       errMsg = (e as Error).message
       saveState = 'error'
-      return false
+      return null
     }
   }
 
   /** Choose what this card's back is. One write, one source. */
   async function choose(next: BackSource) {
     if (!writable || next === back || changingSource) return
-    clearTimeout(timer)
+    // Text typed but not yet written goes out first: a card keeps its text
+    // across a source change, so leaving it behind would lose it.
+    await flushText()
     const previous = back
     back = next // optimistic, so the editor for it appears at once
     changingSource = true
-    const ok = await apply({ back: next })
+    const ok = (await patch({ back: next })) !== null
     changingSource = false
     if (!ok) back = previous
   }
 
-  function scheduleText() {
-    if (!writable || back !== 'markdown' || changingSource) return
+  /** Whether this row may write text at all: a draft, whose back is markdown. */
+  const writingText = () => writable && back === 'markdown' && !changingSource
+
+  /** The editor's text changed: note it, and arm a write for when typing stops. */
+  function onTextChange(markdown: string) {
+    backText = markdown
+    if (!writingText()) return
+    textPending = true
     clearTimeout(timer)
     saveState = 'idle'
-    timer = setTimeout(saveText, 600)
+    timer = setTimeout(() => void saveText(), TEXT_IDLE_MS)
   }
 
+  /** Write the text now — leaving the box, or moving to another back source. */
+  async function flushText() {
+    clearTimeout(timer)
+    await saveText()
+  }
+
+  /** The one writer of `back_text`: whatever is in the box right now. */
   async function saveText() {
+    if (!textPending || !writingText()) return
+    const sent = backText
+    textPending = false
     saveState = 'saving'
-    const ok = await apply({ back_text: backText })
-    saveState = ok ? 'saved' : 'error'
+    const updated = await patch({ back_text: sent })
+    if (updated) saveState = 'saved'
+    // Still unwritten: the next keystroke, or leaving the box, retries it.
+    else textPending = true
   }
 
   /**
@@ -138,7 +163,6 @@
       const updated = await api.uploadBackImage(prefix, card.id, file)
       hasBackImage = !!updated.back_image_content_type
       back = updated.back
-      backText = updated.back_text ?? ''
       onCardUpdated?.(updated)
     } catch (e) {
       errMsg = (e as Error).message
@@ -172,15 +196,6 @@
     if (file) await uploadImage(file)
     else errMsg = 'That is not an image (png, jpg, webp or gif).'
   }
-
-  /** The caption under the back pane: what will actually be printed there. */
-  const backCaption = $derived(
-    back === 'front'
-      ? `back · the front again, ${DEPTH_NOTE[depth]}`
-      : back === 'markdown'
-        ? `back · text, ${DEPTH_NOTE[depth]}`
-        : `back · the picture, ${DEPTH_NOTE[depth]}`,
-  )
 </script>
 
 <article class="card" class:preview-only={readonly}>
@@ -278,18 +293,6 @@
           {/each}
         </div>
 
-        {#if back === 'markdown'}
-          <label for={`back-${card.id}`}>Back text (markdown)</label>
-          <textarea
-            id={`back-${card.id}`}
-            rows="5"
-            bind:value={backText}
-            oninput={scheduleText}
-            disabled={!writable || changingSource}
-            placeholder="song list"
-          ></textarea>
-        {/if}
-
         <div class="row" style="margin-top:6px">
           {#if busy || changingSource}
             <span class="save-state"><span class="spinner"></span> saving…</span>
@@ -303,6 +306,22 @@
           {/if}
         </div>
       </div>
+
+      {#if back === 'markdown'}
+        <!-- The text is a column of its own, beside the choice rather than under
+             it: on a markdown back the box is the thing being worked in, and a
+             narrow one below four option rows is unusable. -->
+        <div class="side editor text-editor">
+          <div class="field-label">Back text (markdown)</div>
+          <MarkdownEditor
+            value={backText}
+            placeholder="song list"
+            disabled={!writable || changingSource}
+            onchange={onTextChange}
+            onblur={flushText}
+          />
+        </div>
+      {/if}
     {/if}
   </div>
 </article>

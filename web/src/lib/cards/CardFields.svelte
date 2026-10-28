@@ -36,12 +36,23 @@
   let saveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
   let errMsg = $state('')
   let timer: ReturnType<typeof setTimeout> | undefined
+  // Typed, not yet written. A write goes out when the customer stops typing or
+  // leaves the field, never mid-word.
+  let pending = false
+  const NAME_IDLE_MS = 1200
 
   function schedule() {
     if (!writable) return
+    pending = true
     clearTimeout(timer)
     saveState = 'idle'
-    timer = setTimeout(save, 600)
+    timer = setTimeout(() => void save(), NAME_IDLE_MS)
+  }
+
+  /** Write the name now — leaving the field, or when typing has stopped. */
+  async function flush() {
+    clearTimeout(timer)
+    await save()
   }
 
   // Only the shared name field: the back side is the mode component's to write,
@@ -49,16 +60,21 @@
   // serial number is not edited from the UI, so it is not part of this PATCH
   // either (it lives on in the model and stays settable via the API).
   async function save() {
+    if (!pending || !writable) return
+    const sent = name
+    pending = false
     saveState = 'saving'
     try {
-      const updated = await api.patchCard(prefix, card.id, {
-        name,
-      })
-      name = updated.name
+      // The response is deliberately not copied back into the field — it is the
+      // name that was sent, and the customer may have typed on since; echoing it
+      // is what used to eat those keystrokes.
+      await api.patchCard(prefix, card.id, { name: sent })
       saveState = 'saved'
     } catch (e) {
       errMsg = (e as Error).message
       saveState = 'error'
+      // Still unwritten: the next keystroke, or leaving the field, retries it.
+      pending = true
     }
   }
 </script>
@@ -74,7 +90,14 @@
   {:else}
     <div class="head-field">
       <label for={`name-${card.id}`}>Name</label>
-      <input id={`name-${card.id}`} type="text" bind:value={name} oninput={schedule} disabled={!writable} />
+      <input
+        id={`name-${card.id}`}
+        type="text"
+        bind:value={name}
+        oninput={schedule}
+        onblur={flush}
+        disabled={!writable}
+      />
     </div>
   {/if}
 

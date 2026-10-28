@@ -173,15 +173,30 @@ two places on purpose: which back the card *has* is chosen in the editor (one
 button per source, all four on either ribbon, with what that source needs under
 it), while the **file chooser for an `image` back sits under the back pane**,
 beside its caption — the pane is the picture it chooses, and stays unobstructed.
-`cards/CardFields.svelte` holds the shared header (name, delete and the
-debounced save).
+`cards/CardFields.svelte` holds the shared header (name, delete and the save
+state).
 
 | `back` | Printed on the back | The pane shows | The editor offers |
 |--------|---------------------|----------------|-------------------|
 | `none` | nothing — a single-sided card | no back pane at all | nothing to supply |
 | `front` | the front image again | the server's render of it | nothing to supply |
 | `image` | a second uploaded picture | the server's render, or the drop prompt | the file chooser, under the pane |
-| `markdown` | text, rendered to an image | the server's render | the back-text textarea |
+| `markdown` | text, rendered to an image | the server's render | the markdown editor, in a column of its own |
+
+A markdown back is edited **as the formatting it will have**, in a Tiptap editor
+(`cards/MarkdownEditor.svelte`) whose value in and out is the markdown itself:
+the toolbar applies the constructs, and what the customer sees is what the
+backend is handed. The editor's schema carries everything a back can hold — the
+starter set plus pictures, tables and task lists — so editing a card cannot drop
+a construct the backend would have printed. The pane beside it is still the
+server's render and nothing else. The editor is also where the layout lives: it
+sits in its own column beside the back-source choice rather than under it.
+
+The two text fields — a card's name and its back text — are written **when the
+customer stops writing or leaves the field** (a 1200 ms idle timer, plus `blur`),
+never per keystroke: every write of a card re-renders its rasters. A response is
+never copied back into the field it came from (the server stores what it was
+sent), which is what keeps the text that was typed while a write was in flight.
 
 Every back has exactly one picture in the UI, and it is the server's:
 `display/back`, rendered at the ribbon's colour depth. The row never draws a back
@@ -211,11 +226,17 @@ Completing it needs no new state — the badge and the button follow the write.
 
 A markdown back is no exception: the server renders the text with the `markie`
 backend the flake packages (`MARKIE_BIN`, see "Markdown in the back text" in
-TODO.md), then fits that picture to the printer's bitmap and reduces it to the
-ribbon's depth — the same path an uploaded picture takes. So the pane shows what
-would print, never a picture of its own, and a markdown back whose render fails
-reports the card not printable with the reason the backend gave. The print queue
-carries no rendering either way.
+TODO.md), then places that picture on the printer's bitmap and reduces it to the
+ribbon's depth — the same path an uploaded picture takes, differing only in
+*where the picture lands*. A rendered document is anchored at the panel's
+top-left, at the width the card was laid out for, and whatever runs past the
+panel is clipped: a long song list keeps the text size the layout gave it and is
+cut at the card's edge rather than shrunk to fit. An uploaded picture is instead
+scaled to fit inside the panel and centred, so none of it goes missing.
+`render::Placement` is that choice, named at the call site rather than defaulted.
+Either way the pane shows what would print, never a picture of its own, and a
+markdown back whose render fails reports the card not printable with the reason
+the backend gave. The print queue carries no rendering either way.
 
 The panes load the **server-derived display images** — `display/front` for the
 front, `display/back` for every back whatever its source — so the aspect, the
