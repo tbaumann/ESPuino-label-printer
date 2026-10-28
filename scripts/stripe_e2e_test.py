@@ -54,7 +54,7 @@ PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", BASE)
 # itself, so the expectation is a constant rather than the server's environment.
 CUSTOMER_EMAIL = "ada@example.test"
 # What section 3's order costs, and therefore what Stripe reports back and the
-# order confirmation states: two cards on the default YMCKOK ribbon — that
+# order confirmation states: two cards on the black-back (YMCKOK) ribbon — that
 # ribbon prices a whole card, so that is two units, not four printed sides —
 # plus the flat shipping. Derived once so the amount assertions cannot drift
 # from the session they describe.
@@ -182,10 +182,10 @@ def payment_event(
             obj["metadata"] = {"prefix": prefix}
         else:
             obj["client_reference_id"] = prefix
-    # What section 3's session is priced at — two cards on the default YMCKOK
-    # ribbon is two *cards* (that ribbon prices per card), plus shipping. Stripe
-    # always reports both the amount and the currency, and the order confirmation
-    # states the amount.
+    # What section 3's session is priced at — two cards on the black-back
+    # (YMCKOK) ribbon is two *cards* (that ribbon prices per card), plus
+    # shipping. Stripe always reports both the amount and the currency, and the
+    # order confirmation states the amount.
     obj["amount_total"] = amount_total
     obj["currency"] = currency
     if customer_email is not None:
@@ -219,7 +219,11 @@ def prefix_order_ref(prefix: str) -> Any:
 
 
 def new_prefix(cards: int = 0, start_checkout: bool = False) -> str:
-    status, created = json_request("POST", "/api/prefixes")
+    # Every price assertion in this suite is the BLACK-BACK ribbon's arithmetic
+    # (one unit per whole card, however the backs are filled in), so it asks for
+    # that ribbon explicitly. A prefix created without one is on the colour
+    # ribbon, whose unit is a printed side — checked in section 1.
+    status, created = json_request("POST", "/api/prefixes", {"ribbon": "ymckok"})
     assert status == 201, (status, created)
     prefix = created["uuid"]
     png = open(CARD_PNG, "rb").read()
@@ -285,7 +289,7 @@ check(
     str(prices),
 )
 check(
-    "one card/printed side on the default ribbon is 500",
+    "the price of one billing unit on the black-back ribbon is 500",
     prices.get("ymckok") == 500,
     str(prices),
 )
@@ -294,6 +298,15 @@ check(
     "each price says what its unit is: a side on YMCKO, a card on YMCKOK",
     units == {"ymcko": "side", "ymckok": "card"},
     str(units),
+)
+
+# A prefix created with no ribbon at all lands on the DEFAULT one, and the
+# default is the colour ribbon — the black-back one is a choice, not a fallback.
+status, defaulted = json_request("POST", "/api/prefixes")
+check(
+    "a new prefix defaults to the colour ribbon (ymcko)",
+    status == 201 and (defaulted or {}).get("ribbon") == "ymcko",
+    str((defaulted or {}).get("ribbon")),
 )
 check("shipping is 250", config.get("shipping_cents") == 250, str(config.get("shipping_cents")))
 check("shipping countries include DE", "DE" in config.get("countries", []), str(config.get("countries")))
@@ -397,9 +410,9 @@ else:
         field("metadata[prefix]") == prefix,
         str(field("metadata[prefix]")),
     )
-    # Two cards on the default YMCKOK ribbon. That ribbon prices a whole card,
-    # so the order is two units however its backs are filled in — one per card,
-    # not two per card as the old always-two rule charged.
+    # Two cards on the black-back (YMCKOK) ribbon. That ribbon prices a whole
+    # card, so the order is two units however its backs are filled in — one per
+    # card, not two per card as the old always-two rule charged.
     check(
         "quantity is the number of cards on this ribbon",
         field("line_items[0][quantity]") == "2",

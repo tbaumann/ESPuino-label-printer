@@ -353,7 +353,14 @@ console.log('\nB. project page renders a card')
   console.log('\nB2. a markdown back is the server\'s to render')
   {
     const mdPrefix = (
-      await api('/api/prefixes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      await api('/api/prefixes', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // Explicitly the BLACK-BACK ribbon: this scenario is about what the
+        // black panel does with a rendered document (1-bit, a `black` back in
+        // the queue, one billed card). The default is the colour one.
+        body: JSON.stringify({ ribbon: 'ymckok' }),
+      })
     ).uuid
 
     const md = [
@@ -614,6 +621,12 @@ console.log('\nG. pay button')
       })
     ).uuid
 
+    // Created with no ribbon at all, so this is the default — and the default is
+    // the COLOUR ribbon: YMCKOK is a choice, not a fallback.
+    const fresh = await api(`/api/prefixes/${prefix}`)
+    check('a new project is on the default ribbon — ymcko',
+      fresh.ribbon === 'ymcko', String(fresh.ribbon))
+
     const fd = new NodeFormData()
     fd.append('name', 'Payable Card')
     fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'pay.png')
@@ -630,13 +643,13 @@ console.log('\nG. pay button')
       text.slice(0, 160),
     )
     check('there is no submit button', !/Submit/.test(text), text.slice(0, 200))
-    // The default ribbon is YMCKOK, whose price is per *card*: one card at 500
-    // + 250 shipping = 750 minor units. Charging it as two printed sides (as the
-    // old always-two rule did) would double it. Match the digits, not the
+    // On the default (colour) ribbon a single-sided card is ONE printed side at
+    // 500 + 250 shipping = 750 minor units. The old always-two rule charged two
+    // sides for it and would double the total. Match the digits, not the
     // currency formatting, which depends on the host locale.
     check('the total is shown', /7[.,]50/.test(text), text.slice(0, 300))
-    check('the price is per card on a black-back ribbon, not per side',
-      /1 card ×/.test(text), text.slice(0, 300))
+    check('a single-sided card is billed as one printed side, not two',
+      /1 side ×/.test(text), text.slice(0, 300))
 
     const before = seen.length
     const payButton = [...w.document.querySelectorAll('button')].find((b) =>

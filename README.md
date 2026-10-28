@@ -521,8 +521,8 @@ data/
   never part of the public prefix JSON, whose uuid is the customer's only
   credential. Empty until the payment settles, and on a checkout that collected
   no address.
-- **Ribbons** — `ymcko` (colour front and a full-colour back) and `ymckok`
-  (colour front, black-and-white back; the **default**). The one choice per
+- **Ribbons** — `ymcko` (colour front and a full-colour back; the **default**)
+  and `ymckok` (colour front, black-and-white back). The one choice per
   *job*, because a batch cannot mix ribbon loads. Set at prefix creation or via
   `PATCH /api/prefixes/{prefix}` while the prefix is still writable. The switch
   is always lossless: no card is tied to the ribbon except in how it is

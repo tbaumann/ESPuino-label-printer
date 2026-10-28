@@ -85,7 +85,7 @@ pub async fn create_prefix(
     ribbon: Option<Ribbon>,
 ) -> Result<Prefix, ApiError> {
     let uuid = uuid.unwrap_or_else(Uuid::new_v4);
-    let ribbon = ribbon.unwrap_or(Ribbon::Ymckok);
+    let ribbon = ribbon.unwrap_or(Ribbon::Ymcko);
     let res = sqlx::query(
         "INSERT INTO prefixes (uuid, status, status_changed_at, ribbon)
          VALUES (?1, 'draft', datetime('now'), ?2)",
@@ -1429,10 +1429,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_defaults_to_ymckok() {
+    async fn prefix_defaults_to_ymcko() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
-        assert_eq!(p.ribbon, Ribbon::Ymckok);
+        assert_eq!(p.ribbon, Ribbon::Ymcko);
     }
 
     #[tokio::test]

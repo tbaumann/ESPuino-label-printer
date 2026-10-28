@@ -254,7 +254,7 @@ pub struct Prefix {
     pub status_changed_at: Option<String>,
     /// The ribbon this order is printed with — the one choice that has to be
     /// made per job, because a batch cannot mix ribbon loads. Defaults to
-    /// `ymckok`. Changing it re-renders the cards' back sides; it is the only
+    /// `ymcko`. Changing it re-renders the cards' back sides; it is the only
     /// thing that decides what the printer is fed.
     pub ribbon: Ribbon,
     /// External shop/order reference, typically set when the order is paid.
@@ -497,7 +497,7 @@ pub struct CardInput {
 pub struct PrefixInput {
     pub uuid: Option<Uuid>,
     /// The ribbon this job is printed with. Omitted (or null) means the default
-    /// `ymckok`.
+    /// `ymcko`.
     pub ribbon: Option<Ribbon>,
 }
 
