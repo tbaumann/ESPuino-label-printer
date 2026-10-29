@@ -248,7 +248,7 @@
   <a href="/swagger-ui/" target="_blank" rel="noreferrer" class="muted" style="text-decoration:none">API</a>
 </div>
 
-<div class="app">
+<div class="app wide">
   {#if error}
     <div class="error">{error}</div>
   {/if}

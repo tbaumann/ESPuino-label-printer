@@ -133,6 +133,15 @@ label,
   padding: 20px 20px 64px;
 }
 
+/* The pages that show a card row take the screen's width instead. A card row is
+   up to four columns — the front, the back, the back-side chooser and, on a
+   markdown back, the text box — and at a reading width they crush each other:
+   the two previews come out at 200px, which is no preview at all. 1100px stays
+   the measure for the pages that are mostly prose. */
+.app.wide {
+  max-width: 1920px;
+}
+
 .topbar {
   display: flex;
   align-items: center;
@@ -356,8 +365,13 @@ section.panel {
   min-width: 0;
 }
 
-/* The image row: front side, back side, and (when editable) the back editor,
-   side by side. Wraps onto its own lines on narrow screens. */
+/* The image row: the front side, the back side, the back-side chooser and —
+   when it is editable — the text box, side by side. Each column asks for the
+   width it is worth reading at, so a line with no room left for the next column
+   wraps it onto a line of its own at the full width of the row: a phone ends up
+   with one column per line, and nothing is ever squeezed below the width it
+   asked for. Asking for 200px — what this was — is what turned both previews
+   into 200px thumbnails the moment the text box joined the row. */
 .image-row {
   display: flex;
   flex-wrap: wrap;
@@ -365,12 +379,19 @@ section.panel {
   align-items: flex-start;
 }
 
+/* The two previews: what a preview is worth showing at is whatever is left over
+   on its line, so they grow — but never past the width the server renders a
+   display artifact at, because a pane wider than its own picture is an upscaled
+   one, and this pane is what the customer judges the card by. The flex-basis is
+   what makes the row wrap instead of crush. */
 .image-row .side {
-  flex: 1 1 200px;
-  min-width: 180px;
-  max-width: 320px;
+  flex: 1 1 320px;
+  max-width: 856px; /* render::DISPLAY_WIDTH — the artifact's own width */
+  min-width: 0;
 }
 
+/* The back-side chooser keeps its measure: a list of options with a sentence
+   under each reads worse the wider it gets. */
 .image-row .side.editor {
   flex: 1 1 240px;
   max-width: 360px;
@@ -381,16 +402,14 @@ section.panel {
 
 /* The markdown editor is a column of its own, beside the back-side choice
    instead of under it: on a markdown back the box is the thing being worked in,
-   and stacked under four option rows it has no width to write in. */
+   and stacked under four option rows it has no width to write in. It gets a
+   double share of the row and takes the rest of its line — under the row when
+   there is no room for it beside. The ceiling has to be said out loud: the box
+   carries `editor` as well, for the column layout, so the chooser's 360px would
+   otherwise cap it. */
 .image-row .side.text-editor {
-  flex: 2 1 320px;
-  max-width: 560px;
-}
-
-@media (max-width: 860px) {
-  .image-row .side {
-    max-width: none;
-  }
+  flex: 2 1 520px;
+  max-width: none;
 }
 
 .preview {
@@ -478,11 +497,6 @@ input[type='file']::file-selector-button {
 input[type='file']:disabled::file-selector-button {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.no-back-side {
-  font-size: 12px;
-  line-height: 1.35;
 }
 
 .preview .caption {
