@@ -72,7 +72,9 @@ export interface Card {
   back: BackSource
   /**
    * Markdown a `markdown` back is rendered from, in the ribbon's colour depth.
-   * `null` for every other back, and for a markdown card with no text yet.
+   * A card whose back is something else may carry one too — stored and unused,
+   * waiting for the back to become markdown — and `null` means the card has no
+   * text at all.
    */
   back_text: string | null
   image_content_type: string

@@ -719,11 +719,13 @@ Card create/update (`POST`/`PUT`) takes `multipart/form-data` with fields
 `name`, `serial_number`, `back`, `back_text` and a file part `image`, plus an
 optional `back_image` file part. `back` is one of `none`, `front`, `image` or
 `markdown`, and defaults to `none` (a single-sided card); sending a `back_image`
-part implies `back=image`. `back_text` is only accepted for a `markdown` back;
-no ribbon restricts a back *source*, so `400` is for a form that contradicts
-itself, never for a choice the ribbon dislikes. `serial_number` here is a serial
-you assign yourself; the card's RFID UID is written by the print process through
-`POST .../cards/{id}/printed`.
+part implies `back=image`. `back_text` is the markdown a `markdown` back is
+rendered from, and it is stored whatever the back is: a card whose back is not
+markdown keeps it for the day it becomes one, so sending a text never selects a
+back side. No ribbon restricts a back *source*, so `400` is for a form that
+contradicts itself, never for a choice the ribbon dislikes. `serial_number` here
+is a serial you assign yourself; the card's RFID UID is written by the print
+process through `POST .../cards/{id}/printed`.
 
 `back_image` is optional even for an `image` back, because cards are created by
 the front-image dropzone, one file at a time. A card without one is simply not

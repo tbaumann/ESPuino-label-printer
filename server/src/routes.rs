@@ -98,7 +98,10 @@ struct StoredCard {
     serial_number: Option<String>,
     /// The card's back side, already validated against the prefix's ribbon.
     back: BackSource,
-    /// Markdown for a `markdown` back; `None` otherwise.
+    /// Markdown for the card's back. Stored whatever the back source is: a card
+    /// whose back is not `markdown` keeps the text for the day it becomes one
+    /// (a client may pre-fill a track list without choosing a back side, which
+    /// spends a ribbon panel), and only a `markdown` back renders it.
     back_text: Option<String>,
     image_rel: String,
     image_content_type: String,
@@ -228,12 +231,6 @@ async fn store_card_form(
         (None, true) => BackSource::Image,
         (None, false) => BackSource::None,
     };
-
-    if back_text.is_some() && back != BackSource::Markdown {
-        return Err(ApiError::BadRequest(format!(
-            "back_text is only valid for a 'markdown' back, not '{back}'"
-        )));
-    }
 
     let image_rel = write_blob(
         data_dir,

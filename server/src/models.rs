@@ -387,9 +387,11 @@ pub struct Card {
     /// [`BackSource::None`] is a single-sided card.
     pub back: BackSource,
     /// Markdown source for a [`BackSource::Markdown`] back — the text the
-    /// server renders, at the ribbon's colour depth, into the back image.
-    /// `None` for every other source, and for a markdown card whose text has
-    /// been cleared.
+    /// server renders, at the ribbon's colour depth, into the back image. A
+    /// card whose back is something else may carry a text too — it is stored
+    /// and unused, waiting for the back to become markdown (a client may
+    /// pre-fill a track list without choosing a back side); `None` means the
+    /// card has no text at all, cleared or never given one.
     pub back_text: Option<String>,
     pub image_content_type: String,
     /// Non-None only when this card's back is [`BackSource::Image`] and one has
@@ -469,12 +471,13 @@ pub struct CardIndex {
 /// as a multipart file part named "image"). Documents the multipart form for
 /// OpenAPI; the handler parses the fields directly.
 ///
-/// `back` is the per-card single/double-sided choice. `back_text` is only
-/// meaningful for a `markdown` back and is refused otherwise; a `back_image`
-/// file part is the `image` back's material. Every back source is allowed on
-/// either ribbon — the ribbon only decides how the back is rendered — so the
-/// handler rejects a form that contradicts itself, not a back the ribbon
-/// "cannot print".
+/// `back` is the per-card single/double-sided choice. `back_text` is the text a
+/// `markdown` back renders from, and is stored whatever the back source is: a
+/// card whose back is not markdown keeps it for the day it becomes one, so
+/// sending a text does not choose a back side. A `back_image` file part is the
+/// `image` back's material. Every back source is allowed on either ribbon — the
+/// ribbon only decides how the back is rendered — so the handler rejects a form
+/// that contradicts itself, not a back the ribbon "cannot print".
 ///
 /// `back_image` is optional even for an `image` back: cards are created by the
 /// folder-at-a-time front-image upload, and the per-card back is filled in

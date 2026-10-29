@@ -574,8 +574,9 @@ pub struct CardContent<'a> {
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
 ///
 /// A `back_image_path`/`back_image_content_type` of `None` clears any stored
-/// back image. Whether a `back_text` goes with the `back` is enforced by the
-/// route layer before this is called; no ribbon rules out a back source.
+/// back image. A `back_text` is stored whatever the back source is — only a
+/// `markdown` back renders it (see [`back_renders`]) — and no ribbon rules out a
+/// back source.
 pub async fn upsert_card(
     pool: &SqlitePool,
     prefix: Uuid,
@@ -710,8 +711,13 @@ pub async fn billed_units(
 /// Update a card's metadata without touching its front image.
 ///
 /// The back side is one choice, so a patch carries at most one intent for it:
-/// the new `back` and, for a markdown back, its text. Both are validated before
-/// anything is written, so a refused patch leaves the card exactly as it was.
+/// the new `back` and its text. The text is deliberately **not** tied to a
+/// `markdown` source: it is stored whatever the back is and only rendered once
+/// the back is markdown, so a client that pre-fills a track list does not
+/// thereby pick a back side — which spends a ribbon panel.
+///
+/// The one field with a rule of its own, the name, is validated before anything
+/// is written, so a refused patch leaves the card exactly as it was.
 ///
 /// No ribbon can refuse a back: every source is printable on either ribbon, and
 /// the ribbon only decides the depth the back is rendered in.
@@ -725,16 +731,22 @@ pub async fn update_card_meta(
     id: i64,
     patch: &CardPatch,
 ) -> Result<Card, ApiError> {
-    let card = get_card(pool, prefix, id).await?; // 404 if the card is unknown
+    // 404 if the card is unknown — nothing below can then write anything.
+    get_card(pool, prefix, id).await?;
 
-    // Validate the whole back change before writing any of it.
-    if let Some(text) = patch.back_text.as_deref() {
-        let effective = patch.back.unwrap_or(card.back);
-        if effective != BackSource::Markdown {
-            return Err(ApiError::BadRequest(
-                "back_text is only valid for a 'markdown' back".into(),
-            ));
+    // Validated first, so nothing of a refused patch lands.
+    let name = match patch.name.as_deref() {
+        Some(raw) => {
+            let name = raw.trim();
+            if name.is_empty() {
+                return Err(ApiError::BadRequest("name must not be empty".into()));
+            }
+            Some(name)
         }
+        None => None,
+    };
+
+    if let Some(text) = patch.back_text.as_deref() {
         let value = if text.trim().is_empty() {
             None
         } else {
@@ -763,11 +775,7 @@ pub async fn update_card_meta(
         .await?;
     }
 
-    if let Some(raw) = patch.name.as_deref() {
-        let name = raw.trim();
-        if name.is_empty() {
-            return Err(ApiError::BadRequest("name must not be empty".into()));
-        }
+    if let Some(name) = name {
         sqlx::query(
             "UPDATE cards SET name = ?3, updated_at = datetime('now')
               WHERE prefix_uuid = ?1 AND id = ?2",
@@ -1673,16 +1681,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Card patches: the back is one choice, validated as one
+    // Card patches: the back is one choice, and its text does not pick it
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn back_text_is_refused_unless_the_back_is_markdown() {
+    async fn back_text_is_stored_without_a_markdown_back() {
         let pool = test_pool().await;
         let p = create_prefix(&pool, None, None).await.expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
 
-        let err = update_card_meta(
+        // A text can arrive on a card whose back is not markdown: that is how a
+        // client pre-fills a track list without choosing a back side (which
+        // spends a ribbon panel). It is stored, and nothing renders it yet.
+        let updated = update_card_meta(
             &pool,
             p.uuid,
             1,
@@ -1692,24 +1703,30 @@ mod tests {
             },
         )
         .await
-        .expect_err("back_text on a single-sided card");
-        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        .expect("back_text on a single-sided card");
+        assert_eq!(updated.back, BackSource::None);
+        assert_eq!(updated.back_text.as_deref(), Some("# Songs"));
+        assert!(
+            updated.display_back.is_none(),
+            "a `none` back renders nothing"
+        );
 
-        // Setting the source and the text together is one accepted patch.
+        // Setting the source and the text together is one accepted patch, and
+        // the stored text is then what the back renders from.
         let updated = update_card_meta(
             &pool,
             p.uuid,
             1,
             &CardPatch {
                 back: Some(BackSource::Markdown),
-                back_text: Some("# Songs".into()),
                 ..Default::default()
             },
         )
         .await
-        .expect("source and text together");
+        .expect("the source alone keeps the text");
         assert_eq!(updated.back, BackSource::Markdown);
         assert_eq!(updated.back_text.as_deref(), Some("# Songs"));
+        assert!(updated.display_back.is_some(), "a markdown back renders");
     }
 
     #[tokio::test]
@@ -1758,21 +1775,21 @@ mod tests {
         let p = create_prefix(&pool, None, None).await.expect("create");
         card(&pool, p.uuid, 1, BackSource::None).await;
 
-        // The name is valid; text against a back that is not markdown is not.
-        // (No ribbon rule can refuse a patch any more, so this is the one
-        // self-contradiction left.) Neither half may land.
+        // The name is the one field with a rule of its own now (no ribbon rule
+        // can refuse a patch, and a `back_text` no longer needs a markdown
+        // back), so it is what refuses the patch — and neither half may land.
         let err = update_card_meta(
             &pool,
             p.uuid,
             1,
             &CardPatch {
-                name: Some("Renamed".into()),
+                name: Some("   ".into()),
                 back_text: Some("- one".into()),
                 ..Default::default()
             },
         )
         .await
-        .expect_err("back_text on a single-sided card");
+        .expect_err("a blank name");
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
 
         let c = get_card(&pool, p.uuid, 1).await.expect("card");
@@ -1780,6 +1797,7 @@ mod tests {
             c.name, "c",
             "the valid half of a refused patch must not land"
         );
+        assert_eq!(c.back_text, None);
         assert_eq!(c.back, BackSource::None);
     }
 

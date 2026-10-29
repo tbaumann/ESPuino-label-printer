@@ -51,9 +51,9 @@
   let over = $state(false)
   let errMsg = $state('')
   let saveState = $state<'idle' | 'saving' | 'saved' | 'error'>('idle')
-  // True while the back *source* itself is still being written. The text may
-  // not be sent before the server knows the back is markdown — it refuses text
-  // on any other source — so the editor waits for it.
+  // True while the back *source* itself is still being written. The text box
+  // exists only for a markdown back, and a text write waits until the server
+  // has that source, so the two never race.
   let changingSource = $state(false)
   let timer: ReturnType<typeof setTimeout> | undefined
   // Text the server has not been told about yet. A write goes out when the
@@ -208,9 +208,10 @@
       </div>
     </div>
 
-    {#if back === 'none'}
-      <div class="side no-back-side muted"></div>
-    {:else}
+    <!-- A single-sided card has no back to show, and no column reserved for one:
+         the chooser takes the place the back pane would have had rather than
+         leaving a pane-wide gap between the two. -->
+    {#if back !== 'none'}
       <div class="side">
         <div class="preview back" class:droppable={pickOnClick} class:over>
           <div class="back-body">
