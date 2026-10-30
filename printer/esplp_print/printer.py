@@ -20,10 +20,12 @@ is: both ribbons print the same set of card backs, and the server's raster is
 what differs — a 24-bit colour BMP on YMCKO, a 1-bit one on YMCKOK. Whichever
 it sends is fed verbatim (see `print_card`).
 
-A card's RFID UID is read before it is printed, with the card parked under the
-contactless station (`read_card_uid`). That reader is separate hardware from the
-print engine and is not installed yet, so the read itself is a stub today — the
-card handling around it is real, and the spooler runs it for every card.
+A card's RFID UID is read before it is printed: the printer feeds the card and
+parks it at the contactless station (`read_card_uid`), where the reader in the
+printer's encoder slot can see it, and that reader is then asked for the UID
+over HTTP (a separate device — see `reader.py`). A `Printer` is handed its
+reader rather than having that step optional, so the read runs for every card;
+what can degrade is the answer, never whether the read was attempted.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import evolis  # deferred import; only for type checking
+    from .reader import NfcReader
 
 RIBBON_YMCKO = "ymcko"
 RIBBON_YMCKOK = "ymckok"
@@ -41,10 +44,11 @@ BACK_NONE = "none"
 BACK_COLOR = "color"
 BACK_BLACK = "black"
 
-# The RFID UID as an ESPuino reports it: four bytes, each formatted `%03d`, so
-# exactly 12 decimal digits and often with a leading zero. The server stores it
-# in the card's `serial_number`; an external client (MediaHub) promotes its own
-# card per UID, so a card without one is a card that never gets promoted.
+# The RFID UID as the reader reports it (`uid_decimal`): the UID's four bytes,
+# each formatted `%03d`, so exactly 12 decimal digits and often with a leading
+# zero. The server stores it in the card's `serial_number`; an external client
+# (MediaHub) promotes its own card per UID, so a card without one is a card that
+# never gets promoted.
 UID_DIGITS = 12
 
 
@@ -78,8 +82,16 @@ def _family_of_sdk_name(name: str) -> str:
 
 
 class Printer:
-    def __init__(self, ip: str):
+    def __init__(self, ip: str, reader: NfcReader):
+        """`ip` is the SDK connection string; `reader` the encoder-slot reader.
+
+        The reader is a required half of this object, not an option: a card's
+        UID is part of what a printed card *is*, and a `Printer` that cannot ask
+        for it has no honest use. A reader that is unplugged or unreachable
+        fails at the read (naming itself) — it does not remove the step.
+        """
         self._ip = ip
+        self._reader = reader
         self._evolis: Any = None  # imported lazily in open()
         self._co: Any = None
 
@@ -153,25 +165,28 @@ class Printer:
 
         The sequence is the point of this method: the card is pulled from the
         feeder and moved to the contactless station
-        (`evolis.CardPos.CONTACTLESS`), where the reader can see it, and it stays
-        there — the print job then takes it from that position to the print
-        station itself. Feeding the card HERE rather than letting the print
-        session do it is what makes the UID the id of *this* card.
+        (`evolis.CardPos.CONTACTLESS`), where the reader in the encoder slot can
+        see it, and it stays there — the print job then takes it from that
+        position to the print station itself. Feeding the card HERE rather than
+        letting the print session do it is what makes the UID the id of *this*
+        card.
 
-        Returns the UID as the 12 decimal digits an ESPuino reports (see
-        `UID_DIGITS`), or None when there is nothing to read. None means "not
-        known yet": the card prints without one, the server's `serial_number`
-        stays NULL, and a client that promotes cards by UID will report this one
-        as printed with an unusable id rather than silently assigning it.
+        The read itself is the reader's HTTP API (`reader.py`); the UID comes
+        back as the reader spells it, `uid_decimal` — already the 12 decimal
+        digits the server stores as `serial_number` (see `UID_DIGITS`). It is
+        passed through verbatim: reformatting it here would be a chance to lose
+        the leading zero, and the reader's spelling is the shop's.
+
+        Returns None when there is nothing to report: the reader polling its coil
+        and finding no card. That means "not known yet": the card prints without
+        one, the server's `serial_number` stays NULL, and a client that promotes
+        cards by UID will report this one as printed with an unusable id rather
+        than silently assigning it.
 
         Raises PrinterError when the printer cannot be driven to the reader at
-        all — a caller may either treat that as fatal or fall back to None (the
-        spooler does the latter: the card prints anyway, and the run names it).
-
-        STUB: the contactless reader is not installed yet. `_read_uid` returns
-        None without touching the hardware, so this parses nothing today; the
-        card handling above it is real and runs for every card, which leaves the
-        reader to `_read_uid` and nothing else.
+        all, and ReaderError when the reader cannot be asked. A caller may treat
+        either as "this card has no UID" — the spooler does exactly that: the
+        card prints either way, and the run names the cards left without one.
         """
         if self._co is None:
             raise PrinterError("printer not open")
@@ -185,24 +200,14 @@ class Printer:
                 "cannot park the card under the contactless station "
                 f"({self._co.get_last_error()}); is the reader installed?"
             )
-        return self._read_uid()
-
-    def _read_uid(self) -> str | None:
-        """Read the UID of the card parked at the contactless station.
-
-        STUB — the reader hardware is not installed. What the real read has to
-        do: talk to the reader (PC/SC through the SDK — `evolis.PcscSession`,
-        `wait_card_present` then a Get-UID APDU through `send_apdu` — or the
-        reader's own interface) and answer the UID the way an ESPuino reports it:
-        the four bytes over `"%03d%03d%03d%03d"`, decimal, never hex, leading
-        zeros kept. None when the card is there but its chip cannot be read.
-        """
-        return None
+        return self._reader.read_uid()
 
     # -- printing -----------------------------------------------------------
 
-    def print_card(self, front_bmp: bytes, back: str, back_bmp: bytes | None) -> None:
-        """Feed and print one card.
+    def print_card(
+        self, front_bmp: bytes, back: str, back_bmp: bytes | None, send: bool = True
+    ) -> None:
+        """Feed and print one card — or stage it and put it back out.
 
         `back` is the queue's per-card back availability (`none|color|black`);
         `back_bmp` is the raster for that back, or None for a single-sided card.
@@ -217,6 +222,14 @@ class Printer:
         duplex flag leak into every later card — a single-sided card 2 after a
         double-sided card 1 prints double-sided with card 1's stale back. init()
         clears the graphics and resets settings to default (including duplex).
+
+        `send=False` stages the job — the same `init()` and both buffers, so the
+        raster path the printer would be handed is exercised for real — and then
+        ejects the card without submitting it. Nothing reaches the print engine,
+        so no ribbon panel is spent and the card comes out blank and reusable
+        (`eject_card()` is just `set_card_pos(EJECT)`; the card still has to be
+        moved out because no print job will take it from the contactless
+        station).
         """
         if self._co is None:
             raise PrinterError("printer not open")
@@ -239,6 +252,12 @@ class Printer:
                 ok = ps.set_black_buffer(evolis.CardFace.BACK, buf)
             if not ok:
                 raise PrinterError(f"cannot set back image buffer: {ps.get_last_error()}")
+        if not send:
+            if not self._co.eject_card():
+                raise PrinterError(
+                    f"cannot eject the staged card: {self._co.get_last_error()}"
+                )
+            return
         rc = ps.print()
         if rc != evolis.ReturnCode.OK:
             raise PrinterError(f"print failed: {rc}")

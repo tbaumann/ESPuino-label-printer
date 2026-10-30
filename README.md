@@ -124,6 +124,49 @@ Notes:
   server ignores it on those routes, so one exported `ESPLP_TOKEN` is fine for
   everything.
 
+## Print spooler (`card-printer`)
+
+`printer/` is the local Python spooler (the flake's default package). It pulls a
+prefix's print queue from the server, prints the unprinted cards on the attached
+Evolis printer, and marks each card printed once it is in the output hopper. It
+runs next to the printer, not next to the server:
+
+```sh
+card-printer --server http://127.0.0.1:8080 --token <admin-token> \
+  --ip 'socket://192.168.2.101?type=evolis' --prefix <uuid>     # one order
+card-printer ... --batch --ribbon ymcko                         # every job for a ribbon
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--server` / `--token` | API base URL / operator token (`ESPLP_TOKEN`, required unless `--dry-run`) |
+| `--prefix <uuid>` | print that order |
+| `--batch` | print every prefix that needs `--ribbon`, pausing between them |
+| `--ribbon ymcko\|ymckok` | ribbon to filter on in `--batch`; defaults to the loaded ribbon |
+| `--ip` | printer connection string, e.g. `socket://192.168.2.101?type=evolis` |
+| `--reader` | base URL of the nfc-reader (`ESPLP_READER`, default `http://nfc-reader.local`) |
+| `--uid-wait-ms` | how long the reader may hold a UID request open waiting for the card (default 3000, cap 30000) |
+| `--ignore-ribbon` | print even when the loaded ribbon does not match the job's |
+| `--dry-run` | stop short of the printer: queue and rasters only — no card fed, no job sent, nothing marked |
+| `--no-print` | the whole run except the printing: card fed, UID read, card marked, card ejected blank (no ribbon spent) |
+
+Every card's RFID UID is read **before** it prints: the printer feeds the card and
+parks it at the contactless station, where the reader in the printer's encoder
+slot can see it, and the spooler asks that reader for the UID
+(`GET /nfc/card`, its `uid_decimal` — 12 decimal digits, the spelling the server
+stores as `serial_number`). The UID is written with the print mark
+(`POST .../cards/{id}/printed`). This step is never optional and never fatal: a
+card the reader cannot see, or a reader that cannot be reached, prints anyway
+with a NULL `serial_number`, and the run names those cards at the end.
+`--dry-run` skips it, since a card would be fed for nothing.
+
+`--no-print` is the middle ground: the entire path runs — card fed and parked,
+UID read, job staged with the buffers it would print from, card ejected — and only
+the print itself is left out, so testing against a real printer costs no ribbon.
+It is still a real run in every other respect and marks the cards, so the order
+ends `printed` with blank cards in the hopper: set it back to `queued` (which
+clears `printed_at`) and rerun without the flag to print it for real.
+
 ## Web UI (`web/`)
 
 A Svelte 5 + Vite + TypeScript SPA, served by the Rust process at `/` — same

@@ -2,9 +2,11 @@
 
 Exercises Client.get_print_queue / fetch_bytes / mark_printed / list_prefixes /
 set_prefix_status and the spooler's queue->todo selection and batch filtering,
-WITHOUT a printer (stops at the printer check). Run from the Nix-built env so
-`esplp_print` imports from the store.
+WITHOUT a printer (stops at the printer check). The card's UID step is exercised
+against a second mock — the nfc-reader's `/nfc/card` — with the printer's side
+of it faked. Run from the Nix-built env so `esplp_print` imports from the store.
 """
+import os
 import sys
 import threading
 import json
@@ -13,6 +15,12 @@ import socketserver
 
 from esplp_print.api import Client
 from esplp_print.printer import Printer, PrinterError
+from esplp_print.reader import (
+    DEFAULT_READER_URL,
+    DEFAULT_WAIT_MS,
+    NfcReader,
+    ReaderError,
+)
 
 LOG = {"GET": [], "POST": [], "PATCH": []}
 # The parsed JSON body of each POST (None when the call sent none).
@@ -45,7 +53,9 @@ QUEUE = {
 }
 
 
-class H(http.server.BaseHTTPRequestHandler):
+class JsonHandler(http.server.BaseHTTPRequestHandler):
+    """A mock that answers JSON; both mocks below share this much."""
+
     def log_message(self, *a):
         pass
 
@@ -57,6 +67,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+
+class H(JsonHandler):
     def do_GET(self):
         LOG["GET"].append(self.path)
         if self.path == "/api/prefixes":
@@ -182,11 +194,47 @@ jobs_ck = [
 ]
 check("batch ymckok picks C", [p["uuid"] for p in jobs_ck] == ["C"])
 
-# 9. the UID step. The card is fed and parked at the contactless station before
-#    it is printed — that is what makes the UID the id of THIS card — and the
-#    read at that station is a stub today (no reader installed), so it reports no
-#    UID rather than inventing one. A connection is faked here: no printer, no
-#    SDK, no wheel.
+# 9. the UID step, which is two halves of two devices. The printer feeds the card
+#    and parks it at the contactless station — that is what makes the UID the id
+#    of THIS card — and the reader in the encoder slot is then asked over HTTP
+#    for the UID of what is on its coil. The printer half is faked (no SDK, no
+#    wheel); the reader half is a second mock server, so the request it is sent
+#    and the JSON it answers are both real.
+READER = {"state": "present", "uid": "004162179196", "query": None}
+
+
+class R(JsonHandler):
+    def do_GET(self):
+        READER["query"] = self.path
+        if READER["state"] == "absent":
+            self._send(404, {"present": False})
+        elif READER["state"] == "error":
+            self._send(500, {"error": "boom"})
+        elif READER["state"] == "junk":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "1")
+            self.end_headers()
+            self.wfile.write(b"{")
+        else:
+            self._send(200, {
+                "present": True,
+                "uid": "04-A2-B3-C4",
+                "uid_decimal": READER["uid"],
+                "kind": "mifare-classic",
+                "sak": 8,
+                "atqa": "0004",
+                "last_seen_ms": 7,
+            })
+
+
+rsrv = S(("127.0.0.1", 0), R)
+rport = rsrv.server_address[1]
+threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+reader = NfcReader(f"http://127.0.0.1:{rport}")
+print("mock reader on", reader.base)
+
+
 class FakeEv:
     class CardPos:
         CONTACTLESS = 6
@@ -205,11 +253,15 @@ class FakeCo:
         self.calls.append(("set_card_pos", pos))
         return self.ok
 
+    def eject_card(self):
+        self.calls.append("eject_card")
+        return self.ok
+
     def get_last_error(self):
         return "none"
 
 
-pr = Printer("socket://127.0.0.1?type=evolis")
+pr = Printer("socket://127.0.0.1?type=evolis", reader)
 pr._evolis = FakeEv
 pr._co = FakeCo()
 uid = pr.read_card_uid()
@@ -217,8 +269,55 @@ check(
     "the card is fed and parked at the contactless station before printing",
     pr._co.calls == ["insert_card", ("set_card_pos", FakeEv.CardPos.CONTACTLESS)],
 )
-check("the UID read is stubbed: no UID is invented", uid is None)
+check("the read asks the reader for the card and waits for it to appear",
+      READER["query"] == f"/nfc/card?wait_ms={DEFAULT_WAIT_MS}")
+check("the reader's uid_decimal is handed over as the card's serial_number",
+      uid == "004162179196")
 
+# A card the reader cannot see is a definitive "no UID", not a failure.
+READER["state"] = "absent"
+pr._co = FakeCo()
+check("a coil with no card on it reads as no UID", pr.read_card_uid() is None)
+
+# A reader that cannot be asked is a ReaderError — a distinct answer from the
+# one above, but the spooler degrades both to "no UID" the same way.
+READER["state"] = "error"
+pr._co = FakeCo()
+failed = None
+try:
+    pr.read_card_uid()
+except ReaderError as e:
+    failed = str(e)
+check("a reader answering an HTTP error is a ReaderError", failed is not None
+      and "500" in failed)
+
+READER["state"] = "junk"
+pr._co = FakeCo()
+failed = None
+try:
+    pr.read_card_uid()
+except ReaderError as e:
+    failed = str(e)
+check("so is a reader answering junk", failed is not None and "JSON" in failed)
+READER["state"] = "present"
+
+# A reader that is not on the network at all: nothing listening on that port.
+dead = Printer("socket://127.0.0.1?type=evolis", NfcReader("http://127.0.0.1:1", 0))
+dead._evolis = FakeEv
+dead._co = FakeCo()
+failed = None
+try:
+    dead.read_card_uid()
+except ReaderError as e:
+    failed = str(e)
+check("so is a reader that is not there",
+      failed is not None and "unreachable" in failed)
+check("the wait is clamped to what the firmware honours",
+      NfcReader("http://x", 90_000).wait_ms == 30_000)
+
+# The printer half is the ordering guarantee, so both of its failures are tested
+# — and neither may reach the reader (no card at the antenna, nothing to read).
+READER["query"] = None
 pr._co = FakeCo(ok=False)
 failed = None
 try:
@@ -229,6 +328,7 @@ check(
     "a card that cannot be fed is a PrinterError",
     failed is not None and "feed" in failed,
 )
+check("and the reader is never asked", READER["query"] is None)
 
 
 class NoStationCo(FakeCo):
@@ -249,24 +349,157 @@ check(
     "a station that is not there is a PrinterError naming the reader",
     failed is not None and "contactless" in failed,
 )
+check("and the reader is never asked either", READER["query"] is None)
 
 
 class StubPrinter:
-    def __init__(self, uid=None, boom=False):
+    def __init__(self, uid=None, boom=None):
         self.uid = uid
         self.boom = boom
 
     def read_card_uid(self):
-        if self.boom:
-            raise PrinterError("cannot park the card under the contactless station")
+        if self.boom is not None:
+            raise self.boom
         return self.uid
 
 
 check("a card with no UID still prints (the helper never raises)",
-      mm._card_uid(StubPrinter(boom=True), 7) is None)
+      mm._card_uid(StubPrinter(boom=PrinterError("cannot park the card")), 7) is None)
+unreachable = StubPrinter(boom=ReaderError("http://nfc-reader.local unreachable"))
+check("so does a card whose reader could not be asked at all",
+      mm._card_uid(unreachable, 7) is None)
 check("and a card WITH a UID hands it over", mm._card_uid(StubPrinter("012345678901"), 7)
       == "012345678901")
 
+# 10. --no-print: the card walks the whole path except the print itself. The
+#     buffers the printer would be handed are set for real (that is where a
+#     depth or raster bug lives), and the card is then ejected instead of
+#     submitted — no ribbon spent, card reusable.
+class FakePs:
+    """Stands in for evolis.PrintSession: records what the SDK was asked to do."""
+
+    def __init__(self):
+        self.calls = []
+
+    def init(self):
+        self.calls.append("init")
+        return True
+
+    def set_image_buffer(self, face, buf):
+        self.calls.append(("set_image_buffer", face, len(buf.raw)))
+        return True
+
+    def set_black_buffer(self, face, buf):
+        self.calls.append(("set_black_buffer", face, len(buf.raw)))
+        return True
+
+    def print(self):
+        self.calls.append("print")
+        return 0
+
+    def get_last_error(self):
+        return "none"
+
+
+class Face:
+    FRONT = "front"
+    BACK = "back"
+
+
+class Rc:
+    OK = 0
+
+
+class FakePsEv:
+    CardPos = FakeEv.CardPos
+    CardFace = Face
+    ReturnCode = Rc
+
+    def __init__(self):
+        self.ps = FakePs()
+
+    def PrintSession(self, co):  # noqa: N802 - the SDK's own name
+        return self.ps
+
+
+def _printer_with_session():
+    printer = Printer("socket://127.0.0.1?type=evolis", reader)
+    printer._evolis = ev = FakePsEv()
+    printer._co = co = FakeCo()
+    return printer, ev, co
+
+
+FRONT, BACK = b"FRONTBMP", b"BACKBMP1"  # +1 below: create_string_buffer adds a NUL
+staged, ev, co = _printer_with_session()
+staged.print_card(FRONT, "black", BACK, send=False)
+check(
+    "a staged card goes through the same raster path as a printed one",
+    ev.ps.calls == [
+        "init",
+        ("set_image_buffer", "front", len(FRONT) + 1),
+        ("set_black_buffer", "back", len(BACK) + 1),
+    ],
+)
+check("but is never submitted to the print engine", "print" not in ev.ps.calls)
+check("and is ejected instead of printed", co.calls == ["eject_card"])
+
+printed, ev, co = _printer_with_session()
+printed.print_card(FRONT, "black", BACK)
+check("a real print does submit the job", ev.ps.calls[-1] == "print")
+check("and ejects nothing itself (the job takes the card)", co.calls == [])
+
+colour, ev, _ = _printer_with_session()
+colour.print_card(FRONT, "color", BACK)
+check(
+    "the back's DEPTH picks the call, never its source: colour is 24-bit",
+    ev.ps.calls[2] == ("set_image_buffer", "back", len(BACK) + 1),
+)
+single, ev, _ = _printer_with_session()
+single.print_card(FRONT, "none", None)
+check(
+    "a single-sided card sets the front and no back",
+    [c[0] if isinstance(c, tuple) else c for c in ev.ps.calls]
+    == ["init", "set_image_buffer", "print"],
+)
+
+stuck, _ev, _co = _printer_with_session()
+stuck._co = FakeCo(ok=False)
+failed = None
+try:
+    stuck.print_card(FRONT, "none", None, send=False)
+except PrinterError as e:
+    failed = str(e)
+check("a card that will not eject is a PrinterError", failed is not None
+      and "eject" in failed)
+
+# 11. the CLI wiring: where the reader is, how long it may wait, and the two
+#     "don't print" modes. The environment is cleared first so the defaults
+#     below are the CODE's, not this shell's.
+os.environ.pop("ESPLP_READER", None)
+os.environ.pop("ESPLP_TOKEN", None)
+args = mm.build_parser().parse_args(["--ip", "socket://x", "--prefix", "P"])
+check("--reader defaults to the reader's mDNS name", args.reader == DEFAULT_READER_URL)
+check("--uid-wait-ms defaults to the read's own default",
+      args.uid_wait_ms == DEFAULT_WAIT_MS)
+args = mm.build_parser().parse_args([
+    "--ip", "socket://x", "--prefix", "P",
+    "--reader", "http://reader.lan", "--uid-wait-ms", "500",
+])
+check("both are overridable",
+      (args.reader, args.uid_wait_ms) == ("http://reader.lan", 500))
+built = mm._reader(args)
+check("and the printer gets the reader they describe",
+      (built.base, built.wait_ms) == ("http://reader.lan", 500))
+
+plain = mm.build_parser().parse_args(["--ip", "socket://x", "--prefix", "P"])
+check("--no-print is off unless asked for", plain.no_print is False)
+check("--no-print with --dry-run is refused (a dry run prints nothing anyway)",
+      mm.main(["--ip", "socket://x", "--prefix", "P", "--token", "t",
+               "--dry-run", "--no-print"]) == 2)
+check("--no-print still needs the token, because it marks cards",
+      mm.main(["--ip", "socket://x", "--prefix", "P", "--no-print"]) == 2)
+
+rsrv.shutdown()
 srv.shutdown()
 print("RESULT:", "OK" if ok else "FAILED")
 sys.exit(0 if ok else 1)

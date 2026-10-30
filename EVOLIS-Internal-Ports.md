@@ -138,6 +138,15 @@ ps = evolis.PcscSession(co)                   # reader side (USB connection)
 - J3 pin 1 is a card-presence line — usable to know a card is at the station
   without polling the printer.
 
+## The reader in the slot (the route in use)
+
+The slot is not carrying one of those CCID modules: it holds our own ESP32 +
+PN532 (`~/git/embassy-test/nfc-reader`), which polls the coil and serves what it
+sees over the LAN — `GET /nfc/card`, whose `uid_decimal` is the card's UID, no
+PC/SC anywhere in the path. The printer's side is unchanged and still the one
+that matters: it moves the card to the station, and the spooler reads there
+(`card-printer --reader`, see the README).
+
 ## Verifying on a host
 
 Printer on USB (type-B), then:

@@ -5,24 +5,33 @@ attached Evolis printer, and marks each card printed once it is in the output
 hopper. Prefix status transitions are deliberately NOT handled here — they
 belong to the operator/backend; this tool only prints and marks.
 
-`--dry-run` does everything a real run does — fetch the queue, open the printer,
-check the ribbon, fetch every raster — except the two irreversible actions: it
-does not send a print job and does not mark any card printed.
+`--dry-run` stops short of the printer — fetch the queue, open the printer, check
+the ribbon, fetch every raster — but feeds no card, sends no print job and marks
+nothing.
+
+`--no-print` runs the whole path EXCEPT the printing: the card is fed, parked at
+the contactless station and its UID read, the job is staged with the same buffers
+it would be printed from, and the card is then ejected blank (no ribbon spent, and
+the card can go straight back in the feeder). It does mark each card and close the
+order out, because that write is where the UID lands — so printing for real
+afterwards means setting the order back to `queued`, which clears `printed_at`.
 
 `--batch` prints every prefix that needs a given ribbon, one after another. The
 operator loads that ribbon once, and between jobs the tool pauses and asks them
 to empty the output tray before the next prefix starts.
 
-Each card's RFID UID is read before it is printed: the card is fed, parked under
-the contactless station and read, and the print job takes it from there. The UID
-goes onto the card with the print mark. The read itself is still a stub (the
-reader is not installed yet), so cards print with a NULL `serial_number` and the
-run names them at the end — a card the reader cannot see is never fatal, since
-the card prints either way. `--dry-run` skips the read: feeding a card is a
-physical action, and nothing would print it afterwards.
+Each card's RFID UID is read before it is printed: the card is fed, parked at the
+contactless station and read there, and the print job takes it from there. The
+reader is its own device (`reader.py`, reachable via `--reader`), asked over HTTP
+for the UID of the card the printer has just moved to it, and the UID goes onto
+the card with the print mark. A reader that cannot be asked, or a card with no
+readable chip, is never fatal: the card prints with a NULL `serial_number`, and
+the run names those cards at the end. `--dry-run` skips the read — feeding a card
+is a physical action, and nothing would print it afterwards.
 
 Exit codes:
-  0  complete (all unprinted printable cards printed, or a dry run)
+  0  complete (all unprinted printable cards printed — or staged, under
+     --no-print, or simply reported, under --dry-run)
   1  an error stopped the run (cards before it were printed and marked; rerun
      to resume — the server's `printed_at` skips them)
   2  usage error
@@ -31,6 +40,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Any
 
@@ -43,6 +53,7 @@ from .printer import (
     PrinterError,
     RibbonStatus,
 )
+from .reader import DEFAULT_READER_URL, DEFAULT_WAIT_MS, NfcReader, ReaderError
 
 RASTER_FRONT = "/api/prefixes/{prefix}/cards/{id}/print-raster/front"
 RASTER_BACK = "/api/prefixes/{prefix}/cards/{id}/print-raster/back"
@@ -113,17 +124,22 @@ def _is_printed(card: dict[str, Any]) -> bool:
     return card.get("printed_at") is not None
 
 
+def _reader(args: argparse.Namespace) -> NfcReader:
+    """The encoder-slot reader, as configured on the command line."""
+    return NfcReader(args.reader, args.uid_wait_ms)
+
+
 def _card_uid(printer: Printer, card_id: int) -> str | None:
     """The RFID UID of the card about to be printed, or None when there is none.
 
-    Best effort on purpose: a card the reader cannot see still prints, with the
-    server's `serial_number` left NULL, and the end of the run names it. Stopping
-    the run instead would strand a paid order half-printed over a read nothing
-    else depends on.
+    Best effort on purpose: a card the reader cannot see — or a reader that
+    cannot be asked — still prints, with the server's `serial_number` left NULL,
+    and the end of the run names it. Stopping the run instead would strand a paid
+    order half-printed over a read nothing else depends on.
     """
     try:
         return printer.read_card_uid()
-    except PrinterError as e:
+    except (PrinterError, ReaderError) as e:
         print(f"  [uid] WARNING: card {card_id} not read: {e}", file=sys.stderr)
         return None
 
@@ -179,11 +195,13 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
             _mark_printed(client, prefix)
         return 0
 
-    verb = "would print" if args.dry_run else "printing"
-    print(
-        f"{verb} {len(todo)} card(s)"
-        + ("" if not args.dry_run else " (dry run: no jobs sent, nothing marked)")
-    )
+    if args.dry_run:
+        verb, note = "would print", " (dry run: no jobs sent, nothing marked)"
+    elif args.no_print:
+        verb, note = "staging", " (no-print: nothing is printed, no ribbon spent)"
+    else:
+        verb, note = "printing", ""
+    print(f"{verb} {len(todo)} card(s){note}")
 
     # A dry run never changes status.
     if not args.dry_run:
@@ -191,7 +209,7 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
 
     # Open the printer and check the ribbon in BOTH modes — a dry run must
     # exercise the same path, so a run that prints is already proven to connect.
-    with Printer(args.ip) as printer:
+    with Printer(args.ip, _reader(args)) as printer:
         printer.require_ready()
         loaded = printer.ribbon_status()
         print(
@@ -235,21 +253,22 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
                     )
                     continue
                 # The card is fed and parked under the contactless station for
-                # the UID read, and the print job takes it from there. A dry run
-                # reads nothing: feeding a card is a physical action like
-                # printing is.
-                uid = None if args.dry_run else _card_uid(printer, cid)
-                printer.print_card(front, back, back_bmp)
-                # The print call returned OK: the card is ejected to the hopper.
-                # Mark it NOW so a crash cannot reprint it, and so a parallel
-                # run does not pull it. The server endpoint is idempotent, and it
-                # takes the UID with the mark — the only card write that still
-                # applies once the order is being printed.
+                # the UID read; on the way out either the print job takes it from
+                # there, or (--no-print) it is ejected, staged but unprinted. A
+                # dry run reaches neither: feeding a card is a physical action.
+                uid = _card_uid(printer, cid)
+                printer.print_card(front, back, back_bmp, send=not args.no_print)
+                # The card is out of the printer either way: printed, or ejected
+                # blank by --no-print. Mark it NOW so a crash cannot reprint it,
+                # and so a parallel run does not pull it. The server endpoint is
+                # idempotent, and it takes the UID with the mark — the only card
+                # write that still applies once the order is being printed.
                 client.mark_printed(prefix, cid, uid)
-                if not args.dry_run and uid is None:
+                if uid is None:
                     no_uid.append(cid)
+                what = "staged (not printed)" if args.no_print else "printed"
                 print(
-                    f"  -> card {cid} printed and marked"
+                    f"  -> card {cid} {what} and marked"
                     + (f" (uid {uid})" if uid else ""),
                     flush=True,
                 )
@@ -261,7 +280,13 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
                 )
                 return 1
 
-    print(f"done: {len(todo)} card(s) {'inspected' if args.dry_run else 'printed'}")
+    if args.dry_run:
+        done = "inspected"
+    elif args.no_print:
+        done = "staged (not printed)"
+    else:
+        done = "printed"
+    print(f"done: {len(todo)} card(s) {done}")
 
     # A UID that was never read is a card nothing can map back to a chip: an
     # external client promotes its cards by UID, so a run that produced any has
@@ -269,8 +294,22 @@ def print_prefix(client: Client, args: argparse.Namespace, prefix: str) -> int:
     if no_uid:
         ids = ", ".join(str(i) for i in no_uid)
         print(
-            f"[uid] NOTE: {len(no_uid)} card(s) printed without a UID read: {ids} — "
-            "nothing maps those cards to a chip",
+            f"[uid] NOTE: {len(no_uid)} card(s) "
+            f"{'staged' if args.no_print else 'printed'} without a UID read: "
+            f"{ids} — nothing maps those cards to a chip",
+            file=sys.stderr,
+        )
+
+    if args.no_print:
+        # Say what the blank cards in the hopper mean, and how to turn this into
+        # a real print: the run marked them (that is where the UID landed), so
+        # the prefix is about to be closed as `printed` with nothing on the
+        # cards. `queued` is the operator's reprint lever and clears printed_at.
+        print(
+            "[no-print] NOTE: nothing was printed — the cards just ejected are "
+            "blank and can go back in the feeder. The server was told each card "
+            "was ejected, UIDs included, so set the order back to 'queued' and "
+            "rerun without --no-print to print it for real.",
             file=sys.stderr,
         )
 
@@ -297,7 +336,7 @@ def run_batch(client: Client, args: argparse.Namespace) -> int:
         # Autodetect from the loaded ribbon. A dry run still opens the printer
         # (it must exercise the same path), so this works in both modes.
         try:
-            with Printer(args.ip) as printer:
+            with Printer(args.ip, _reader(args)) as printer:
                 printer.require_ready()
                 loaded = printer.ribbon_status()
         except PrinterError as e:
@@ -423,6 +462,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="printer connection string, e.g. socket://192.168.2.101?type=evolis",
     )
     p.add_argument(
+        "--reader",
+        default=os.environ.get("ESPLP_READER") or DEFAULT_READER_URL,
+        help="base URL of the nfc-reader each card's UID is read from "
+        "(or set ESPLP_READER)",
+    )
+    p.add_argument(
+        "--uid-wait-ms",
+        type=int,
+        default=DEFAULT_WAIT_MS,
+        help="how long the reader may hold the UID request open waiting for the "
+        "card to appear (the firmware caps this at 30000)",
+    )
+    p.add_argument(
         "--ignore-ribbon",
         action="store_true",
         help="print even when the loaded ribbon does not match the job's ribbon",
@@ -430,14 +482,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="do everything except send print jobs and mark cards printed",
+        help="stop short of the printer: fetch the queue and every raster, but "
+        "feed no card, send no job and mark nothing",
+    )
+    p.add_argument(
+        "--no-print",
+        action="store_true",
+        help="do the whole run except the printing: card fed, UID read, card "
+        "marked and ejected blank — nothing reaches the print engine, so no "
+        "ribbon is spent",
     )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    import os
-
     args = build_parser().parse_args(argv)
     if not args.token:
         args.token = os.environ.get("ESPLP_TOKEN")
@@ -451,6 +509,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     elif not args.prefix:
         print("error: --prefix is required (or use --batch)", file=sys.stderr)
+        return 2
+    if args.dry_run and args.no_print:
+        print(
+            "error: --dry-run and --no-print are mutually exclusive "
+            "(--dry-run already prints nothing; --no-print exists to exercise "
+            "the printer)",
+            file=sys.stderr,
+        )
         return 2
 
     client = Client(args.server, args.token)
