@@ -498,6 +498,10 @@ pub struct MarkdownRenderer {
     /// one directory this process is entitled to write to — a container has no
     /// writable `/tmp` and nothing else to lean on.
     scratch: PathBuf,
+    /// The theme, written from [`MARKDOWN_THEME`] beside the scratch directory:
+    /// the backend wants a file, and this one belongs to the installation rather
+    /// than to a render.
+    theme: PathBuf,
 }
 
 /// The width a markdown back is laid out at, in the backend's pixels: the
@@ -511,16 +515,35 @@ pub struct MarkdownRenderer {
 /// text or shrink it.
 pub const MARKDOWN_WIDTH: u32 = 508;
 
-/// The theme a markdown back is drawn in: a flat white ground with dark text,
-/// which is what a card wants (and what the black panel's own threshold expects).
-/// Pinned by name because a backend's default is not a contract.
-const MARKDOWN_THEME: &str = "github_light";
+/// The theme a markdown back is drawn in, compiled in from `markdown-theme.toml`
+/// beside this file: a flat white ground, no tinted panels, and a hairline that
+/// survives the black panel's cut — what a card wants, and what that panel's own
+/// threshold expects. The file itself names every key the backend reads.
+///
+/// Compiled in rather than named as one of the backend's built-ins: a name still
+/// leaves the drawing to whatever the installed backend happens to ship, and a
+/// card is money. The backend takes a *path*, so this travels to it as a file
+/// written beside the scratch directory on first use (see `run`) — which is also
+/// what keeps `nix run`, a bare `cargo run`, the suites and a container drawing
+/// the same card.
+const MARKDOWN_THEME: &str = include_str!("../markdown-theme.toml");
+
+/// The name `MARKDOWN_THEME` is written under: a file beside the scratch
+/// directory, not in it. It is a constant of the installation and outlives every
+/// render, while the scratch directory holds one render at a time.
+const MARKDOWN_THEME_FILE: &str = "markie-theme.toml";
 
 impl MarkdownRenderer {
     pub fn new(bin: impl Into<PathBuf>, scratch: impl Into<PathBuf>) -> Self {
+        let scratch = scratch.into();
+        let theme = scratch
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(MARKDOWN_THEME_FILE);
         Self {
             bin: bin.into(),
-            scratch: scratch.into(),
+            scratch,
+            theme,
         }
     }
 
@@ -572,6 +595,18 @@ impl MarkdownRenderer {
             .scratch
             .join(format!("markdown-{}.png", Uuid::new_v4()));
 
+        // The backend takes the theme as a path. Ours is written beside the
+        // scratch directory — never in it, which holds one render at a time —
+        // once, and rewritten only when this binary's own copy differs.
+        if std::fs::read_to_string(&self.theme).ok().as_deref() != Some(MARKDOWN_THEME) {
+            if let Some(dir) = self.theme.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("markdown theme directory {}: {e}", dir.display()))?;
+            }
+            std::fs::write(&self.theme, MARKDOWN_THEME)
+                .map_err(|e| format!("markdown theme {}: {e}", self.theme.display()))?;
+        }
+
         // The layout is the card's; the raster follows it at whatever scale
         // reaches the printer's bitmap. So a test that renders at 400x256 gets
         // the card's own text size rather than a re-flowed, shrunken one.
@@ -586,7 +621,7 @@ impl MarkdownRenderer {
             .arg("--png-scale")
             .arg(scale.to_string())
             .arg("--theme")
-            .arg(MARKDOWN_THEME)
+            .arg(&self.theme)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

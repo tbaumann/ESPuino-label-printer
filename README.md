@@ -256,8 +256,11 @@ button stays disabled while any are: the checkout refuses such an order with
 Completing it needs no new state — the badge and the button follow the write.
 
 A markdown back is no exception: the server renders the text with the `markie`
-backend the flake packages (`MARKIE_BIN`, see "Markdown in the back text" in
-TODO.md), then places that picture on the printer's bitmap and reduces it to the
+backend the flake packages (`MARKIE_BIN`), in the theme compiled in from
+`server/markdown-theme.toml` — a flat
+white ground with no tinted panels. The backend takes a theme as a *file*, so the
+server writes that theme to `data/markie-theme.toml` and points `--theme` at it.
+It then places that picture on the printer's bitmap and reduces it to the
 ribbon's depth — the same path an uploaded picture takes, differing only in
 *where the picture lands*. A rendered document is anchored at the panel's
 top-left, at the width the card was laid out for, and whatever runs past the
@@ -513,6 +516,7 @@ data/
   cards.db                   # prefix + card metadata (the single index)
   blobs/<prefix>/<id>.<ext>       # card front images
   blobs/<prefix>/<id>-back.<ext>  # back images (an `image` back only)
+  markie-theme.toml           # the markdown back's theme, written once by the server
   tmp/                        # scratch for the markdown backend: one file, deleted after each render
 ```
 

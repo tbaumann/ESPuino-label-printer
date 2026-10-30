@@ -1,0 +1,49 @@
+# The theme a card's markdown back is drawn in. Compiled into the server
+# (`render::MARKDOWN_THEME`), written beside each render and handed to the
+# backend as `--theme <path>`.
+#
+# The format is Markie's "Alacritty theme" TOML, and it is a COLOUR contract
+# only: markie's page margin, code/table radius and table-header tint are
+# constants inside markie (theme.rs), not keys here. What it reads, and where
+# each colour lands (markie theme.rs `from_alacritty_theme`):
+#
+#   primary.background  -> the page ground
+#   primary.foreground  -> body text, and the text of a code block
+#   normal.blue         -> headings
+#   normal.cyan         -> links
+#   normal.black        -> the FILL of a fenced block, inline `code`, and the
+#                          table header band
+#   normal.white        -> blockquote edges and table cell outlines
+#
+# `black`, `blue`, `cyan` and `white` are required by the parser; the rest of
+# the palette below is carried for reference and ignored.
+#
+# Two deliberate departures from github_light:
+#
+#   * the fill colour is WHITE, not a tint. A fenced block or inline `code`
+#     therefore prints as text on the card ground rather than as a grey panel,
+#     which is what a 1-bit black panel wants and what reads on a 600 dpi card.
+#   * the border is a mid grey chosen to survive the black panel's cut. The
+#     reduction splits at mid grey (~#808080) and everything lighter prints as
+#     nothing, so github_light's own #6a737d works but a pale hairline would
+#     vanish on an YMCKOK card. #57606a is github's muted foreground: a thin
+#     line on the card that still prints.
+#
+# NOT expressed here, because markie does not read it from a theme file: the
+# page margin (a fixed 32 px), the code-block corner radius, and the table
+# header tint (the text colour at 8% opacity). Those are the only tinted
+# background left in this theme.
+
+[colors.primary]
+background = '#ffffff'
+foreground = '#24292f'
+
+[colors.normal]
+black   = '#ffffff'   # fill: none — code blocks, inline code, table header
+red     = '#d73a49'
+green   = '#28a745'
+yellow  = '#dbab09'
+blue    = '#0366d6'   # headings
+magenta = '#5a32a3'
+cyan    = '#0598bc'   # links
+white   = '#57606a'   # blockquote edges, table cell outlines
