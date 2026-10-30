@@ -167,6 +167,46 @@ It is still a real run in every other respect and marks the cards, so the order
 ends `printed` with blank cards in the hopper: set it back to `queued` (which
 clears `printed_at`) and rerun without the flag to print it for real.
 
+## Deploy (NixOS module)
+
+The flake exports `nixosModules.card-printer-server` — a systemd service for the
+packaged server (SPA and markdown backend baked in), with every non-secret
+setting as an option. The secrets have no option: they go in an
+`environmentFile`, which is where a sops secret's rendered path belongs, so they
+never reach the store.
+
+```nix
+{
+  inputs.espuino-label-printer.url = "github:tbaumann/ESPuino-label-printer";
+  # ... imports = [ inputs.espuino-label-printer.nixosModules.card-printer-server ];
+
+  services.card-printer-server = {
+    enable = true;
+    port = 8081;
+    publicBaseUrl = "https://cards.example.com";
+    stripeShippingCents = 250;
+    openFirewall = true;                                   # only without a proxy
+    environmentFile = config.sops.secrets."card-printer-env".path;
+  };
+
+  # ADMIN_TOKEN, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY
+  sops.secrets."card-printer-env" = { };
+}
+```
+
+- Option name → environment variable is name to SCREAMING_SNAKE
+  (`bindAddress` + `port` make up `BIND_ADDR`, `stripeShippingCents` is
+  `STRIPE_SHIPPING_CENTS`); `environment` takes anything the module does not name.
+- systemd reads the environment file as root before dropping privileges, so it may
+  stay root-owned and mode `0400`. Settings in it win over the options — keep it
+  to the four secrets.
+- State lives in `/var/lib/card-printer-server` (the SQLite database, the card
+  images). On a host with an impermanent root it has to be in your `preservation`
+  list, or a reboot loses every order.
+- `package` defaults to this flake's own build for the host's system, so a
+  deployment needs no working tree; the remaining options are documented in
+  `nix/modules/card-printer-server.nix`.
+
 ## Web UI (`web/`)
 
 A Svelte 5 + Vite + TypeScript SPA, served by the Rust process at `/` — same

@@ -25,6 +25,13 @@
         ./checks.nix
       ];
       systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+
+      # The NixOS deployment module (see "Deploy (NixOS)" in the README). It is
+      # handed the flake's own outputs so its `package` option can default to
+      # this flake's SPA-baked server for whatever system the consuming host runs.
+      flake.nixosModules.card-printer-server =
+        import ./nix/modules/card-printer-server.nix {self = inputs.self;};
+
       perSystem = {
         config,
         lib,
