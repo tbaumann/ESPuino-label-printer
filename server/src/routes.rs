@@ -498,7 +498,7 @@ fn back_raster(
 #[utoipa::path(
     post, path = "/api/prefixes", tag = "prefixes",
     request_body = PrefixInput,
-    responses((status = 201, description = "created", body = Prefix), (status = 409, description = "uuid already exists", body = crate::error::ErrorBody))
+    responses((status = 201, description = "created", body = Prefix), (status = 409, description = "uuid already exists", body = ErrorBody))
 )]
 pub async fn create_prefix(
     State(st): State<AppState>,
@@ -517,7 +517,7 @@ pub async fn create_prefix(
     responses(
         (status = 201, description = "created", body = Prefix),
         (status = 200, description = "already exists", body = Prefix),
-        (status = 400, description = "invalid uuid", body = crate::error::ErrorBody)
+        (status = 400, description = "invalid uuid", body = ErrorBody)
     )
 )]
 pub async fn put_prefix(
@@ -548,8 +548,8 @@ pub struct StatusQuery {
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = [Prefix]),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn list_prefixes(
     State(st): State<AppState>,
@@ -570,7 +570,7 @@ pub async fn list_prefixes(
 /// Fetch one prefix with its card count.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    responses((status = 200, body = Prefix), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 200, body = Prefix), (status = 404, body = ErrorBody)))]
 pub async fn get_prefix(
     State(st): State<AppState>,
     Path(prefix): Path<String>,
@@ -582,7 +582,7 @@ pub async fn get_prefix(
 /// Index of all cards under a prefix.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}/cards", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    responses((status = 200, body = [Card]), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 200, body = CardIndex), (status = 404, body = ErrorBody)))]
 pub async fn list_cards(
     State(st): State<AppState>,
     Path(prefix): Path<String>,
@@ -598,7 +598,7 @@ pub async fn list_cards(
     put, path = "/api/prefixes/{prefix}/cards/{id}", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     request_body(content = CardInput, content_type = "multipart/form-data"),
-    responses((status = 200, body = Card), (status = 404, body = crate::error::ErrorBody), (status = 400, body = crate::error::ErrorBody))
+    responses((status = 200, body = Card), (status = 404, body = ErrorBody), (status = 400, body = ErrorBody))
 )]
 pub async fn put_card(
     State(st): State<AppState>,
@@ -634,7 +634,7 @@ pub async fn put_card(
     post, path = "/api/prefixes/{prefix}/cards", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body(content = CardInput, content_type = "multipart/form-data"),
-    responses((status = 201, body = Card), (status = 404, body = crate::error::ErrorBody), (status = 400, body = crate::error::ErrorBody))
+    responses((status = 201, body = Card), (status = 404, body = ErrorBody), (status = 400, body = ErrorBody))
 )]
 pub async fn post_card(
     State(st): State<AppState>,
@@ -672,7 +672,7 @@ pub async fn post_card(
 /// Fetch one card's metadata.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
-    responses((status = 200, body = Card), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 200, body = Card), (status = 404, body = ErrorBody)))]
 pub async fn get_card(
     State(st): State<AppState>,
     Path((prefix, id)): Path<(String, i64)>,
@@ -684,7 +684,7 @@ pub async fn get_card(
 /// Fetch a card's front image bytes.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/image/front", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
-    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = ErrorBody)))]
 pub async fn get_front_image(
     State(st): State<AppState>,
     Path((prefix, id)): Path<(String, i64)>,
@@ -708,7 +708,7 @@ pub async fn get_front_image(
 /// Fetch a card's colour back image bytes (only present in `double_sided_color`).
 #[utoipa::path(get, path = "/api/prefixes/{prefix}/cards/{id}/image/back", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
-    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 200, description = "image bytes", content_type = "image/png"), (status = 404, body = ErrorBody)))]
 pub async fn get_back_image(
     State(st): State<AppState>,
     Path((prefix, id)): Path<(String, i64)>,
@@ -816,9 +816,9 @@ fn artifact_etag(bytes: &[u8]) -> String {
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "display image bytes", content_type = "image/png"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
-        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 423, description = "still rendering", body = ErrorBody),
+        (status = 500, description = "render failed", body = ErrorBody)
     ))]
 pub async fn get_front_display(
     State(st): State<AppState>,
@@ -841,9 +841,9 @@ pub async fn get_front_display(
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "back display image bytes", content_type = "image/png"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
-        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 423, description = "still rendering", body = ErrorBody),
+        (status = 500, description = "render failed", body = ErrorBody)
     ))]
 pub async fn get_back_display(
     State(st): State<AppState>,
@@ -867,9 +867,9 @@ pub async fn get_back_display(
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "print raster bytes", content_type = "image/bmp"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
-        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 423, description = "still rendering", body = ErrorBody),
+        (status = 500, description = "render failed", body = ErrorBody)
     ))]
 pub async fn get_front_raster(
     State(st): State<AppState>,
@@ -892,9 +892,9 @@ pub async fn get_front_raster(
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
     responses(
         (status = 200, description = "back print raster bytes", content_type = "image/bmp"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 423, description = "still rendering", body = crate::error::ErrorBody),
-        (status = 500, description = "render failed", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 423, description = "still rendering", body = ErrorBody),
+        (status = 500, description = "render failed", body = ErrorBody)
     ))]
 pub async fn get_back_raster(
     State(st): State<AppState>,
@@ -978,9 +978,9 @@ async fn ensure_back_image_writable(
         description = "Multipart form carrying exactly one file part, `back_image`."),
     responses(
         (status = 200, body = Card),
-        (status = 400, description = "the file part is missing or empty", body = crate::error::ErrorBody),
-        (status = 404, description = "unknown prefix or card", body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+        (status = 400, description = "the file part is missing or empty", body = ErrorBody),
+        (status = 404, description = "unknown prefix or card", body = ErrorBody),
+        (status = 409, description = "prefix is frozen", body = ErrorBody)
     ))]
 pub async fn put_back_image(
     State(st): State<AppState>,
@@ -1016,9 +1016,9 @@ pub async fn put_back_image(
     request_body = PrefixRibbonPatch,
     responses(
         (status = 200, body = Prefix),
-        (status = 400, body = crate::error::ErrorBody),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 409, description = "prefix is frozen", body = ErrorBody)
     ))]
 pub async fn patch_prefix_ribbon(
     State(st): State<AppState>,
@@ -1046,7 +1046,7 @@ pub async fn patch_prefix_ribbon(
 /// Delete a card (metadata + image).
 #[utoipa::path(delete, path = "/api/prefixes/{prefix}/cards/{id}", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid"), ("id" = i64, Path, description = "card index within the prefix")),
-    responses((status = 204, description = "deleted"), (status = 404, body = crate::error::ErrorBody)))]
+    responses((status = 204, description = "deleted"), (status = 404, body = ErrorBody)))]
 pub async fn delete_card(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -1079,8 +1079,8 @@ pub async fn delete_card(
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 204, description = "deleted"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is not deletable without the admin token", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 409, description = "prefix is not deletable without the admin token", body = ErrorBody)
     ))]
 pub async fn delete_prefix(
     State(st): State<AppState>,
@@ -1106,8 +1106,8 @@ pub async fn delete_prefix(
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
         (status = 204, description = "all cards removed"),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+        (status = 404, body = ErrorBody),
+        (status = 409, description = "prefix is frozen", body = ErrorBody)
     ))]
 pub async fn delete_cards(
     State(st): State<AppState>,
@@ -1128,9 +1128,9 @@ pub async fn delete_cards(
     request_body = CardPatch,
     responses(
         (status = 200, body = Card),
-        (status = 400, body = crate::error::ErrorBody),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 409, description = "prefix is frozen", body = crate::error::ErrorBody)
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 409, description = "prefix is frozen", body = ErrorBody)
     ))]
 pub async fn patch_card(
     State(st): State<AppState>,
@@ -1156,9 +1156,9 @@ pub async fn patch_card(
         security(("bearerAuth" = []), ("sessionCookie" = [])),
         responses(
             (status = 200, body = PrintQueue),
-            (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-            (status = 404, body = crate::error::ErrorBody),
-            (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+            (status = 401, description = "admin token required", body = ErrorBody),
+            (status = 404, body = ErrorBody),
+            (status = 503, description = "no admin token configured", body = ErrorBody)
         ))]
 pub async fn get_print_queue(
     State(st): State<AppState>,
@@ -1188,11 +1188,11 @@ pub async fn get_print_queue(
         security(("bearerAuth" = []), ("sessionCookie" = [])),
         responses(
             (status = 200, body = Card),
-            (status = 400, description = "a non-empty body that is not this JSON", body = crate::error::ErrorBody),
-            (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-            (status = 404, body = crate::error::ErrorBody),
-            (status = 409, description = "this UID already belongs to another card of the prefix", body = crate::error::ErrorBody),
-            (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+            (status = 400, description = "a non-empty body that is not this JSON", body = ErrorBody),
+            (status = 401, description = "admin token required", body = ErrorBody),
+            (status = 404, body = ErrorBody),
+            (status = 409, description = "this UID already belongs to another card of the prefix", body = ErrorBody),
+            (status = 503, description = "no admin token configured", body = ErrorBody)
         ))]
 pub async fn mark_card_printed(
     State(st): State<AppState>,
@@ -1236,9 +1236,9 @@ pub async fn mark_card_printed(
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = Prefix),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 404, body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn patch_status(
     State(st): State<AppState>,
@@ -1288,8 +1288,8 @@ fn cookie_secure(st: &AppState, headers: &HeaderMap) -> bool {
     request_body = AdminLogin,
     responses(
         (status = 204, description = "logged in; a session cookie is set"),
-        (status = 401, description = "wrong token", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 401, description = "wrong token", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn admin_login(
     State(st): State<AppState>,
@@ -1338,8 +1338,8 @@ pub async fn admin_logout(State(st): State<AppState>, headers: HeaderMap) -> Res
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = AdminSession),
-        (status = 401, description = "not logged in", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 401, description = "not logged in", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn admin_session(
     State(st): State<AppState>,
@@ -1383,8 +1383,8 @@ const ABANDONED_CHECKOUT_AFTER_SECS: i64 = 24 * 3600;
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = [NeedsAttentionItem]),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn needs_attention(
     State(st): State<AppState>,
@@ -1444,8 +1444,8 @@ pub async fn needs_attention(
     responses(
         (status = 200, description = "the stored shipping address, or null when there is none",
             body = Option<ShippingAddress>),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 404, description = "prefix not found", body = crate::error::ErrorBody)
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 404, description = "prefix not found", body = ErrorBody)
     ))]
 pub async fn get_prefix_shipping(
     State(st): State<AppState>,
@@ -1535,9 +1535,9 @@ pub async fn shop_config(State(st): State<AppState>) -> Result<Json<ShopConfig>,
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = RibbonStock),
-        (status = 400, description = "unknown ribbon", body = crate::error::ErrorBody),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 400, description = "unknown ribbon", body = ErrorBody),
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn put_ribbon_stock(
     State(st): State<AppState>,
@@ -1577,9 +1577,9 @@ const MAX_PRICE_CENTS: i64 = 100_000;
     security(("bearerAuth" = []), ("sessionCookie" = [])),
     responses(
         (status = 200, body = RibbonPrice),
-        (status = 400, description = "unknown ribbon, or a price outside the allowed range", body = crate::error::ErrorBody),
-        (status = 401, description = "admin token required", body = crate::error::ErrorBody),
-        (status = 503, description = "no admin token configured", body = crate::error::ErrorBody)
+        (status = 400, description = "unknown ribbon, or a price outside the allowed range", body = ErrorBody),
+        (status = 401, description = "admin token required", body = ErrorBody),
+        (status = 503, description = "no admin token configured", body = ErrorBody)
     ))]
 pub async fn put_ribbon_price(
     State(st): State<AppState>,
@@ -1665,12 +1665,12 @@ async fn ensure_order_printable(pool: &SqlitePool, prefix: Uuid) -> Result<(), A
 #[utoipa::path(post, path = "/api/prefixes/{prefix}/checkout", tag = "shop",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     responses(
-        (status = 200, body = stripe::CheckoutSession),
-        (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = crate::error::ErrorBody),
-        (status = 404, description = "unknown prefix", body = crate::error::ErrorBody),
-        (status = 409, description = "the prefix has no cards, is already past payment, its print mode's ribbon is out of stock, or a card is missing its back side", body = crate::error::ErrorBody),
-        (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody),
-        (status = 502, description = "Stripe refused or could not be reached", body = crate::error::ErrorBody)
+        (status = 200, body = CheckoutSession),
+        (status = 429, description = "too many checkout sessions for this prefix in the last minute", body = ErrorBody),
+        (status = 404, description = "unknown prefix", body = ErrorBody),
+        (status = 409, description = "the prefix has no cards, is already past payment, its print mode's ribbon is out of stock, or a card is missing its back side", body = ErrorBody),
+        (status = 503, description = "payment is not configured on this deployment", body = ErrorBody),
+        (status = 502, description = "Stripe refused or could not be reached", body = ErrorBody)
     ))]
 pub async fn create_checkout(
     State(st): State<AppState>,
@@ -1771,8 +1771,8 @@ pub async fn create_checkout(
         description = "Raw Stripe event. Verified by the Stripe-Signature header, not by a token."),
     responses(
         (status = 200, description = "accepted, including events deliberately ignored"),
-        (status = 400, description = "missing, stale or mismatching signature", body = crate::error::ErrorBody),
-        (status = 503, description = "payment is not configured on this deployment", body = crate::error::ErrorBody)
+        (status = 400, description = "missing, stale or mismatching signature", body = ErrorBody),
+        (status = 503, description = "payment is not configured on this deployment", body = ErrorBody)
     ))]
 pub async fn stripe_webhook(
     State(st): State<AppState>,

@@ -21,8 +21,16 @@ with a **Nix flake** (rust-flake / crane).
 nix develop -c cargo run -p card-printer-server   # server
 ```
 
-Then open http://127.0.0.1:8080/swagger-ui — the live, generated API docs.
-The raw spec is at http://127.0.0.1:8080/api-docs/openapi.json.
+Then open http://127.0.0.1:8080/swagger-ui — the live, generated API docs. They
+describe the **public surface**: every operation a caller can reach without the
+operator's credential. http://127.0.0.1:8080/swagger-ui-full describes everything
+the router serves, admin and shop included; the two specs are
+`/api-docs/openapi.json` and `/api-docs/openapi-full.json`.
+
+Which half an operation lands in is declared in its own
+`#[utoipa::path(...)]`: naming a credential (`security((bearerAuth…))`) or
+carrying the `admin` tag keeps it out of the public docs. The filter is in
+`server/src/main.rs` (`restrict_to_public_surface`).
 
 ## Run (Nix)
 
@@ -678,6 +686,11 @@ present; force it with `SESSION_COOKIE_SECURE=true` (or `=false` to suppress).
 
 `(admin)` marks operations that need the admin credential — the bearer token or
 an admin session.
+
+Everything below is routed. Swagger UI at `/swagger-ui` describes the public
+surface only — the operations callable without the operator's credential — so the
+rows marked `(admin)` and the `/api/admin/session` ones are documented at
+`/swagger-ui-full` instead.
 
 | Method | Path                                   | Purpose                       |
 |--------|----------------------------------------|-------------------------------|

@@ -8,6 +8,7 @@ mod render;
 mod routes;
 mod stripe;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,6 +101,161 @@ impl utoipa::Modify for SecurityAddon {
     }
 }
 
+/// The surface the docs describe: everything a caller can reach without the
+/// operator's credential.
+///
+/// Two declarations disqualify an operation, both of them in its own
+/// `#[utoipa::path(...)]`: naming a credential (`bearerAuth`, `sessionCookie`),
+/// and carrying the [`ADMIN_TAG`]. The tag is not redundant for
+/// `POST /api/admin/session`, whose token travels in the BODY where no security
+/// scheme can express it — there the tag is the only declaration that this is
+/// the way *into* the admin surface, not part of the open one.
+///
+/// The filter reads those declarations instead of keeping a second `paths(...)`
+/// list beside the derive's: an endpoint says what it needs in the one place
+/// that already names it. Which also means the declaration has to be true — in
+/// this server the operations calling `require_admin()` are exactly the ones
+/// declaring a credential, and a new one must keep that up.
+const ADMIN_TAG: &str = "admin";
+
+/// Where a `$ref` to a component schema points, as it appears in the JSON.
+const SCHEMA_REF: &str = "#/components/schemas/";
+
+/// Drop every operation that needs the operator's credential, and with it the
+/// components nothing kept still uses.
+fn restrict_to_public_surface(openapi: &mut utoipa::openapi::OpenApi) {
+    openapi.paths.paths.retain(|_, item| {
+        item.operations.retain(|_, operation| {
+            operation.security.is_none()
+                && !operation.tags.iter().flatten().any(|tag| tag == ADMIN_TAG)
+        });
+        !item.operations.is_empty()
+    });
+
+    // What the kept operations still use: their schemas (or the docs keep a
+    // Schemas section describing the admin session, i.e. the models of what was
+    // just hidden) and their credential schemes (or the public docs offer an
+    // Authorize button for a token nothing in them accepts). Both are read out of
+    // the spec's own JSON, because `utoipa` has no accessor for "what does this
+    // operation reference". A spec that cannot be read is left whole: a filter
+    // that fails must never empty the document it filters.
+    let paths = match serde_json::to_value(&openapi.paths) {
+        Ok(paths) => paths,
+        Err(err) => {
+            tracing::warn!(
+                "could not read the spec's paths ({err}): every component stays in the served docs"
+            );
+            return;
+        }
+    };
+    let schemas = match reachable_schemas(openapi, &paths) {
+        Some(schemas) => schemas,
+        None => {
+            tracing::warn!(
+                "could not read the spec's schemas: every component stays in the served docs"
+            );
+            return;
+        }
+    };
+    let schemes = named_security_schemes(&paths);
+
+    if let Some(components) = openapi.components.as_mut() {
+        components.schemas.retain(|name, _| schemas.contains(name));
+        components
+            .security_schemes
+            .retain(|name, _| schemes.contains(name));
+    }
+
+    // Say which half this is: the info text describes both kinds of caller, and
+    // the operator's own operations are exactly what was dropped from here.
+    let described = openapi.info.description.take().unwrap_or_default();
+    openapi.info.description = Some(format!(
+        "{} This document is the public surface: the operations callable without an operator \
+         credential. The operator's own are documented at /swagger-ui-full.",
+        described.trim_end()
+    ));
+}
+
+/// The schema names the given paths reach, following `$ref`s through the schemas
+/// themselves (`Card` carries a `BackSource`). `None` if any of it cannot be
+/// serialized, which the caller reads as "prune nothing".
+fn reachable_schemas(
+    openapi: &utoipa::openapi::OpenApi,
+    paths: &serde_json::Value,
+) -> Option<HashSet<String>> {
+    fn collect(value: &serde_json::Value, into: &mut HashSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    match (key.as_str(), item.as_str()) {
+                        ("$ref", Some(reference)) => {
+                            if let Some(name) = reference.strip_prefix(SCHEMA_REF) {
+                                into.insert(name.to_string());
+                            }
+                        }
+                        _ => collect(item, into),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, into)),
+            _ => {}
+        }
+    }
+
+    let mut schemas: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Some(components) = openapi.components.as_ref() {
+        for (name, schema) in &components.schemas {
+            schemas.push((name.clone(), serde_json::to_value(schema).ok()?));
+        }
+    }
+
+    let mut reached: HashSet<String> = HashSet::new();
+    collect(paths, &mut reached);
+
+    // Schemas reference one another, so the set grows until it settles. There
+    // are a few dozen of them, so this takes two or three passes.
+    loop {
+        let before = reached.len();
+        for (name, schema) in &schemas {
+            if reached.contains(name) {
+                collect(schema, &mut reached);
+            }
+        }
+        if reached.len() == before {
+            return Some(reached);
+        }
+    }
+}
+
+/// The security scheme names the given paths name, i.e. the keys of every
+/// `security` requirement in them.
+fn named_security_schemes(paths: &serde_json::Value) -> HashSet<String> {
+    let mut named: HashSet<String> = HashSet::new();
+    match paths {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == "security" {
+                    if let serde_json::Value::Array(requirements) = value {
+                        for requirement in requirements {
+                            if let serde_json::Value::Object(names) = requirement {
+                                named.extend(names.keys().cloned());
+                            }
+                        }
+                    }
+                }
+                named.extend(named_security_schemes(value));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                named.extend(named_security_schemes(item));
+            }
+        }
+        _ => {}
+    }
+    named
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -115,6 +271,7 @@ impl utoipa::Modify for SecurityAddon {
         routes::put_prefix,
         routes::list_prefixes,
         routes::get_prefix,
+        routes::patch_prefix_ribbon,
         routes::delete_prefix,
         routes::delete_cards,
         routes::patch_status,
@@ -123,6 +280,7 @@ impl utoipa::Modify for SecurityAddon {
         routes::post_card,
         routes::get_card,
         routes::get_front_image,
+        routes::get_back_image,
         routes::get_front_display,
         routes::get_back_display,
         routes::get_front_raster,
@@ -143,20 +301,27 @@ impl utoipa::Modify for SecurityAddon {
         routes::stripe_webhook,
         routes::get_prefix_shipping,
     ),
+    // The names here are what a `$ref` must spell, and a path attribute's
+    // `body = <tokens>` is named by the tokens it is given: `body = Prefix`
+    // points at `Prefix`, while `body = crate::error::ErrorBody` points at
+    // `crate.error.ErrorBody`, which nothing registers. So the attribute spells
+    // the bare type name and does NOT need it imported — the utoipa macro reads
+    // the name out of the tokens without resolving them.
     components(schemas(
         models::Prefix,
         models::PrefixInput,
         models::PrefixStatus,
         models::StatusInput,
         models::Card,
-                models::CardIndex,
-                models::CardInput,
-                models::CardPatch,
-                models::PrintedInput,
-                models::BackSource,
-                models::PrintQueue,
-                models::PrintQueueCard,
-                models::AdminLogin,
+        models::CardIndex,
+        models::CardInput,
+        models::CardPatch,
+        models::PrefixRibbonPatch,
+        models::PrintedInput,
+        models::BackSource,
+        models::PrintQueue,
+        models::PrintQueueCard,
+        models::AdminLogin,
         models::AdminSession,
         models::NeedsAttentionItem,
         models::NeedsAttentionKind,
@@ -265,15 +430,28 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Two docs. `/swagger-ui` describes the public surface (see
+    // `restrict_to_public_surface`); `/swagger-ui-full` describes everything the
+    // router serves, the operator's own operations included.
+    let mut public = ApiDoc::openapi();
+    restrict_to_public_surface(&mut public);
+
     let app = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", public))
+        .merge(
+            SwaggerUi::new("/swagger-ui-full")
+                .url("/api-docs/openapi-full.json", ApiDoc::openapi()),
+        )
         .merge(routes::router(state))
         .fallback_service(ServeDir::new(&static_dir).fallback(ServeFile::new(index_html)))
         .layer(middleware::from_fn(static_cache_policy))
         .layer(TraceLayer::new_for_http());
 
     let addr: SocketAddr = bind.parse()?;
-    tracing::info!("listening on http://{addr}  (app at /, swagger UI at /swagger-ui)");
+    tracing::info!(
+        "listening on http://{addr}  (app at /, api docs at /swagger-ui for the public \
+         surface and /swagger-ui-full for everything)"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
