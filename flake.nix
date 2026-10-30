@@ -33,7 +33,19 @@
         ...
       }: {
         rust-project.toolchain = pkgs.rust-bin.stable.latest.default;
-        rust-project.src = lib.cleanSource ./.;
+        # Only the Rust workspace is a build input: the manifests and the two
+        # crate dirs. server/ carries the migrations, which sqlx::migrate!
+        # embeds at compile time. Editing the SPA, a Nix file or a doc no
+        # longer moves the crates' derivations.
+        rust-project.src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./cli
+            ./server
+          ];
+        };
         # The crate binary is never exposed on its own: packages.nix owns
         # `packages.card-printer-server` and bundles the SPA into it. Keep the
         # docs package and the clippy check autowired.
