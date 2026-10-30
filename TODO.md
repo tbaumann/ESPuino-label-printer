@@ -85,6 +85,65 @@ rendered in the browser.
   written when typing stops (1200 ms) or the field is left, and a response is
   never copied back into the field it came from.
 
+## A filtered source per derivation
+
+`rust-project.src = lib.cleanSource ./.` (flake.nix:36) passes the whole **tracked**
+tree to every Rust crate. `lib.cleanSource` filters only VCS dirs, editor backups,
+`*.o`/`*.so` and `result*` symlinks — nothing of ours — so the crate's `src` is
+exactly `git ls-files` (`cli/`, `server/`, `Cargo.lock`, the flake files, `nix/`,
+`printer/`, `reader/`, `scripts/`, `web/` and every `*.md`). Editing a README
+sentence, an ESPHome yaml or a Svelte file therefore moves the crate's derivation
+and rebuilds the workspace crates, clippy, docs, the tests and the server wrapper.
+(`target/` and `data/` stay out only because Nix copies a flake's git tree, not
+because of this call.) Give each derivation the files it reads:
+
+1. Rust workspace (`rust-project.src`) — a fileset over the manifests and the two
+   crate directories:
+   ```nix
+   rust-project.src = lib.fileset.toSource {
+     root = ./.;
+     fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./cli ./server ];
+   };
+   ```
+   `server/migrations` must stay inside: `sqlx::migrate!("./migrations")` embeds the
+   directory at compile time (`server/src/db.rs:35` and the test modules in
+   `auth.rs`/`notify.rs`/`routes.rs`). rust-flake's default,
+   `filterCargoSources`, keeps only `.rs`/`.toml`/`Cargo.lock` and drops the `.sql`
+   — which is why this is `cleanSource` today, and why the fileset names the
+   directory rather than letting a filter guess.
+2. `checks.nix` needs no second fileset: `workspaceArgs.src` is
+   `config.rust-project.src` and follows point 1. `spooler-api-test` puts
+   `PYTHONPATH=${./printer}` in the store, which is the spooler's whole (five-file)
+   directory — narrow it to `pyproject.toml` and `esplp_print/` if it is ever
+   expected to grow.
+3. Already narrow, and the pattern to copy rather than change:
+   `nix/packages/card-printer-server-web.nix` names `index.html`, the
+   package/tsconfig/vite files, `public/` and `src/`; `evolis-sdk.nix` and
+   `markie.nix` are pinned fetches; `card-printer-server.nix` has no `src` at all
+   (it wraps the crate, the SPA and markie); the two NixOS tests copy the single
+   scripts and fixtures they need; `card-printer.nix`'s `fileset = ../../printer`
+   is a five-file directory already.
+
+Verification, on a clean tree — the crate's derivation must not move when a file
+outside the fileset changes:
+
+```sh
+# what the Rust build actually gets (today: the whole tracked tree)
+nix derivation show "$(nix eval --raw .#packages.x86_64-linux.card-printer-cli.drvPath)" \
+  | jq -r '.derivations[].env.src'
+diff <(cd <that src> && find . -type f | sort) <(git ls-files | sed 's|^|./|' | sort)
+
+# A/B: a doc edit must NOT create a new derivation
+nix eval --raw .#packages.x86_64-linux.card-printer-cli.drvPath   # record
+echo >> README.md
+nix eval --raw .#packages.x86_64-linux.card-printer-cli.drvPath   # must be the same
+```
+
+Then the gates, which a narrowed src changes once (a full workspace rebuild —
+batch it with other Rust work): `nix build --no-link
+.#checks.x86_64-linux.{cargo-test,card-printer-server-clippy,svelte-check,spooler-api-test}`
+and `nix build --no-link .#card-printer-server`.
+
 ## Done — both ribbons are the same except in the print raster
 
 Neither ribbon restricts a back source any more. The ribbon decides one thing,
