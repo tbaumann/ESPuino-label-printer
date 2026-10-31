@@ -51,6 +51,16 @@ const ADMIN_PREFIX_SELECT: &str = "SELECT p.uuid, p.created_at, p.status, p.stat
             AS unprinted_count
  FROM prefixes p";
 
+/// The INSERT that creates a prefix row: a draft on the default ribbon.
+///
+/// [`create_prefix`] runs it bare — a duplicate uuid is a `409`. The writes that
+/// create a project lazily (`upsert_card`, `set_prefix_ribbon`) append their own
+/// `ON CONFLICT` clause, so the row a first write creates is the row this
+/// statement would have created for it.
+const DRAFT_INSERT: &str = "\
+INSERT INTO prefixes (uuid, status, status_changed_at, ribbon)
+ VALUES (?1, 'draft', datetime('now'), ?2)";
+
 fn prefix_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Prefix, ApiError> {
     let status_raw: String = row.get("status");
     let status = PrefixStatus::parse(&status_raw)
@@ -85,15 +95,12 @@ pub async fn create_prefix(
     ribbon: Option<Ribbon>,
 ) -> Result<Prefix, ApiError> {
     let uuid = uuid.unwrap_or_else(Uuid::new_v4);
-    let ribbon = ribbon.unwrap_or(Ribbon::Ymcko);
-    let res = sqlx::query(
-        "INSERT INTO prefixes (uuid, status, status_changed_at, ribbon)
-         VALUES (?1, 'draft', datetime('now'), ?2)",
-    )
-    .bind(uuid.to_string())
-    .bind(ribbon.as_str())
-    .execute(pool)
-    .await;
+    let ribbon = ribbon.unwrap_or_default();
+    let res = sqlx::query(DRAFT_INSERT)
+        .bind(uuid.to_string())
+        .bind(ribbon.as_str())
+        .execute(pool)
+        .await;
 
     if let Err(e) = res {
         if let sqlx::Error::Database(db) = &e {
@@ -178,25 +185,27 @@ pub async fn set_prefix_shipping(
     Ok(())
 }
 
-/// Change a prefix's ribbon. Idempotent: re-applying the current ribbon is a
-/// no-op that still returns the prefix.
+/// Change a prefix's ribbon, creating the prefix if this is the first write to
+/// its uuid. Idempotent: re-applying the current ribbon changes nothing.
 ///
 /// Nothing about a card is checked, because nothing about a card is tied to the
 /// ribbon except how it is rendered. Re-rendering the derived artifacts is the
-/// route's job; this only writes the column.
+/// route's job; this only writes the column — and creating the row is exactly
+/// what its caller checked the ribbon for, so no separate "does it exist" step
+/// is needed. The route skips this call when the ribbon is unchanged on a stored
+/// prefix, which is what keeps a no-op PATCH from re-rendering every card.
 pub async fn set_prefix_ribbon(
     pool: &SqlitePool,
     uuid: Uuid,
     ribbon: Ribbon,
 ) -> Result<Prefix, ApiError> {
-    let current = get_prefix(pool, uuid).await?;
-    if current.ribbon != ribbon {
-        sqlx::query("UPDATE prefixes SET ribbon = ?2 WHERE uuid = ?1")
-            .bind(uuid.to_string())
-            .bind(ribbon.as_str())
-            .execute(pool)
-            .await?;
-    }
+    sqlx::query(&format!(
+        "{DRAFT_INSERT} ON CONFLICT(uuid) DO UPDATE SET ribbon = excluded.ribbon"
+    ))
+    .bind(uuid.to_string())
+    .bind(ribbon.as_str())
+    .execute(pool)
+    .await?;
     get_prefix(pool, uuid).await
 }
 
@@ -207,6 +216,23 @@ pub async fn get_prefix(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiErro
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("prefix {uuid}")))?;
     prefix_from_row(&row)
+}
+
+/// The prefix a request is about: the stored row, or an empty draft that is not
+/// in the database ([`Prefix::empty`]).
+///
+/// Every read and every write the customer's editor makes goes through this, so
+/// a well-formed uuid nothing has been written to yet is the empty project it
+/// names rather than a failed lookup — and the write that follows is what stores
+/// it. [`get_prefix`] stays the honest "is it there" question, for the callers
+/// that need one: the admin list, the order operations, and the webhook, whose
+/// `NotFound` arm is a real anomaly to report.
+pub async fn prefix_or_draft(pool: &SqlitePool, uuid: Uuid) -> Result<Prefix, ApiError> {
+    match get_prefix(pool, uuid).await {
+        Ok(p) => Ok(p),
+        Err(ApiError::NotFound(_)) => Ok(Prefix::empty(uuid)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Every ribbon's stock flag, ordered by ribbon, for the shop config.
@@ -444,12 +470,16 @@ pub async fn set_status(
 /// A customer may only write while the prefix is a draft; the operator may
 /// write in any state up to and including `queued` (and even while printing,
 /// which is what makes a stuck print job recoverable).
+///
+/// An unknown uuid is a draft ([`prefix_or_draft`]) and therefore writable: the
+/// write that follows is what stores the project, so a guard that 404'd here
+/// would leave the first upload with nowhere to go.
 pub async fn ensure_writable(
     pool: &SqlitePool,
     uuid: Uuid,
     admin: bool,
 ) -> Result<Prefix, ApiError> {
-    let prefix = get_prefix(pool, uuid).await?;
+    let prefix = prefix_or_draft(pool, uuid).await?;
     let writable = if admin {
         prefix.status.is_writable()
     } else {
@@ -573,6 +603,14 @@ pub struct CardContent<'a> {
 
 /// Insert or replace a card. Mirrors a PUT semantics on (prefix, id).
 ///
+/// This is also what creates the prefix on the first write to its uuid: a card
+/// is what makes a project real — the customer's page is created by uploading
+/// into it, not by opening it. Both rows go in one transaction, because
+/// `cards.prefix_uuid` is a foreign key and a card insert that fails (a UID
+/// another card already carries, say) must not leave the empty prefix it created
+/// behind: a half-done upload that left a dead project is exactly what opening a
+/// page must never produce.
+///
 /// A `back_image_path`/`back_image_content_type` of `None` clears any stored
 /// back image. A `back_text` is stored whatever the back source is — only a
 /// `markdown` back renders it (see [`back_renders`]) — and no ribbon rules out a
@@ -583,6 +621,12 @@ pub async fn upsert_card(
     id: i64,
     card: CardContent<'_>,
 ) -> Result<Card, ApiError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("{DRAFT_INSERT} ON CONFLICT(uuid) DO NOTHING"))
+        .bind(prefix.to_string())
+        .bind(Ribbon::default().as_str())
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO cards
             (prefix_uuid, id, name, serial_number, back_source, back_text, image_path,
@@ -609,8 +653,9 @@ pub async fn upsert_card(
     .bind(card.image_content_type)
     .bind(card.back_image_path)
     .bind(card.back_image_content_type)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     get_card(pool, prefix, id).await
 }
@@ -1450,6 +1495,86 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(p.ribbon, Ribbon::Ymcko);
+    }
+
+    // -----------------------------------------------------------------------
+    // A project exists from its first write, not from opening its page
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_unwritten_uuid_reads_as_an_empty_draft() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+
+        let draft = prefix_or_draft(&pool, uuid).await.expect("a draft");
+        assert!(!draft.is_stored());
+        assert_eq!(draft.status, PrefixStatus::Draft);
+        assert_eq!(draft.ribbon, Ribbon::Ymcko);
+        assert_eq!(draft.card_count, 0);
+        assert!(draft.status_changed_at.is_none());
+
+        // Reading it stored nothing...
+        assert!(matches!(
+            get_prefix(&pool, uuid).await,
+            Err(ApiError::NotFound(_))
+        ));
+
+        // ...and once it is written the same read answers the stored row.
+        create_prefix(&pool, Some(uuid), None).await.expect("create");
+        let stored = prefix_or_draft(&pool, uuid).await.expect("stored");
+        assert!(stored.is_stored());
+        assert!(stored.created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn writing_a_card_creates_the_prefix_it_is_written_into() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+        assert!(matches!(
+            get_prefix(&pool, uuid).await,
+            Err(ApiError::NotFound(_))
+        ));
+
+        card(&pool, uuid, 1, BackSource::None).await;
+
+        let p = get_prefix(&pool, uuid)
+            .await
+            .expect("the card stored the project");
+        assert!(p.is_stored());
+        assert_eq!(p.status, PrefixStatus::Draft);
+        assert_eq!(p.card_count, 1);
+    }
+
+    #[tokio::test]
+    async fn setting_the_ribbon_of_an_unwritten_uuid_stores_it() {
+        let pool = test_pool().await;
+        let uuid = Uuid::new_v4();
+
+        let p = set_prefix_ribbon(&pool, uuid, Ribbon::Ymckok)
+            .await
+            .expect("the ribbon write stores the project");
+        assert!(p.is_stored());
+        assert_eq!(p.ribbon, Ribbon::Ymckok);
+        assert_eq!(p.status, PrefixStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn setting_the_ribbon_leaves_the_rest_of_the_prefix_alone() {
+        let pool = test_pool().await;
+        let p = create_prefix(&pool, None, None).await.expect("create");
+        set_status(&pool, p.uuid, PrefixStatus::PaymentPending, None, false)
+            .await
+            .expect("seal it");
+
+        let after = set_prefix_ribbon(&pool, p.uuid, Ribbon::Ymckok)
+            .await
+            .expect("switch");
+
+        // The upsert writes `ribbon` and nothing else: a sealed order stays
+        // sealed, and its status is not quietly reset to draft.
+        assert_eq!(after.status, PrefixStatus::PaymentPending);
+        assert_eq!(after.ribbon, Ribbon::Ymckok);
+        assert!(after.is_stored());
     }
 
     #[tokio::test]

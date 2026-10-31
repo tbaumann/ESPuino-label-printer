@@ -172,6 +172,14 @@ pub enum Ribbon {
     Ymckok,
 }
 
+impl Default for Ribbon {
+    /// What a new prefix is created on: a customer's job prints in colour
+    /// unless they say otherwise.
+    fn default() -> Self {
+        Self::Ymcko
+    }
+}
+
 impl Ribbon {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -248,7 +256,12 @@ pub enum BackDepth {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Prefix {
     pub uuid: Uuid,
-    pub created_at: String,
+    /// When the prefix was first written. `None` means nothing has been written
+    /// to this uuid yet: a customer's page generates the uuid and edits against
+    /// it, and the first write is what stores the project (see
+    /// [`Prefix::empty`]). Nothing in the database is ever missing it, so this
+    /// is the one field that says "stored".
+    pub created_at: Option<String>,
     pub status: PrefixStatus,
     /// When the status last changed.
     pub status_changed_at: Option<String>,
@@ -267,6 +280,41 @@ pub struct Prefix {
     /// prefix is a resume (still has unprinted cards).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unprinted_count: Option<i64>,
+}
+
+impl Prefix {
+    /// An empty draft: what a uuid that nothing has been written to yet reads
+    /// as.
+    ///
+    /// A project is created by its first *write*, not by opening its page — the
+    /// customer's page generates a uuid, edits against it and uploads cards
+    /// into it, and the first card is what puts the row in the database. So
+    /// every well-formed uuid is a real address with an empty project behind
+    /// it, and a request for one is not a failed lookup: answering `404` there
+    /// is what made opening a page look like an error, and a stored empty row
+    /// per page load what filled the database with dead projects.
+    ///
+    /// Everything here is what a fresh prefix gets ([`Ribbon::default`],
+    /// `draft`), and `created_at` is `None` — the one field that says nothing
+    /// is stored yet.
+    pub fn empty(uuid: Uuid) -> Self {
+        Prefix {
+            uuid,
+            created_at: None,
+            status: PrefixStatus::Draft,
+            status_changed_at: None,
+            ribbon: Ribbon::default(),
+            order_ref: None,
+            card_count: 0,
+            unprinted_count: None,
+        }
+    }
+
+    /// Whether this prefix is in the database. A draft nothing has been written
+    /// to yet has no creation time.
+    pub fn is_stored(&self) -> bool {
+        self.created_at.is_some()
+    }
 }
 
 /// Where a paid order ships, as Stripe Checkout collected it.

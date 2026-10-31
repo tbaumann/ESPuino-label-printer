@@ -246,8 +246,15 @@ Its last scenario (the Pay button) needs payment configured on that server and i
 skipped with a note when it is not; `scripts/stripe_e2e_test.py` is the test that
 covers payment properly.
 
-Opening `/` creates a new project and redirects to `/p/<uuid>` — the project
-*is* the prefix. Use "Open" to return to an existing project code; recent
+Opening `/` picks a project uuid in the browser and opens `/p/<uuid>` — the
+project *is* the prefix. Nothing is stored by opening it: the first write (the
+first card uploaded) is what creates the prefix, so a page that is only looked
+at leaves no dead project behind. Which also means any well-formed uuid is an
+addressable project — `GET /api/prefixes/{uuid}` answers an empty draft
+(`created_at: null`) rather than a `404`. A write the page would otherwise make
+before there is a card — a ribbon chosen on an empty project — is held in the
+browser and applied with that first card, so an empty project never earns a row.
+Use "Open" to return to an existing project code; recent
 projects are remembered in `localStorage`. A project page holds the ribbon
 chooser (one radio per ribbon, with the price of one billing unit — a printed
 side or a whole card, as the server names it; a ribbon that
@@ -687,6 +694,14 @@ draft ──Pay──▶ payment_pending ──paid──▶ paid ──▶ queu
   (`{"serial_number": "123456789012"}`, optional, like the whole body):
   the write that records the ejection is the only one left at the moment the
   chip has been read.
+- **A prefix exists from its first write, not from a page load.** The customer's
+  page picks a uuid in the browser and edits against it; `POST .../cards`,
+  `PUT .../cards/{id}`, `PATCH /api/prefixes/{prefix}` and `PUT
+  /api/prefixes/{prefix}` are what store the row. A uuid nobody has written to is
+  not an error: reads answer an empty `draft` with `created_at: null`, and
+  deleting a prefix returns its uuid to exactly that state. Only the operator's
+  list (`GET /api/prefixes`) can tell a stored project from an address someone
+  typed.
 - `GET /api/prefixes?status=paid` is the print queue's work list.
 - Transitions are validated; an invalid one returns `409`. Re-applying the
   current status is a no-op, so shop/queue callbacks can safely retry.
@@ -784,13 +799,13 @@ rows marked `(admin)` and the `/api/admin/session` ones are documented at
 | POST   | `/api/prefixes`                        | create prefix (optional uuid) |
 | PUT    | `/api/prefixes/{prefix}`               | create prefix at path uuid, idempotent |
 | GET    | `/api/prefixes`                        | list prefixes, `?status=` filter **(admin)** |
-| GET    | `/api/prefixes/{prefix}`               | get one prefix + card count   |
-| PATCH  | `/api/prefixes/{prefix}`               | set the ribbon (while writable; `409` if a card's back cannot be printed on it) |
+| GET    | `/api/prefixes/{prefix}`               | get one prefix + card count (an unwritten uuid answers an empty `draft`) |
+| PATCH  | `/api/prefixes/{prefix}`               | set the ribbon (while writable; `409` if a card's back cannot be printed on it); stores the prefix if this is its first write |
 | DELETE | `/api/prefixes/{prefix}`               | delete prefix + all its cards and blobs (writable, or admin) |
 | POST   | `/api/prefixes/{prefix}/submit`        | **removed** — answers `410`, use checkout |
 | PATCH  | `/api/prefixes/{prefix}/status`        | set status, any transition **(admin)** |
-| GET    | `/api/prefixes/{prefix}/cards`         | index of cards in the prefix  |
-| POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id (optional `back`) |
+| GET    | `/api/prefixes/{prefix}/cards`         | index of cards in the prefix (empty until something is written) |
+| POST   | `/api/prefixes/{prefix}/cards`         | add card, server-assigned id (optional `back`); creates the prefix if this is its first write |
 | DELETE | `/api/prefixes/{prefix}/cards`         | delete every card in the prefix |
 | GET    | `/api/prefixes/{prefix}/cards/{id}`    | card metadata                 |
 | PUT    | `/api/prefixes/{prefix}/cards/{id}`    | create/replace card at id (image required) |

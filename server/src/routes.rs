@@ -568,27 +568,33 @@ pub async fn list_prefixes(
 }
 
 /// Fetch one prefix with its card count.
+///
+/// Every well-formed uuid answers: a uuid nothing has been written to yet is an
+/// empty draft (`created_at: null`) rather than a `404`, because the customer's
+/// page picks its uuid and is created by its first write.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    responses((status = 200, body = Prefix), (status = 404, body = ErrorBody)))]
+    responses((status = 200, body = Prefix), (status = 400, body = ErrorBody)))]
 pub async fn get_prefix(
     State(st): State<AppState>,
     Path(prefix): Path<String>,
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    Ok(Json(db::get_prefix(&st.pool, prefix).await?))
+    Ok(Json(db::prefix_or_draft(&st.pool, prefix).await?))
 }
 
 /// Index of all cards under a prefix.
 #[utoipa::path(get, path = "/api/prefixes/{prefix}/cards", tag = "cards",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
-    responses((status = 200, body = CardIndex), (status = 404, body = ErrorBody)))]
+    responses((status = 200, body = CardIndex), (status = 400, body = ErrorBody)))]
 pub async fn list_cards(
     State(st): State<AppState>,
     Path(prefix): Path<String>,
 ) -> Result<Json<CardIndex>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
-    db::get_prefix(&st.pool, prefix).await?; // 404 if the prefix is unknown
+    // No existence check to fail: a project nothing has been written to yet has
+    // no cards, which is an empty index rather than a missing prefix.
+    db::prefix_or_draft(&st.pool, prefix).await?;
     let cards = db::list_cards(&st.pool, prefix).await?;
     Ok(Json(CardIndex { prefix, cards }))
 }
@@ -1011,13 +1017,18 @@ pub async fn put_back_image(
 /// one ribbon and this is it. Whether the prefix has been paid for is irrelevant:
 /// the charge is already taken and recorded, and which load goes in the printer
 /// is a production decision, not a repricing.
+///
+/// This is a write, so it stores the project too: a uuid nothing has been
+/// written to yet gets its row here, on the requested ribbon. The customer's page
+/// never spends it that way — a ribbon chosen before the first card is held in
+/// the browser and applied with that card — but the operation has to mean the
+/// same thing however it is called.
 #[utoipa::path(patch, path = "/api/prefixes/{prefix}", tag = "prefixes",
     params(("prefix" = Uuid, Path, description = "prefix uuid")),
     request_body = PrefixRibbonPatch,
     responses(
         (status = 200, body = Prefix),
         (status = 400, body = ErrorBody),
-        (status = 404, body = ErrorBody),
         (status = 409, description = "prefix is frozen", body = ErrorBody)
     ))]
 pub async fn patch_prefix_ribbon(
@@ -1028,9 +1039,11 @@ pub async fn patch_prefix_ribbon(
 ) -> Result<Json<Prefix>, ApiError> {
     let prefix = parse_uuid(&prefix)?;
     let caller = auth::resolve(&st, &headers).await?;
-    db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
-    let current = db::get_prefix(&st.pool, prefix).await?;
-    if current.ribbon == input.ribbon {
+    let current = db::ensure_writable(&st.pool, prefix, caller.is_admin()).await?;
+    // Nothing to write and nothing to re-render — but only for a prefix that is
+    // actually stored. An unsaved draft with the default ribbon must still fall
+    // through, because storing it is the point of the call.
+    if current.ribbon == input.ribbon && current.is_stored() {
         return Ok(Json(current)); // idempotent: nothing to render or write
     }
     let updated = db::set_prefix_ribbon(&st.pool, prefix, input.ribbon).await?;
@@ -1414,7 +1427,9 @@ pub async fn needs_attention(
                       nothing was ever paid, so no work queue will pick it up — revert it to \
                       draft, or mark it paid by hand if the money arrived outside Stripe"
                 .into(),
-            at: p.status_changed_at.unwrap_or(p.created_at),
+            // Both are set on a stored prefix, which is the only kind this list
+            // is about; the fallback is for the type, not for a real case.
+            at: p.status_changed_at.or(p.created_at).unwrap_or_default(),
             session_id: None,
             amount_cents: None,
             currency: None,
@@ -1693,7 +1708,7 @@ pub async fn create_checkout(
         ApiError::Unavailable("payment is disabled: STRIPE_SECRET_KEY is not set".into())
     })?;
 
-    let p = db::get_prefix(&st.pool, prefix).await?;
+    let p = db::prefix_or_draft(&st.pool, prefix).await?;
     // Re-opening a checkout is fine — the customer may have closed the window, or
     // had a card declined. Anything at or past payment is not.
     if !matches!(p.status, PrefixStatus::Draft | PrefixStatus::PaymentPending) {
@@ -1702,6 +1717,8 @@ pub async fn create_checkout(
             p.status
         )));
     }
+    // A project nothing has been written to yet has no cards, which is the same
+    // refusal — said in the terms the customer can act on.
     if p.card_count <= 0 {
         return Err(ApiError::Conflict(format!(
             "prefix {prefix} has no cards, so there is nothing to print"
@@ -2709,6 +2726,38 @@ mod tests {
             login_limiter: crate::auth::LoginLimiter::default(),
             checkout_limiter: limiter,
         }
+    }
+
+    #[tokio::test]
+    async fn get_prefix_answers_an_unwritten_uuid_with_an_empty_draft() {
+        let pool = test_pool().await;
+        let st = state_with(
+            rate_limit::RateLimiter::new(5, Duration::from_secs(60)),
+            pool.clone(),
+        );
+        let uuid = Uuid::new_v4();
+
+        // Not a 404: the customer's page picks its own uuid and is created by
+        // its first write, so the address has to read before anything exists.
+        let Json(p) = get_prefix(State(st.clone()), Path(uuid.to_string()))
+            .await
+            .expect("an unwritten uuid is an empty project, not an error");
+        assert_eq!(p.uuid, uuid);
+        assert!(!p.is_stored());
+        assert_eq!(p.card_count, 0);
+        assert_eq!(p.status, PrefixStatus::Draft);
+
+        // Its cards are an empty index...
+        let Json(idx) = list_cards(State(st), Path(uuid.to_string()))
+            .await
+            .expect("no cards is an empty index, not a missing prefix");
+        assert!(idx.cards.is_empty());
+
+        // ...and reading either of them wrote nothing.
+        assert!(matches!(
+            db::get_prefix(&pool, uuid).await,
+            Err(ApiError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

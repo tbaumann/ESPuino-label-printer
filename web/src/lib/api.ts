@@ -22,7 +22,14 @@ export type BackSource = 'none' | 'front' | 'image' | 'markdown'
 
 export interface Prefix {
   uuid: string
-  created_at: string
+  /**
+   * When the project was first stored — `null` while nothing has been written to
+   * it, which is what a project the customer has only opened reads as.
+   *
+   * A page does not create anything: the browser picks the uuid, the customer
+   * edits against it, and the first card uploaded is what stores the project.
+   */
+  created_at: string | null
   status: PrefixStatus
   status_changed_at: string | null
   ribbon: Ribbon
@@ -300,6 +307,29 @@ export function isUuid(s: string): boolean {
   return UUID_RE.test(s.trim())
 }
 
+/**
+ * A fresh project uuid, for a page that has just been opened.
+ *
+ * Nothing is stored by this: the project is created by its first write, so
+ * opening a page leaves no trace. Built on `getRandomValues` rather than
+ * `crypto.randomUUID`, which browsers only expose in a secure context — a
+ * deployment reached over plain HTTP on a LAN address would otherwise have no
+ * way to start a project at all.
+ */
+export function newUuid(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 0x0f) | 0x40 // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80 // variant 1
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'))
+  return [
+    hex.slice(0, 4).join(''),
+    hex.slice(4, 6).join(''),
+    hex.slice(6, 8).join(''),
+    hex.slice(8, 10).join(''),
+    hex.slice(10).join(''),
+  ].join('-')
+}
+
 export function stem(filename: string): string {
   return filename.replace(/\.[^.]+$/, '')
 }
@@ -337,13 +367,11 @@ export function moneyInput(cents: number): string {
 }
 
 export const api = {
-  createPrefix: (uuid?: string, ribbon?: Ribbon): Promise<Prefix> =>
-    req<Prefix>('/api/prefixes', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...(uuid ? { uuid } : {}), ...(ribbon ? { ribbon } : {}) }),
-    }),
-
+  /**
+   * The project. Every well-formed uuid answers: one that nothing has been
+   * written to yet comes back as an empty draft with `created_at: null`, because
+   * a project is created by its first write and not by opening its page.
+   */
   getPrefix: (p: string): Promise<Prefix> => req<Prefix>(`/api/prefixes/${p}`),
 
   /**
@@ -538,7 +566,7 @@ export const adminApi = {
     }),
 }
 
-/** Remembered projects, so the auto-created landing page isn't a dead end. */
+/** Remembered projects, so the landing page can offer a way back to one. */
 export interface Recent {
   uuid: string
   at: number

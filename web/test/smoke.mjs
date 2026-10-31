@@ -239,6 +239,20 @@ async function listPrefixes(token) {
   return (await realFetch(`${BASE}/api/prefixes`, { headers })).status
 }
 
+/**
+ * The prefixes that are actually stored, as the operator's list serves them.
+ *
+ * The only view that can answer "was anything written?": every well-formed uuid
+ * answers a `GET /api/prefixes/{uuid}` now (an empty draft, see scenario A), so
+ * reading one back no longer says whether it exists.
+ */
+async function storedPrefixes() {
+  const res = await realFetch(`${BASE}/api/prefixes`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  return res.ok ? await res.json() : []
+}
+
 console.log(`bundle: ${bundleName}\nbase:   ${BASE}\n`)
 
 // ---- scenario A: landing auto-creates a project and redirects --------------
@@ -271,11 +285,17 @@ console.log('\n0. what the browser may keep of the frontend')
   )
 }
 
-console.log('A. landing page redirects into a new project')
+// ---- scenario A: the landing page opens a project without storing one ------
+// A project is created by its first *write*, not by opening its page: the
+// browser picks the uuid, the customer edits against it, and the first card
+// uploaded is what stores it. Otherwise every page load left an empty dead
+// project in the database, and every address a visitor typed read as a 404.
+console.log('A. the landing page opens a project without storing one')
 {
   const w = await mount('/', { bust: 'a' })
-  const p = w.location.pathname
-  check('redirected to /p/<uuid>', /^\/p\/[0-9a-f-]{36}$/.test(p), p)
+  const opened = w.location.pathname
+  check('redirected to /p/<uuid>', /^\/p\/[0-9a-f-]{36}$/.test(opened), opened)
+  const uuid = opened.slice(3)
   const text = w.document.body.textContent ?? ''
   check('renders the project page', text.includes('Project') && text.includes('Cards'))
   check('renders the upload dropzone', !!w.document.querySelector('.dropzone'))
@@ -285,15 +305,46 @@ console.log('A. landing page redirects into a new project')
   check('has a folder input with webkitdirectory',
     w.document.querySelector('input[webkitdirectory]') !== null)
   check('shows draft status badge', w.document.querySelector('.badge')?.textContent?.trim() === 'draft')
-  check('project exists on the server', !!(await api(`/api/prefixes/${p.slice(3)}`)))
+
+  // Not a single writing call, from either page: this is the whole point.
+  check('opening a page makes no writing call at all', seen.length === 0, JSON.stringify(seen))
+  check('no prefix was stored',
+    !(await storedPrefixes()).some((p) => p.uuid === uuid), uuid)
+
+  // ...and the project still reads, because a well-formed uuid nobody has
+  // written to is an empty draft rather than a failed lookup.
+  const draft = await api(`/api/prefixes/${uuid}`)
+  check('the unsaved project reads as an empty draft',
+    draft.status === 'draft' && draft.created_at === null && draft.card_count === 0,
+    JSON.stringify(draft))
+  check('...with no cards', (await api(`/api/prefixes/${uuid}/cards`)).cards.length === 0)
+  check('...and nothing to pay for',
+    ![...w.document.querySelectorAll('button')].some((b) => /Pay now/.test(b.textContent) && !b.disabled))
+
+  // Nor is a ribbon choice: with no card to apply it to, it is held in the page.
+  const pick = w.document.querySelector('input[name="print-ribbon"][value="ymckok"]')
+  check('the ribbon chooser offers both ribbons', !!pick)
+  const beforeRibbon = seen.length
+  pick.checked = true
+  pick.dispatchEvent(new w.Event('change', { bubbles: true }))
+  await settle(700)
+  check('choosing a ribbon before the first card writes nothing',
+    seen.length === beforeRibbon, JSON.stringify(seen.slice(beforeRibbon)))
+  check('...and the choice is still shown', pick.checked === true)
+  check('...and nothing was stored for it',
+    !(await storedPrefixes()).some((p) => p.uuid === uuid))
+
+  // A uuid that is not one is a bad request, not a phantom project.
+  const bad = await realFetch(`${BASE}/api/prefixes/not-a-uuid`)
+  check('a malformed uuid is a 400', bad.status === 400, String(bad.status))
 }
 
 // ---- scenario B: a seeded card renders with front/back previews ------------
 console.log('\nB. project page renders a card')
 {
-  const prefix = (
-    await api('/api/prefixes', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
-  ).uuid
+  // Chosen here and *not* created, the way the browser does it: the card upload
+  // below is what stores this project (see scenario A).
+  const prefix = crypto.randomUUID()
 
   const fd = new NodeFormData()
   fd.append('name', 'Sample Card')
@@ -303,6 +354,16 @@ console.log('\nB. project page renders a card')
   fd.append('back_text', '01 Song One\n02 Song Two')
   fd.append('image', new NodeBlob([PNG], { type: 'image/png' }), 'sample.png')
   await api(`/api/prefixes/${prefix}/cards`, { method: 'POST', body: fd })
+
+  // The first card is the project's first write: it is stored now, on the
+  // default ribbon, with a creation time.
+  const stored = await api(`/api/prefixes/${prefix}`)
+  check('the first card upload stored the project',
+    stored.created_at !== null && stored.status === 'draft' && stored.card_count === 1,
+    JSON.stringify(stored))
+  // ...and it is not a dead row: it has the card that made it.
+  check('...and it is in the operator\'s list',
+    (await storedPrefixes()).some((p) => p.uuid === prefix))
 
   const w = await mount(`/p/${prefix}`, { bust: 'b' })
   const text = w.document.body.textContent ?? ''
@@ -455,10 +516,16 @@ console.log('\nB. project page renders a card')
   check('says it can no longer be changed', /can no longer be changed/.test(text2))
   check('name input disabled', w2.document.querySelector('input#name-1')?.disabled === true)
 
-  // ---- scenario D: 404 for an unknown project -----------------------------
-  console.log('\nD. unknown project')
+  // ---- scenario D: a uuid nobody has written to is an empty project --------
+  console.log('\nD. a project nobody has written to')
   const w3 = await mount('/p/00000000-0000-0000-0000-000000000000', { bust: 'd' })
-  check('shows an error', /404/.test(w3.document.body.textContent ?? ''))
+  const textD = w3.document.body.textContent ?? ''
+  check('renders the project page, not an error',
+    /Project/.test(textD) && !/404/.test(textD), textD.slice(0, 200))
+  check('offers the upload dropzone', !!w3.document.querySelector('.dropzone'))
+  check('shows an empty project', /No cards yet/.test(textD), textD.slice(0, 300))
+  check('nothing was written by looking at it',
+    !(await storedPrefixes()).some((p) => p.uuid === '00000000-0000-0000-0000-000000000000'))
 }
 
 // ---- scenario E: the admin route asks for the token first -----------------
@@ -596,7 +663,15 @@ console.log('\nF. admin: list, status change, print preview, delete')
   const gone = await realFetch(`${BASE}/api/prefixes/${prefix}`, {
     headers: { authorization: `Bearer ${TOKEN}` },
   })
-  check('prefix is gone from the server', gone.status === 404, String(gone.status))
+  // A deleted prefix reads as the empty draft of its uuid again — which is what
+  // any address nobody has written to reads as. What is gone is the work, not
+  // the address.
+  const goneBody = gone.status === 200 ? await gone.json() : null
+  check('the deleted prefix reads as an empty draft again',
+    goneBody?.created_at === null && goneBody?.card_count === 0,
+    `${gone.status} ${JSON.stringify(goneBody)}`)
+  check('...and is gone from the operator\'s list',
+    !(await storedPrefixes()).some((p) => p.uuid === prefix))
 }
 
 // ---- scenario G: the Pay button, straight from a draft ---------------------

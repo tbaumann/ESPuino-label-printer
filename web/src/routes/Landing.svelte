@@ -1,25 +1,22 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { api, isUuid, recentProjects, rememberProject } from '../lib/api'
+  import { isUuid, newUuid, recentProjects, rememberProject } from '../lib/api'
   import { navigate } from '../lib/router'
 
   let error = $state<string | null>(null)
-  let creating = $state(true)
   let code = $state('')
   let recent = $state(recentProjects())
 
-  async function createNew() {
-    creating = true
-    error = null
-    try {
-      const p = await api.createPrefix()
-      rememberProject(p.uuid)
-      navigate(`/p/${p.uuid}`)
-    } catch (e) {
-      error = (e as Error).message
-    } finally {
-      creating = false
-    }
+  /**
+   * Open a project nobody has written to yet.
+   *
+   * The uuid is picked here, in the browser, and going to it stores nothing: the
+   * project is created by its first write (the first card uploaded). So a page
+   * load — or a hundred of them — leaves no empty project behind, and a page
+   * that is only looked at is not an order.
+   */
+  function createNew() {
+    navigate(`/p/${newUuid()}`)
   }
 
   function openExisting() {
@@ -48,9 +45,7 @@
 
   <section class="panel">
     <div class="row">
-      <button class="primary" onclick={createNew} disabled={creating}>
-        {#if creating}<span class="spinner"></span> Creating project…{:else}New project{/if}
-      </button>
+      <button class="primary" onclick={createNew}>New project</button>
       <div class="row" style="gap:8px;flex:1">
         <input
           type="text"
@@ -59,7 +54,7 @@
           style="min-width:260px"
           onkeydown={(e) => e.key === 'Enter' && openExisting()}
         />
-        <button onclick={openExisting} disabled={creating}>Open</button>
+        <button onclick={openExisting}>Open</button>
       </div>
     </div>
 

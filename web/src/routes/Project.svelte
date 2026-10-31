@@ -34,6 +34,24 @@
   const WRITABLE: string[] = ['draft']
   const writable = $derived(prefix ? WRITABLE.includes(prefix.status) : false)
 
+  /**
+   * A ribbon chosen before the project is stored.
+   *
+   * Nothing has been written to this uuid yet, so there is nowhere to write the
+   * choice: the first card is what creates the project, and this is applied by
+   * that upload (see `onUploaded`). Choosing a ribbon is not an order, and a page
+   * that is only looked at must not leave one behind — so the choice waits here
+   * until there is something real to save it with.
+   */
+  let heldRibbon = $state<Ribbon | null>(null)
+
+  /**
+   * The ribbon the page shows: the server's, or the choice held for the
+   * project's first write. Only ever the two — a card cannot exist while a
+   * choice is held, so the previews always read the server's ribbon.
+   */
+  const ribbon = $derived(heldRibbon ?? prefix?.ribbon)
+
   // Amounts pre-rendered, so the template never re-derives a price and `shop`
   // never has to be narrowed there.
   //
@@ -96,7 +114,7 @@
 
   // The ribbon the prefix is actually set to, so the panel can mark it and warn
   // when it is the one that ran out.
-  const chosen = $derived(ribbons.find((r) => r.ribbon === prefix?.ribbon) ?? null)
+  const chosen = $derived(ribbons.find((r) => r.ribbon === ribbon) ?? null)
 
   // A card whose back side is a picture or text that has not been supplied yet
   // is an order that cannot be printed. The server refuses such a checkout with
@@ -106,12 +124,21 @@
 
   let choosing = $state<Ribbon | null>(null)
 
-  async function chooseRibbon(ribbon: Ribbon) {
-    if (!prefix || ribbon === prefix.ribbon) return
-    choosing = ribbon
+  async function chooseRibbon(next: Ribbon) {
+    if (!prefix || next === ribbon) return
     error = null
+    // Nothing is stored for this project yet, so there is nothing to write the
+    // choice to. Hold it, and let the upload that creates the first card carry
+    // it: choosing a ribbon is not worth a project in the database.
+    if (cards.length === 0) {
+      // Picking back the ribbon that is already stored is simply no longer a
+      // choice that differs from it.
+      heldRibbon = next === prefix.ribbon ? null : next
+      return
+    }
+    choosing = next
     try {
-      prefix = await api.setRibbon(uuid, ribbon)
+      prefix = await api.setRibbon(uuid, next)
       // Nothing on a card changes with the ribbon, so no card can be stranded:
       // the server re-renders the rasters and repaints the back previews in the
       // new colour depth. Re-read the cards, because those previews did change.
@@ -198,9 +225,22 @@
   }
 
   async function onUploaded() {
+    // The upload that just landed is this project's first write, so a ribbon
+    // chosen while there was nothing to write it to can be applied now — and
+    // the choice is only ever held until a card exists. The server re-renders
+    // the new card's back in that depth, which is why the cards are read back a
+    // second time.
+    const wanted = heldRibbon
     try {
       error = null
       await refresh()
+      if (wanted && cards.length > 0) {
+        if (prefix && prefix.ribbon !== wanted) {
+          prefix = await api.setRibbon(uuid, wanted)
+          await refresh()
+        }
+        heldRibbon = null
+      }
     } catch (e) {
       error = (e as Error).message
     }
@@ -281,14 +321,14 @@
         {#each ribbons as r (r.ribbon)}
           <label
             class="mode"
-            class:selected={prefix.ribbon === r.ribbon}
+            class:selected={ribbon === r.ribbon}
             class:unavailable={!r.available}
           >
             <input
               type="radio"
               name="print-ribbon"
               value={r.ribbon}
-              checked={prefix.ribbon === r.ribbon}
+              checked={ribbon === r.ribbon}
               disabled={!writable || !r.available || choosing !== null}
               onchange={() => chooseRibbon(r.ribbon)}
             />
@@ -357,6 +397,11 @@
               {missingBacks === 1 ? 'its' : 'their'} back finished — the picture or
               the text the back is printed from.
             </span>
+          {:else if cards.length === 0}
+            <!-- Nothing to print yet, and nothing the server would accept: a
+                 card-less checkout is a 409. -->
+            <button class="primary" disabled>Pay now</button>
+            <span class="muted">Add a card first — there is nothing to print yet.</span>
           {:else}
             <button class="primary" onclick={pay} disabled={paying}>
               {paying ? 'Opening checkout…' : 'Pay now'}

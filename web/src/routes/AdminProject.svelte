@@ -123,7 +123,11 @@
       <div class="row" style="margin-top:12px">
         <span class="mono muted">{uuid}</span>
         <span class="muted">{prefix.card_count} card{prefix.card_count === 1 ? '' : 's'}</span>
-        <span class="muted">created {prefix.created_at}</span>
+        <!-- A prefix nothing has been written to yet has no creation time: the
+             page is only addressable, not stored. -->
+        {#if prefix.created_at}
+          <span class="muted">created {prefix.created_at}</span>
+        {/if}
       </div>
 
       <div class="row" style="margin-top:14px">
