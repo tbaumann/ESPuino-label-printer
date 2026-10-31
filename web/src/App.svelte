@@ -23,3 +23,19 @@
 {:else}
   <Landing />
 {/if}
+
+<!-- The Impressum belongs to every page, so it lives in the shell rather than in
+     each route: no route can be served without it. -->
+<footer class="site-footer">
+  <div class="site-footer-inner">
+    <div class="field-label">Impressum</div>
+    <p>Tilman Johannes Baumann</p>
+    <p>Grindstraße 7, 35066 Frankenberg (Eder), DE</p>
+    <p>Telefon: +49 151 55837069</p>
+    <p>
+      E-Mail: <a href="mailto:info@kartenschmiede.tilman.baumann.name"
+        >info@kartenschmiede.tilman.baumann.name</a
+      >
+    </p>
+  </div>
+</footer>

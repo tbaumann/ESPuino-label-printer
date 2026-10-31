@@ -231,6 +231,26 @@ section.panel {
   margin-bottom: 12px;
 }
 
+/* ---------- footer ---------- */
+
+/* The Impressum. It is in the shell (App.svelte), so it shows on every page and
+   no route has to carry it. Reading width, like the prose pages. */
+.site-footer {
+  border-top: 1px solid var(--border);
+  padding: 16px 20px 32px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.site-footer-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.site-footer a {
+  color: var(--accent);
+}
+
 /* ---------- print modes ---------- */
 
 /* One option per row. They undo the global `label` rule (small, muted,
