@@ -34,7 +34,7 @@
 </script>
 
 <div class="app" style="max-width:640px">
-  <h1>ESPuino Label Printer</h1>
+  <h1>Kartenschmiede</h1>
   <p class="muted" style="margin:8px 0 24px">
     Print-ready RFID card labels for ESPuino, phoniebox, TONUino, SonUINO and friends.
   </p>

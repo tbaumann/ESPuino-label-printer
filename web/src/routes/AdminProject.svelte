@@ -95,7 +95,7 @@
 </script>
 
 <div class="topbar">
-  <span class="brand">ESPuino Label Printer</span>
+  <span class="brand">Kartenschmiede</span>
   <span class="badge">admin</span>
   <span class="spacer"></span>
   <a href="/admin" onclick={(e) => { e.preventDefault(); navigate('/admin') }} style="color:var(--accent);text-decoration:none">

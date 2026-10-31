@@ -275,7 +275,7 @@
 </script>
 
 <div class="topbar">
-  <span class="brand">ESPuino Label Printer</span>
+  <span class="brand">Kartenschmiede</span>
   <span class="spacer"></span>
   <a
     href="/"
